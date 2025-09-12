@@ -1,0 +1,9 @@
+UI:
+Add date added
+
+Logic:
+Sort for sold
+Profiles logic?
+
+uvicorn main:app --reload
+npm run dev
