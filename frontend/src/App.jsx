@@ -336,24 +336,38 @@ function App() {
                   )}
                 </div>
               </div>
-              <div className="results-scroll">                
+
+              <div className="results-scroll">
                 {/* Render results */}
-                {row.results && row.results.length > 0 && row.results.map((res, i) => (
-                  <a className="result-card" key={`${res.url}-${i}` || i} href={res.url || '#'} target="_blank" rel="noreferrer">
-                    {res.image ? (
-                      <img className="result-img" src={res.image} alt="item" />
-                    ) : (
-                      <div className="result-img placeholder" />
-                    )}
-                    <div className="result-price">{res.price || ''}</div>
-                    {(res.p2p || res.length) && (
-                      <div className="result-meta">
-                        {res.p2p ? `${res.p2p.toFixed ? res.p2p.toFixed(2) : res.p2p}" P2P` : ''}
-                        {res.length ? ` · ${res.length.toFixed ? res.length.toFixed(2) : res.length}" Len` : ''}
-                      </div>
-                    )}
-                  </a>
-                ))}
+                {row.results && row.results.length > 0 && row.results.map((res, i) => {
+                  const metaParts = [];
+                  if (res.p2p !== undefined && res.p2p !== null && res.p2p !== '') {
+                    metaParts.push(`${res.p2p.toFixed ? res.p2p.toFixed(2) : res.p2p}" P2P`);
+                  }
+                  if (res.length !== undefined && res.length !== null && res.length !== '') {
+                    metaParts.push(`${res.length.toFixed ? res.length.toFixed(2) : res.length}" Len`);
+                  }
+                  if (typeof res.ageDays === 'number' && !Number.isNaN(res.ageDays)) {
+                    metaParts.push(`${Math.round(res.ageDays)}d old`);
+                  }
+                  const hasMeta = metaParts.length > 0;
+
+                  return (
+                    <a className="result-card" key={`${res.url}-${i}` || i} href={res.url || '#'} target="_blank" rel="noreferrer">
+                      {res.image ? (
+                        <img className="result-img" src={res.image} alt="item" />
+                      ) : (
+                        <div className="result-img placeholder" />
+                      )}
+                      <div className="result-price">{res.price || ''}</div>
+                      {hasMeta && (
+                        <div className="result-meta">
+                          {metaParts.join(' | ')}
+                        </div>
+                      )}
+                    </a>
+                  );
+                })}
               </div>
             </div>
           ))}

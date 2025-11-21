@@ -42,6 +42,50 @@ CANCEL_FLAGS: Dict[str, bool] = {}
 
 RELTIME_RX = re.compile(r"\b(\d+)\s*(minute|hour|day|week|month)s?\s*ago\b", re.I)
 
+def parse_iso_datetime(ts: str) -> Optional[dt.datetime]:
+    """Parse an ISO datetime string (with optional trailing Z) to a UTC-aware datetime."""
+    try:
+        clean = ts.strip()
+        if clean.endswith("Z"):
+            clean = clean[:-1] + "+00:00"
+        dt_val = dt.datetime.fromisoformat(clean)
+        if dt_val.tzinfo is None:
+            dt_val = dt_val.replace(tzinfo=dt.timezone.utc)
+        else:
+            dt_val = dt_val.astimezone(dt.timezone.utc)
+        return dt_val
+    except Exception:
+        return None
+
+def age_days_from(ts_val: dt.datetime) -> float:
+    delta = dt.datetime.now(dt.timezone.utc) - ts_val
+    return max(delta.total_seconds() / 86400.0, 0.0)
+
+def parse_relative_time(text: str) -> Optional[dt.datetime]:
+    """Convert relative phrases like 'Listed 3 hours ago' to an approximate UTC datetime."""
+    try:
+        m = RELTIME_RX.search(text or "")
+        if not m:
+            return None
+        qty = int(m.group(1))
+        unit = m.group(2).lower()
+        now = dt.datetime.now(dt.timezone.utc)
+        if unit.startswith("minute"):
+            delta = dt.timedelta(minutes=qty)
+        elif unit.startswith("hour"):
+            delta = dt.timedelta(hours=qty)
+        elif unit.startswith("day"):
+            delta = dt.timedelta(days=qty)
+        elif unit.startswith("week"):
+            delta = dt.timedelta(weeks=qty)
+        elif unit.startswith("month"):
+            delta = dt.timedelta(days=qty * 30)
+        else:
+            return None
+        return now - delta
+    except Exception:
+        return None
+
 class MeasurementParser:
     NUM  = r'(?P<val>\d+(?:\.\d+)?(?:\s+\d\/\d)?)'
     UNIT = r'(?P<unit>\s*(?:cm|mm|in|inch|inches|["″”]))?'
@@ -126,8 +170,26 @@ def accept_cookies_if_any(page) -> None:
         except Exception:
             continue
 
+def remove_sold_sections(page) -> None:
+    """Remove the sold-items section so sold listings are not rendered/scanned."""
+    try:
+        page.evaluate("""() => {
+            const headings = Array.from(document.querySelectorAll(
+                "p._text_bevez_41._shared_bevez_6._bold_bevez_47.styles_headingText__YfI1k"
+            ));
+            for (const h of headings) {
+                if ((h.textContent || "").trim().toLowerCase() === "sold items") {
+                    const section = h.closest("section") || h.parentElement;
+                    if (section) section.remove();
+                }
+            }
+        }""")
+    except Exception:
+        pass
+
 def collect_listing_links(page, max_scrolls: int = 2, per_scroll_wait_ms: int = 1200, max_links: Optional[int] = None) -> List[str]:
     seen: set[str] = set()
+    ordered: List[str] = []
     def page_origin() -> str:
         u = urlparse(page.url)
         return f"{u.scheme}://{u.netloc}"
@@ -143,14 +205,41 @@ def collect_listing_links(page, max_scrolls: int = 2, per_scroll_wait_ms: int = 
     for _ in range(max_scrolls):
         for sel in selectors:
             try:
-                hrefs = page.eval_on_selector_all(sel, "els => els.map(e => e.getAttribute('href'))")
+                # Filter out sold items by checking for sold indicators in parent elements
+                hrefs = page.eval_on_selector_all(sel, """
+                    els => els
+                        .filter(e => {
+                            // Check if item is marked as sold
+                            const listItem = e.closest('li');
+                            if (!listItem) return true;
+                            
+                            // Look for sold indicators in the list item
+                            const text = listItem.textContent || '';
+                            if (text.toLowerCase().includes('sold')) return false;
+                            
+                            // Check for sold class names
+                            const classes = listItem.className || '';
+                            if (classes.includes('sold') || classes.includes('Sold')) return false;
+                            
+                            // Check for aria-labels or data attributes indicating sold status
+                            if (listItem.getAttribute('aria-label')?.toLowerCase().includes('sold')) return false;
+                            if (listItem.getAttribute('data-sold') === 'true') return false;
+                            
+                            return true;
+                        })
+                        .map(e => e.getAttribute('href'))
+                """)
             except Exception:
                 hrefs = []
             for href in hrefs:
                 if not href: continue
-                seen.add(urljoin(origin, href))
+                full = urljoin(origin, href)
+                if full in seen:
+                    continue
+                seen.add(full)
+                ordered.append(full)
                 if max_links and len(seen) >= max_links:
-                    return list(seen)
+                    return ordered
         page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
         page.wait_for_timeout(per_scroll_wait_ms)
         if len(seen) == last_count:
@@ -160,7 +249,7 @@ def collect_listing_links(page, max_scrolls: int = 2, per_scroll_wait_ms: int = 
             page.wait_for_timeout(400)
             if len(seen) == last_count: break
         last_count = len(seen)
-    return list(seen)
+    return ordered
 
 PRICE_RX = re.compile(r"([$£€]\s?\d[\d,]*(?:\.\d{2})?)")
 
@@ -234,7 +323,45 @@ def parse_listing(page, url: str) -> Optional[Dict[str, Any]]:
             except Exception:
                 image_url = None
 
-        return {"url": url, "description": desc, "image": image_url, "price": price_text}
+        # Listing time and age
+        listed_at_iso: Optional[str] = None
+        listed_ts: Optional[float] = None
+        age_days: Optional[float] = None
+        try:
+            tloc = page.locator("time._text_bevez_41._shared_bevez_6._normal_bevez_51._caption2_bevez_61.styles_text__AMrZL[datetime]").first
+            if not tloc.count():
+                tloc = page.locator("time[datetime]").first
+            if tloc.count():
+                dt_attr = tloc.get_attribute("datetime")
+                time_text = ""
+                try:
+                    time_text = tloc.inner_text(timeout=400) or ""
+                except Exception:
+                    time_text = ""
+                if dt_attr:
+                    listed_at_iso = dt_attr
+                    parsed_dt = parse_iso_datetime(dt_attr)
+                    if parsed_dt:
+                        listed_ts = parsed_dt.timestamp()
+                        age_days = age_days_from(parsed_dt)
+                if listed_ts is None and time_text:
+                    rel_dt = parse_relative_time(time_text)
+                    if rel_dt:
+                        listed_ts = rel_dt.timestamp()
+                        age_days = age_days_from(rel_dt)
+                        listed_at_iso = rel_dt.isoformat()
+        except Exception:
+            pass
+
+        return {
+            "url": url,
+            "description": desc,
+            "image": image_url,
+            "price": price_text,
+            "listedAt": listed_at_iso,
+            "listedTs": listed_ts,
+            "ageDays": age_days,
+        }
     except Exception:
         return None
 
@@ -265,6 +392,7 @@ def scrape_depop(max_items: int, headless: bool = True, slowmo_ms: int = 0, max_
         page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
         accept_cookies_if_any(page)
         page.wait_for_load_state("networkidle", timeout=60000)
+        remove_sold_sections(page)
         links = collect_listing_links(page, max_scrolls=max_scrolls, max_links=max_links)
         for url in links:
             if len(out) >= max_items: break
@@ -333,6 +461,8 @@ async def search(request: Request):
         "price": it.get("price"),
         "p2p": it.get("p2p"),
         "length": it.get("length"),
+        "ageDays": it.get("ageDays"),
+        "listedAt": it.get("listedAt"),
     } for it in filtered]
     return {"count": len(items), "items": items}
 
@@ -415,6 +545,7 @@ async def search_stream(request: Request):
                 page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
                 accept_cookies_if_any(page)
                 page.wait_for_load_state("networkidle", timeout=60000)
+                remove_sold_sections(page)
                 
                 # Send progress after landing
                 yield _sse({"type": "progress", "phase": "landing", "processed": 0, "total": None, "matches": 0, "searchId": search_id or None})
@@ -459,12 +590,14 @@ async def search_stream(request: Request):
                                 "price": item.get("price"),
                                 "p2p": w,
                                 "length": L,
+                                "ageDays": item.get("ageDays"),
+                                "listedAt": item.get("listedAt"),
                             }
                             try:
                                 sys.stdout.write("\n")
                             except Exception:
                                 pass
-                            print(f"[stream] MATCH {processed+1}/{total} p2p={w} len={L} price={item2['price']}")
+                            print(f"[stream] MATCH {processed+1}/{total} p2p={w} len={L} price={item2['price']} ageDays={item2.get('ageDays')}")
                             
                             # Send match immediately
                             yield _sse({"type": "match", "item": item2, "searchId": search_id or None})
