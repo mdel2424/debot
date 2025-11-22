@@ -323,6 +323,26 @@ def parse_listing(page, url: str) -> Optional[Dict[str, Any]]:
             except Exception:
                 image_url = None
 
+        # Seller info
+        seller_name = ""
+        sold_count = 0
+        try:
+            # Try to find seller link
+            sloc = page.locator("a.styles_username__zh8fr").first
+            if sloc.count():
+                seller_name = (sloc.inner_text(timeout=500) or "").strip()
+            
+            # Try to find sold count
+            # Look for "X sold" text inside the signal container
+            sold_loc = page.locator("div.styles_signal__D2W6L p").filter(has_text=re.compile(r"\d+\s*sold")).first
+            if sold_loc.count():
+                txt = sold_loc.inner_text(timeout=500)
+                m = re.search(r"(\d+)\s*sold", txt)
+                if m:
+                    sold_count = int(m.group(1))
+        except Exception:
+            pass
+
         # Listing time and age
         listed_at_iso: Optional[str] = None
         listed_ts: Optional[float] = None
@@ -361,6 +381,8 @@ def parse_listing(page, url: str) -> Optional[Dict[str, Any]]:
             "listedAt": listed_at_iso,
             "listedTs": listed_ts,
             "ageDays": age_days,
+            "seller": seller_name,
+            "soldCount": sold_count,
         }
     except Exception:
         return None
@@ -538,95 +560,186 @@ async def search_stream(request: Request):
                 
                 if seller:
                     search_url = build_seller_url(seller, groups=groups, gender=gender)
-                else:
-                    search_url = "https://www.depop.com/ca/category/mens/tops/tshirts/?sort=newlyListed"
+                    print(f"[stream] navigating: {search_url}")
+                    page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+                    accept_cookies_if_any(page)
+                    page.wait_for_load_state("networkidle", timeout=60000)
+                    remove_sold_sections(page)
                     
-                print(f"[stream] navigating: {search_url}")
-                page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-                accept_cookies_if_any(page)
-                page.wait_for_load_state("networkidle", timeout=60000)
-                remove_sold_sections(page)
-                
-                # Send progress after landing
-                yield _sse({"type": "progress", "phase": "landing", "processed": 0, "total": None, "matches": 0, "searchId": search_id or None})
-                
-                links = collect_listing_links(page, max_scrolls=max_scrolls, max_links=max_links)
-                total = len(links)
-                print(f"[stream] collected {total} links")
-                
-                # Send meta immediately after collecting links
-                yield _sse({"type": "meta", "links": total, "seller": seller or None, "searchId": search_id or None})
+                    # Send progress after landing
+                    yield _sse({"type": "progress", "phase": "landing", "processed": 0, "total": None, "matches": 0, "searchId": search_id or None})
+                    
+                    links = collect_listing_links(page, max_scrolls=max_scrolls, max_links=max_links)
+                    total = len(links)
+                    print(f"[stream] collected {total} links")
+                    
+                    # Send meta immediately after collecting links
+                    yield _sse({"type": "meta", "links": total, "seller": seller or None, "searchId": search_id or None})
 
-                matches = 0
-                processed = 0
-                
-                for i, url in enumerate(links):
-                    # Check cancellation flag
-                    if search_id and CANCEL_FLAGS.get(search_id):
-                        print(f"[stream] cancelled {search_id}")
-                        yield _sse({"type": "cancelled", "searchId": search_id})
-                        break
-                        
-                    try:
-                        item = parse_listing(page, url)
-                        if not item:
-                            processed += 1
-                            # Send progress update immediately after each failed parse
-                            yield _sse({"type": "progress", "phase": "parsing", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
-                            try:
-                                sys.stdout.write(f"\r[stream] processed {processed}/{total} matches={matches}")
-                                sys.stdout.flush()
-                            except Exception:
-                                pass
-                            continue
-                            
-                        text = f"{item.get('description','')}"
-                        w, L = parser.extract_tops(text)
-                        
-                        if parser.within(w, target_p2p, tol) and parser.within(L, target_length, tol):
-                            item2 = {
-                                "url": item.get("url"),
-                                "image": item.get("image"),
-                                "price": item.get("price"),
-                                "p2p": w,
-                                "length": L,
-                                "ageDays": item.get("ageDays"),
-                                "listedAt": item.get("listedAt"),
-                            }
-                            try:
-                                sys.stdout.write("\n")
-                            except Exception:
-                                pass
-                            print(f"[stream] MATCH {processed+1}/{total} p2p={w} len={L} price={item2['price']} ageDays={item2.get('ageDays')}")
-                            
-                            # Send match immediately
-                            yield _sse({"type": "match", "item": item2, "searchId": search_id or None})
-                            matches += 1
-                            
-                        processed += 1
-                        
-                        # Send progress update immediately after each item
-                        yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
-                        
-                        try:
-                            sys.stdout.write(f"\r[stream] processed {processed}/{total} matches={matches}")
-                            sys.stdout.flush()
-                        except Exception:
-                            pass
-                            
-                        if matches >= max_items:
-                            print(f"[stream] reached maxItems={max_items}")
+                    matches = 0
+                    processed = 0
+                    
+                    for i, url in enumerate(links):
+                        # Check cancellation flag
+                        if search_id and CANCEL_FLAGS.get(search_id):
+                            print(f"[stream] cancelled {search_id}")
+                            yield _sse({"type": "cancelled", "searchId": search_id})
                             break
                             
-                    except Exception as e:
-                        processed += 1
                         try:
-                            sys.stdout.write(f"\r[stream] processed {processed}/{total} matches={matches}")
-                            sys.stdout.flush()
-                        except Exception:
-                            pass
-                        continue
+                            item = parse_listing(page, url)
+                            if not item:
+                                processed += 1
+                                # Send progress update immediately after each failed parse
+                                yield _sse({"type": "progress", "phase": "parsing", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
+                                continue
+                                
+                            text = f"{item.get('description','')}"
+                            w, L = parser.extract_tops(text)
+                            
+                            if parser.within(w, target_p2p, tol) and parser.within(L, target_length, tol):
+                                item2 = {
+                                    "url": item.get("url"),
+                                    "image": item.get("image"),
+                                    "price": item.get("price"),
+                                    "p2p": w,
+                                    "length": L,
+                                    "ageDays": item.get("ageDays"),
+                                    "listedAt": item.get("listedAt"),
+                                }
+                                try:
+                                    sys.stdout.write("\n")
+                                except Exception:
+                                    pass
+                                print(f"[stream] MATCH {processed+1}/{total} p2p={w} len={L} price={item2['price']} ageDays={item2.get('ageDays')}")
+                                
+                                # Send match immediately
+                                yield _sse({"type": "match", "item": item2, "searchId": search_id or None})
+                                matches += 1
+                                
+                            processed += 1
+                            
+                            # Send progress update immediately after each item
+                            yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
+                            
+                            if matches >= max_items:
+                                print(f"[stream] reached maxItems={max_items}")
+                                break
+                                
+                        except Exception as e:
+                            processed += 1
+                            continue
+                else:
+                    # Browse mode (no seller specified)
+                    search_url = "https://www.depop.com/ca/category/mens/tops/?sort=newlyListed"
+                    print(f"[stream] browsing: {search_url}")
+                    page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+                    accept_cookies_if_any(page)
+                    page.wait_for_load_state("networkidle", timeout=60000)
+                    # remove_sold_sections(page) # Not strictly needed for newly listed but ok
+                    
+                    yield _sse({"type": "progress", "phase": "browsing", "processed": 0, "matches": 0, "searchId": search_id or None})
+                    
+                    seen_urls = set()
+                    processed = 0
+                    matches = 0
+                    
+                    while True:
+                        if search_id and CANCEL_FLAGS.get(search_id):
+                            yield _sse({"type": "cancelled", "searchId": search_id})
+                            break
                         
+                        # Scroll and collect links
+                        # We use collect_listing_links with max_scrolls=1 to get current links
+                        # It scrolls internally, which is fine.
+                        found_links = collect_listing_links(page, max_scrolls=1, per_scroll_wait_ms=1000)
+                        
+                        unique_new_links = [u for u in found_links if u not in seen_urls]
+                        
+                        if not unique_new_links:
+                            # Try scrolling one more time explicitly if collect_listing_links didn't yield new ones
+                            page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+                            page.wait_for_timeout(1000)
+                            found_links = collect_listing_links(page, max_scrolls=1, per_scroll_wait_ms=500)
+                            unique_new_links = [u for u in found_links if u not in seen_urls]
+                            if not unique_new_links:
+                                print("[stream] No new links found, stopping.")
+                                break
+                        
+                        for url in unique_new_links:
+                            if search_id and CANCEL_FLAGS.get(search_id): break
+                            
+                            if processed >= max_links:
+                                print(f"[stream] reached maxLinks={max_links}")
+                                yield _sse({"type": "done", "searchId": search_id or None})
+                                ctx.close()
+                                browser.close()
+                                return
+
+                            if url in seen_urls: continue
+                            seen_urls.add(url)
+                            
+                            try:
+                                # Open new page for item to preserve search results page state
+                                item_page = ctx.new_page()
+                                try:
+                                    item = parse_listing(item_page, url)
+                                finally:
+                                    item_page.close()
+
+                                if not item: 
+                                    processed += 1
+                                    continue
+                                
+                                # Check age > 30 days
+                                age = item.get("ageDays")
+                                # if age is not None and age > 30:
+                                #    pass 
+                                    # User requested to remove early stopping based on age
+                                    # print(f"[stream] Hit item > 30 days old ({age:.1f} days). Stopping.")
+                                    # yield _sse({"type": "done", "searchId": search_id or None})
+                                    # ctx.close()
+                                    # browser.close()
+                                    # return
+
+                                text = f"{item.get('description','')}"
+                                w, L = parser.extract_tops(text)
+                                
+                                if parser.within(w, target_p2p, tol) and parser.within(L, target_length, tol):
+                                    # Check seller stats
+                                    s_name = item.get("seller")
+                                    s_sold = item.get("soldCount") or 0
+                                    
+                                    if s_sold > 50:
+                                        item2 = {
+                                            "url": item.get("url"),
+                                            "image": item.get("image"),
+                                            "price": item.get("price"),
+                                            "p2p": w,
+                                            "length": L,
+                                            "ageDays": age,
+                                            "listedAt": item.get("listedAt"),
+                                            "seller": s_name,
+                                            "soldCount": s_sold
+                                        }
+                                        print(f"[stream] MATCH seller={s_name} ({s_sold} sold) p2p={w} len={L}")
+                                        yield _sse({"type": "match", "item": item2, "seller": s_name, "searchId": search_id or None})
+                                        matches += 1
+                                        
+                                        if matches >= max_items:
+                                            print(f"[stream] reached maxItems={max_items}")
+                                            yield _sse({"type": "done", "searchId": search_id or None})
+                                            ctx.close()
+                                            browser.close()
+                                            return
+                                
+                                processed += 1
+                                yield _sse({"type": "progress", "processed": processed, "matches": matches, "searchId": search_id or None})
+                                
+                            except Exception:
+                                processed += 1
+                                continue
+
                 try:
                     sys.stdout.write("\n")
                 except Exception:
@@ -636,6 +749,9 @@ async def search_stream(request: Request):
                 yield _sse({"type": "done", "searchId": search_id or None})
                 ctx.close()
                 browser.close()
+        except Exception as e:
+            print(f"[stream] error: {e}")
+            yield _sse({"type": "error", "message": str(e), "searchId": search_id or None})
                 
         except Exception as e:
             print("[stream] fatal:", e)

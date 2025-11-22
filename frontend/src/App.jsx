@@ -1,4 +1,6 @@
 import { useState } from 'react';
+import Sidebar from './components/Sidebar';
+import SearchRow from './components/SearchRow';
 import './index.css';
 
 const pages = [
@@ -276,100 +278,165 @@ function App() {
     setSearchRows((rows) => [...rows, { ...defaultSearch, results: [], progress: null }]);
   };
 
+  const addResultToSeller = (sellerName, item, measurements) => {
+    setSearchRows((rows) => {
+      // Check if row exists
+      const existingIdx = rows.findIndex(r => r.seller === sellerName);
+      if (existingIdx !== -1) {
+        // Add to existing
+        const newRows = [...rows];
+        const currentResults = newRows[existingIdx].results || [];
+        // Avoid duplicates
+        if (currentResults.some(r => r.url === item.url)) return rows;
+        
+        newRows[existingIdx] = {
+            ...newRows[existingIdx],
+            results: [...currentResults, item]
+        };
+        return newRows;
+      } else {
+        // Create new row
+        const newRow = {
+            ...defaultSearch,
+            seller: sellerName,
+            p2p: measurements.p2p,
+            length: measurements.length,
+            tolerance: measurements.tolerance,
+            results: [item],
+            loading: false 
+        };
+        return [...rows, newRow];
+      }
+    });
+  };
+
+  const startBrowse = async (idx) => {
+    const makeId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const controller = new AbortController();
+    const searchId = makeId();
+    
+    // Initialize search state for the browsing row
+    setRowState(idx, { 
+      loading: true, 
+      error: '', 
+      results: [], 
+      controller, 
+      searchId,
+      progress: null 
+    });
+    
+    const row = searchRows[idx];
+    
+    try {
+      const p2p = parseFloat(row.p2p);
+      const length = parseFloat(row.length);
+      const tolerance = row.tolerance === '' ? 0.5 : parseFloat(row.tolerance);
+      const payload = {
+        category: 'tops',
+        measurements: {
+          first: isNaN(p2p) ? null : p2p,
+          second: isNaN(length) ? null : length,
+        },
+        tolerance: isNaN(tolerance) ? 0.5 : tolerance,
+        seller: "", // Empty seller triggers browse mode
+        maxItems: 100, // Browse limit
+        maxLinks: 10000,
+        searchId,
+      };
+      
+      console.log('[SSE] Starting browse stream with payload:', payload);
+      
+      const res = await fetch(`${API_BASE}/api/search/stream`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'text/event-stream',
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+        cache: 'no-store',
+      });
+      
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      }
+      
+      if (!res.body) {
+        throw new Error('No response body for streaming');
+      }
+      
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+      let isAborted = false;
+      
+      controller.signal.addEventListener('abort', () => {
+        isAborted = true;
+      });
+      
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done || isAborted) break;
+          
+          buffer += decoder.decode(value, { stream: true });
+          
+          let sepIndex;
+          while ((sepIndex = buffer.indexOf('\n\n')) !== -1) {
+            const rawEvent = buffer.slice(0, sepIndex).trim();
+            buffer = buffer.slice(sepIndex + 2);
+            if (!rawEvent || rawEvent.startsWith(':')) continue;
+            
+            const eventLine = rawEvent.startsWith('data:') ? rawEvent.slice(5).trim() : rawEvent;
+            try {
+              const evt = JSON.parse(eventLine);
+              
+              if (evt.type === 'match' && evt.item && evt.seller) {
+                addResultToSeller(evt.seller, evt.item, { p2p: row.p2p, length: row.length, tolerance: row.tolerance });
+              } else if (evt.type === 'progress') {
+                updateProgress(idx, {
+                  processed: evt.processed,
+                  matches: evt.matches,
+                  phase: evt.phase || 'browsing'
+                });
+              } else if (evt.type === 'done' || evt.type === 'cancelled') {
+                setRowState(idx, { loading: false, controller: null });
+                break;
+              } else if (evt.type === 'error') {
+                setRowState(idx, { loading: false, error: evt.message, controller: null });
+                break;
+              }
+            } catch (e) {
+              console.warn('[SSE] Failed to parse event:', e);
+            }
+          }
+        }
+      } catch (readError) {
+        if (!isAborted) throw readError;
+      }
+      setRowState(idx, { loading: false, controller: null });
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        setRowState(idx, { loading: false, error: String(err), controller: null });
+      }
+    }
+  };
+
   return (
     <div className="app-dark-ui">
-      <aside className="sidebar">
-        <div className="sidebar-title">debot</div>
-        <nav className="sidebar-nav">
-          <ul>
-            {pages.map((p) => (
-              <li
-                key={p.name}
-                className={activePage === p.name ? 'active' : ''}
-                onClick={() => setActivePage(p.name)}
-              >
-                <span className="sidebar-icon">{p.icon}</span> {p.name}
-              </li>
-            ))}
-          </ul>
-        </nav>
-      </aside>
+      <Sidebar pages={pages} activePage={activePage} setActivePage={setActivePage} />
       <main className="main-content">
-  <div className="rows-container">
+        <div className="rows-container">
           {searchRows.map((row, idx) => (
-            <div className="search-row-card" key={idx}>
-              <div className="search-row-inputs">
-                <input
-                  className="input-dark"
-                  placeholder="Seller"
-                  value={row.seller}
-                  onChange={e => handleInput(idx, 'seller', e.target.value)}
-                />
-                <input
-                  className="input-dark"
-                  placeholder="Length (in)"
-                  value={row.length}
-                  onChange={e => handleInput(idx, 'length', e.target.value)}
-                />
-                <input
-                  className="input-dark"
-                  placeholder="P2P (in)"
-                  value={row.p2p}
-                  onChange={e => handleInput(idx, 'p2p', e.target.value)}
-                />
-                <input
-                  className="input-dark"
-                  placeholder="Tolerance (in)"
-                  value={row.tolerance}
-                  onChange={e => handleInput(idx, 'tolerance', e.target.value)}
-                />
-                <div className="search-controls">
-                  {row.loading ? (
-                    <button className="search-btn stop" onClick={() => cancelStream(idx)}>Stop</button>
-                  ) : (
-                    <button className="search-btn" onClick={() => startStream(idx)}>Search</button>
-                  )}
-                  {row.progress && (
-                    <div className="progress-counter">
-                      {row.progress.processed || 0}/{row.progress.total || 0} • {row.progress.matches || 0} matches
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              <div className="results-scroll">
-                {/* Render results */}
-                {row.results && row.results.length > 0 && row.results.map((res, i) => {
-                  const metaParts = [];
-                  if (res.p2p !== undefined && res.p2p !== null && res.p2p !== '') {
-                    metaParts.push(`${res.p2p.toFixed ? res.p2p.toFixed(2) : res.p2p}" P2P`);
-                  }
-                  if (res.length !== undefined && res.length !== null && res.length !== '') {
-                    metaParts.push(`${res.length.toFixed ? res.length.toFixed(2) : res.length}" Len`);
-                  }
-                  if (typeof res.ageDays === 'number' && !Number.isNaN(res.ageDays)) {
-                    metaParts.push(`${Math.round(res.ageDays)}d old`);
-                  }
-                  const hasMeta = metaParts.length > 0;
-
-                  return (
-                    <a className="result-card" key={`${res.url}-${i}` || i} href={res.url || '#'} target="_blank" rel="noreferrer">
-                      {res.image ? (
-                        <img className="result-img" src={res.image} alt="item" />
-                      ) : (
-                        <div className="result-img placeholder" />
-                      )}
-                      <div className="result-price">{res.price || ''}</div>
-                      {hasMeta && (
-                        <div className="result-meta">
-                          {metaParts.join(' | ')}
-                        </div>
-                      )}
-                    </a>
-                  );
-                })}
-              </div>
-            </div>
+            <SearchRow
+              key={idx}
+              row={row}
+              idx={idx}
+              handleInput={handleInput}
+              startStream={startStream}
+              cancelStream={cancelStream}
+              startBrowse={startBrowse}
+            />
           ))}
           <div className="add-row-container">
             <button className="add-row-btn" onClick={addRow} title="Add search row" aria-label="Add search row">
@@ -482,6 +549,10 @@ function App() {
           gap: 0.75rem;
           align-items: flex-start;
         }
+        .button-group {
+          display: flex;
+          gap: 0.5rem;
+        }
         .progress-counter {
           font-size: 0.875rem;
           color: #cccccc;
@@ -521,6 +592,14 @@ function App() {
         .search-btn:hover:not(:disabled) {
           background: #e5e5e5;
           transform: translateY(-1px);
+        }
+        .search-btn.secondary {
+          background: #333333;
+          color: #ffffff;
+          border: 1px solid #555555;
+        }
+        .search-btn.secondary:hover:not(:disabled) {
+          background: #444444;
         }
         .search-btn.stop { 
           background: #ff4444;
