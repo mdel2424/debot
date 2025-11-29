@@ -12,21 +12,27 @@ const SearchRow = ({ row, idx, handleInput, startStream, cancelStream, startBrow
         />
         <input
           className="input-dark"
-          placeholder="Length (in)"
-          value={row.length}
-          onChange={e => handleInput(idx, 'length', e.target.value)}
-        />
-        <input
-          className="input-dark"
           placeholder="P2P (in)"
           value={row.p2p}
           onChange={e => handleInput(idx, 'p2p', e.target.value)}
         />
         <input
+          className="input-dark input-small"
+          placeholder="± P2P"
+          value={row.p2pTolerance}
+          onChange={e => handleInput(idx, 'p2pTolerance', e.target.value)}
+        />
+        <input
           className="input-dark"
-          placeholder="Tolerance (in)"
-          value={row.tolerance}
-          onChange={e => handleInput(idx, 'tolerance', e.target.value)}
+          placeholder="Length (in)"
+          value={row.length}
+          onChange={e => handleInput(idx, 'length', e.target.value)}
+        />
+        <input
+          className="input-dark input-small"
+          placeholder="± Len"
+          value={row.lengthTolerance}
+          onChange={e => handleInput(idx, 'lengthTolerance', e.target.value)}
         />
         <div className="search-controls">
           {row.loading ? (
