@@ -163,3 +163,159 @@ export async function cancelSearch(searchId) {
     console.warn('[Cancel] Failed to notify backend:', e);
   }
 }
+
+/**
+ * Stream search through all accounts a user is following
+ * 
+ * @param {Object} options - Stream options
+ * @param {Object} options.payload - Request payload to send
+ * @param {AbortController} options.controller - Abort controller for cancellation
+ * @param {Function} options.onFollowingList - Called when following list is received
+ * @param {Function} options.onMatch - Called when a match event is received
+ * @param {Function} options.onSellerDone - Called when a seller is done being processed
+ * @param {Function} options.onProgress - Called when a progress event is received
+ * @param {Function} options.onError - Called when an error occurs
+ * @param {Function} options.onDone - Called when stream completes
+ */
+export async function streamFollowing({
+  payload,
+  controller,
+  onFollowingList,
+  onMatch,
+  onSellerDone,
+  onProgress,
+  onError,
+  onDone,
+}) {
+  try {
+    console.log('[SSE-Following] Starting stream with payload:', payload);
+    
+    const res = await fetch(`${API_BASE}/api/search/following/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+    
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    }
+    
+    if (!res.body) {
+      throw new Error('No response body for streaming');
+    }
+    
+    console.log('[SSE-Following] Connected successfully');
+    
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    let eventCount = 0;
+    let isAborted = false;
+    
+    controller.signal.addEventListener('abort', () => {
+      isAborted = true;
+      console.log('[SSE-Following] Stream aborted by user');
+    });
+    
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        
+        if (done || isAborted) {
+          console.log('[SSE-Following] Stream ended, total events:', eventCount);
+          break;
+        }
+        
+        buffer += decoder.decode(value, { stream: true });
+        
+        // Process complete SSE events
+        let sepIndex;
+        while ((sepIndex = buffer.indexOf('\n\n')) !== -1) {
+          const rawEvent = buffer.slice(0, sepIndex).trim();
+          buffer = buffer.slice(sepIndex + 2);
+          
+          if (!rawEvent || rawEvent.startsWith(':')) continue;
+          
+          const eventLine = rawEvent.startsWith('data:') ? rawEvent.slice(5).trim() : rawEvent;
+          
+          try {
+            const evt = JSON.parse(eventLine);
+            eventCount++;
+            console.log(`[SSE-Following] Event #${eventCount}:`, evt.type);
+            
+            switch (evt.type) {
+              case 'following_list':
+                onFollowingList?.({
+                  usernames: evt.usernames,
+                  count: evt.count
+                });
+                break;
+              case 'match':
+                if (evt.item) {
+                  onMatch?.(evt);
+                }
+                break;
+              case 'seller_done':
+                onSellerDone?.({
+                  seller: evt.seller,
+                  matches: evt.matches,
+                  processed: evt.processed,
+                  total: evt.total
+                });
+                break;
+              case 'seller_error':
+                console.warn(`[SSE-Following] Seller error for ${evt.seller}:`, evt.error);
+                onSellerDone?.({
+                  seller: evt.seller,
+                  matches: 0,
+                  processed: evt.processed,
+                  total: evt.total,
+                  error: evt.error
+                });
+                break;
+              case 'progress':
+                onProgress?.({
+                  phase: evt.phase,
+                  message: evt.message,
+                  processed: evt.processed,
+                  total: evt.total,
+                  matches: evt.matches
+                });
+                break;
+              case 'cancelled':
+              case 'done':
+                onDone?.();
+                return;
+              case 'error':
+                onError?.(evt.message || 'Stream error');
+                return;
+              case 'hello':
+                console.log('[SSE-Following] Hello from server:', evt.ts);
+                break;
+            }
+          } catch (e) {
+            console.warn('[SSE-Following] Failed to parse event:', e);
+          }
+        }
+      }
+    } catch (readError) {
+      if (!isAborted) throw readError;
+    }
+    
+    onDone?.();
+    
+  } catch (err) {
+    if (err.name === 'AbortError' || err.message?.includes('aborted')) {
+      console.log('[SSE-Following] Stream was cancelled by user');
+      onDone?.();
+    } else {
+      console.error('[SSE-Following] Stream failed:', err);
+      onError?.(String(err));
+    }
+  }
+}

@@ -77,6 +77,79 @@ def accept_cookies(page: Page) -> None:
             continue
 
 
+def dismiss_login_modal(page: Page) -> None:
+    """Dismiss login/signup modal popup if it appears ('Want in?' modal)."""
+    try:
+        # Wait up to 3 seconds for the modal to appear, checking periodically
+        close_selectors = [
+            # The X button in the modal - look for buttons near the modal content
+            "button:has-text('×')",
+            "button:has-text('✕')",
+            "button:has-text('X')",
+            # SVG close buttons
+            "button svg[class*='close']",
+            "button[class*='close']",
+            "button[aria-label='Close']",
+            "button[aria-label='close']",
+            # Look for button that's a sibling/near "Want in?" text
+            "[class*='Modal'] button:not(:has-text('Sign up')):not(:has-text('Log in'))",
+        ]
+        
+        # Try for 3 seconds (6 attempts x 500ms)
+        for attempt in range(60):
+            # Check each selector
+            for selector in close_selectors:
+                try:
+                    close_btn = page.locator(selector).first
+                    if close_btn.count() and close_btn.is_visible(timeout=300):
+                        close_btn.click(timeout=2000)
+                        print(f"[login-modal] Dismissed login modal via: {selector}")
+                        page.wait_for_timeout(500)
+                        return
+                except Exception:
+                    continue
+            
+            # Try JavaScript approach
+            try:
+                clicked = page.evaluate("""() => {
+                    const modal = document.querySelector('[class*="Modal"], [role="dialog"]');
+                    if (!modal) return false;
+                    
+                    const buttons = modal.querySelectorAll('button');
+                    for (const btn of buttons) {
+                        const text = (btn.textContent || '').trim().toLowerCase();
+                        if (text.includes('sign up') || text.includes('log in')) continue;
+                        if (btn.offsetParent !== null) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if clicked:
+                    print("[login-modal] Dismissed login modal via JS click")
+                    page.wait_for_timeout(500)
+                    return
+            except Exception:
+                pass
+            
+            # Wait before next attempt
+            page.wait_for_timeout(500)
+        
+        # Try pressing Escape key as final fallback
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(500)
+            print("[login-modal] Pressed Escape to dismiss modal")
+        except Exception:
+            pass
+        except Exception:
+            pass
+            
+    except Exception as e:
+        print(f"[login-modal] Error dismissing login modal: {e}")
+
+
 def remove_sold_sections(page: Page) -> None:
     """Remove sold items section from page."""
     try:
@@ -286,10 +359,95 @@ def parse_listing(page: Page, url: str) -> Optional[Dict[str, Any]]:
 
 
 def create_browser_context(pw, headless: bool = True, slowmo: int = 0) -> tuple:
-    """Create a browser and context with standard settings."""
-    browser = pw.chromium.launch(headless=headless, slow_mo=slowmo)
+    """Create a browser and context with anti-detection settings."""
+    # Use Firefox - harder to fingerprint than Chromium
+    browser = pw.firefox.launch(
+        headless=headless,
+        slow_mo=slowmo,
+    )
     ctx = browser.new_context(
-        user_agent="Depop-Fit-Finder/0.1 (+contact)",
-        viewport={"width": 1200, "height": 800}
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+        viewport={"width": 1280, "height": 900},
+        locale="en-US",
+        timezone_id="America/New_York",
     )
     return browser, ctx
+
+
+def get_following_list(page: Page, username: str) -> List[str]:
+    """
+    Navigate to a user's profile, click the following button to open modal,
+    and extract all usernames they are following.
+    """
+    profile_url = f"https://www.depop.com/{username.strip().lstrip('@').strip('/')}/"
+    print(f"[following] Navigating to {profile_url}")
+    
+    page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
+    accept_cookies(page)
+    page.wait_for_load_state("networkidle", timeout=60000)
+    
+    # Dismiss login modal if it pops up
+    dismiss_login_modal(page)
+    
+    following_usernames: List[str] = []
+    
+    try:
+        # Click the following button to open the modal
+        # button class="styles_followCount__UzSsn styles_followCountOwnShop__LrExh"
+        follow_btn = page.locator("button.styles_followCount__UzSsn").first
+        if not follow_btn.count():
+            # Try alternative selector
+            follow_btn = page.locator("button:has-text('Following')").first
+        
+        if follow_btn.count():
+            follow_btn.click(timeout=5000)
+            page.wait_for_timeout(1500)  # Wait for modal to open
+            
+            # Scroll the modal to load all following
+            modal_selector = "[class*='Modal'], [role='dialog'], [class*='modal']"
+            max_scroll_attempts = 20
+            last_count = 0
+            
+            for _ in range(max_scroll_attempts):
+                # Get usernames from modal
+                # <p class="_text_bevez_41 _shared_bevez_6 _normal_bevez_51 _caption1_bevez_55">@username</p>
+                usernames = page.eval_on_selector_all(
+                    "p._text_bevez_41._shared_bevez_6._normal_bevez_51._caption1_bevez_55",
+                    "els => els.map(e => e.textContent || '').filter(t => t.startsWith('@'))"
+                )
+                
+                for uname in usernames:
+                    clean_name = uname.strip().lstrip('@')
+                    if clean_name and clean_name not in following_usernames:
+                        following_usernames.append(clean_name)
+                
+                # Try scrolling the modal
+                try:
+                    page.evaluate(f"""() => {{
+                        const modal = document.querySelector("{modal_selector}");
+                        if (modal) {{
+                            const scrollable = modal.querySelector('[class*="scroll"], [style*="overflow"]') || modal;
+                            scrollable.scrollTop = scrollable.scrollHeight;
+                        }}
+                    }}""")
+                except Exception:
+                    pass
+                
+                page.wait_for_timeout(800)
+                
+                # Check if we've loaded more
+                if len(following_usernames) == last_count:
+                    break
+                last_count = len(following_usernames)
+            
+            # Close modal by pressing Escape or clicking outside
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+                
+    except Exception as e:
+        print(f"[following] Error extracting following list: {e}")
+    
+    print(f"[following] Found {len(following_usernames)} accounts")
+    return following_usernames

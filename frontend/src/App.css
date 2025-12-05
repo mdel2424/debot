@@ -356,3 +356,138 @@ body, .app-dark-ui {
     max-width: 160px;
   }
 }
+
+/* Following Tab Styles */
+.following-container {
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.following-header {
+  margin-bottom: 1.5rem;
+}
+
+.following-header h2 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin: 0 0 0.5rem 0;
+  color: #ffffff;
+}
+
+.following-description {
+  color: #888888;
+  font-size: 0.95rem;
+  margin: 0;
+}
+
+.following-inputs {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-bottom: 1.5rem;
+  background: #111111;
+  padding: 1.25rem;
+  border-radius: 12px;
+  border: 1px solid #333333;
+}
+
+.input-profile {
+  min-width: 180px;
+}
+
+.following-progress {
+  background: #111111;
+  border: 1px solid #333333;
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1.5rem;
+  font-size: 0.9rem;
+  color: #cccccc;
+  font-family: ui-monospace, 'SF Mono', Consolas, monospace;
+}
+
+.following-error {
+  background: #331111;
+  border: 1px solid #661111;
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1.5rem;
+  font-size: 0.9rem;
+  color: #ff6666;
+}
+
+.following-sellers {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.seller-row-card {
+  background: #111111;
+  border: 1px solid #333333;
+  border-radius: 12px;
+  padding: 1rem 1.25rem;
+  transition: border-color 0.2s ease;
+}
+
+.seller-row-card:hover {
+  border-color: #555555;
+}
+
+.seller-row-card.loading {
+  opacity: 0.85;
+  border-color: #555555;
+}
+
+.seller-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.seller-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.seller-name {
+  color: #ffffff;
+  text-decoration: none;
+  font-weight: 600;
+  font-size: 1rem;
+  transition: color 0.2s ease;
+}
+
+.seller-name:hover {
+  color: #aaaaff;
+  text-decoration: underline;
+}
+
+.seller-username {
+  color: #888888;
+  font-size: 0.85rem;
+}
+
+.seller-controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.seller-status {
+  color: #888888;
+  font-size: 0.85rem;
+  font-family: ui-monospace, 'SF Mono', Consolas, monospace;
+}
+
+.search-btn.small {
+  padding: 0.5rem 0.75rem;
+  font-size: 0.8rem;
+}
+
+.seller-row-card .results-scroll {
+  margin-top: 0.5rem;
+}

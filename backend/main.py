@@ -18,10 +18,12 @@ from parser import parser
 from scraper import (
     build_seller_url,
     accept_cookies,
+    dismiss_login_modal,
     remove_sold_sections,
     collect_listing_links,
     parse_listing,
     create_browser_context,
+    get_following_list,
     BROWSE_URL,
 )
 
@@ -221,6 +223,7 @@ def _search_seller(ctx, page, seller, groups, gender,
     page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
     accept_cookies(page)
     page.wait_for_load_state("networkidle", timeout=60000)
+    dismiss_login_modal(page)
     remove_sold_sections(page)
     
     yield _sse({"type": "progress", "phase": "landing", "processed": 0, "total": None, "matches": 0, "searchId": search_id or None})
@@ -243,6 +246,13 @@ def _search_seller(ctx, page, seller, groups, gender,
         processed += 1
         
         if item:
+            # Stop if item is over 45 days old (listings are sorted by newest)
+            age_days = item.get("ageDays")
+            if age_days is not None and age_days > 45:
+                print(f"[stream] Item is {age_days:.1f} days old, stopping (max 45 days)")
+                yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None, "stopped": "age_limit"})
+                break
+            
             match = _process_item(item, target_p2p, target_length, p2p_tol, length_tol)
             if match:
                 print(f"[stream] MATCH {processed}/{total} p2p={match['p2p']} len={match['length']}")
@@ -265,6 +275,17 @@ def _browse_all(ctx, page, target_p2p, target_length, p2p_tol, length_tol,
     page.goto(BROWSE_URL, wait_until="domcontentloaded", timeout=60000)
     accept_cookies(page)
     page.wait_for_load_state("networkidle", timeout=60000)
+    dismiss_login_modal(page)
+    
+    # Wait for product grid to appear
+    try:
+        page.wait_for_selector('a[href^="/products/"]', timeout=10000)
+        print("[stream] Product links found on page")
+    except Exception as e:
+        print(f"[stream] Warning: No product links selector found: {e}")
+    
+    # Extra wait for dynamic content
+    page.wait_for_timeout(2000)
     
     yield _sse({"type": "progress", "phase": "browsing", "processed": 0, "matches": 0, "searchId": search_id or None})
     
@@ -272,12 +293,18 @@ def _browse_all(ctx, page, target_p2p, target_length, p2p_tol, length_tol,
     processed = 0
     matches = 0
     
+    # Initial collection with more scrolls
+    found_links = collect_listing_links(page, max_scrolls=3, per_scroll_wait_ms=1500)
+    print(f"[stream] Initial collection found {len(found_links)} links")
+    
     while processed < max_links:
         if _is_cancelled(search_id):
             yield _sse({"type": "cancelled", "searchId": search_id})
             return
         
-        found_links = collect_listing_links(page, max_scrolls=1, per_scroll_wait_ms=1000)
+        # Use already-found links on first iteration, then collect more
+        if processed > 0:
+            found_links = collect_listing_links(page, max_scrolls=2, per_scroll_wait_ms=1000)
         unique_new = [u for u in found_links if u not in seen_urls]
         
         if not unique_new:
@@ -337,3 +364,259 @@ async def cancel_stream(payload: Dict[str, Any] = Body(...)):
     CANCEL_FLAGS[search_id] = True
     print(f"[cancel] requested for searchId={search_id}")
     return {"ok": True, "searchId": search_id}
+
+
+@app.post("/api/search/following/stream")
+async def browse_following_stream(request: Request):
+    """SSE streaming endpoint to browse all accounts a user is following."""
+    payload = await request.json()
+    print("[following-stream] payload:", payload)
+    
+    username = (payload.get("username") or "").strip().lstrip("@")
+    if not username:
+        async def empty_gen():
+            yield SSE_PREAMBLE
+            yield _sse({"type": "error", "message": "Username required"})
+            yield _sse({"type": "done"})
+        return StreamingResponse(empty_gen(), media_type="text/event-stream")
+    
+    ms = payload.get("measurements") or {}
+    target_p2p = float(ms["first"]) if ms.get("first") is not None else None
+    target_length = float(ms["second"]) if ms.get("second") is not None else None
+    p2p_tol = float(payload.get("p2pTolerance") or 1)
+    length_tol = float(payload.get("lengthTolerance") or 0.5)
+    
+    max_items_per_seller = int(payload.get("maxItemsPerSeller") or 10)
+    max_links_per_seller = int(payload.get("maxLinksPerSeller") or 100)
+    max_scrolls = int(payload.get("maxScrolls") or 4)
+    max_threads = int(payload.get("maxThreads") or 5)  # Limit concurrent threads
+    headless = bool(payload.get("headless", False))
+    slowmo = int(payload.get("slowmo") or 0)
+    gender = payload.get("gender") or "male"
+    groups = payload.get("groups") or "tops"
+    search_id = str(payload.get("searchId") or "")
+    
+    if search_id:
+        CANCEL_FLAGS[search_id] = False
+
+    def run_following_search():
+        """Synchronous search generator for following accounts."""
+        try:
+            yield SSE_PREAMBLE
+            yield _sse({"type": "hello", "searchId": search_id or None, "ts": dt.datetime.utcnow().isoformat()})
+            
+            with sync_playwright() as pw:
+                browser, ctx = create_browser_context(pw, headless=headless, slowmo=slowmo)
+                page = ctx.new_page()
+                
+                try:
+                    # Get the following list first
+                    yield _sse({"type": "progress", "phase": "getting_following", "message": f"Getting following list for @{username}", "searchId": search_id})
+                    
+                    following_list = get_following_list(page, username)
+                    
+                    if not following_list:
+                        yield _sse({"type": "error", "message": f"Could not find any accounts that @{username} follows", "searchId": search_id})
+                        yield _sse({"type": "done", "searchId": search_id})
+                        return
+                    
+                    yield _sse({
+                        "type": "following_list",
+                        "usernames": following_list,
+                        "count": len(following_list),
+                        "searchId": search_id
+                    })
+                    
+                    # Now browse each account using threading
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    import threading
+                    
+                    results_queue = queue.Queue()
+                    processed_sellers = [0]
+                    total_matches = [0]
+                    lock = threading.Lock()
+                    
+                    def search_seller_thread(seller_name: str, thread_id: int):
+                        """Search a single seller in a separate thread."""
+                        if _is_cancelled(search_id):
+                            return
+                        
+                        try:
+                            # Create a new page for this thread
+                            thread_page = ctx.new_page()
+                            try:
+                                search_url = build_seller_url(seller_name, groups=groups, gender=gender)
+                                thread_page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+                                accept_cookies(thread_page)
+                                thread_page.wait_for_load_state("networkidle", timeout=60000)
+                                dismiss_login_modal(thread_page)
+                                remove_sold_sections(thread_page)
+                                
+                                links = collect_listing_links(thread_page, max_scrolls=max_scrolls, max_links=max_links_per_seller)
+                                
+                                seller_matches = 0
+                                for url in links:
+                                    if _is_cancelled(search_id):
+                                        break
+                                    
+                                    item = parse_listing(thread_page, url)
+                                    if item:
+                                        # Stop if item is over 45 days old
+                                        age_days = item.get("ageDays")
+                                        if age_days is not None and age_days > 45:
+                                            print(f"[following-thread] {seller_name}: Item is {age_days:.1f} days old, stopping")
+                                            break
+                                        
+                                        match = _process_item(item, target_p2p, target_length, p2p_tol, length_tol)
+                                        if match:
+                                            results_queue.put({
+                                                "type": "match",
+                                                "item": match,
+                                                "seller": seller_name,
+                                                "searchId": search_id
+                                            })
+                                            seller_matches += 1
+                                            with lock:
+                                                total_matches[0] += 1
+                                            
+                                            if seller_matches >= max_items_per_seller:
+                                                break
+                                
+                                with lock:
+                                    processed_sellers[0] += 1
+                                    results_queue.put({
+                                        "type": "seller_done",
+                                        "seller": seller_name,
+                                        "matches": seller_matches,
+                                        "processed": processed_sellers[0],
+                                        "total": len(following_list),
+                                        "searchId": search_id
+                                    })
+                                    
+                            finally:
+                                thread_page.close()
+                                
+                        except Exception as e:
+                            print(f"[following-thread] Error searching {seller_name}: {e}")
+                            with lock:
+                                processed_sellers[0] += 1
+                                results_queue.put({
+                                    "type": "seller_error",
+                                    "seller": seller_name,
+                                    "error": str(e),
+                                    "processed": processed_sellers[0],
+                                    "total": len(following_list),
+                                    "searchId": search_id
+                                })
+                    
+                    # Start threading
+                    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+                        futures = {
+                            executor.submit(search_seller_thread, seller, i): seller
+                            for i, seller in enumerate(following_list)
+                        }
+                        
+                        # Yield results as they come in
+                        completed_count = 0
+                        while completed_count < len(following_list):
+                            if _is_cancelled(search_id):
+                                yield _sse({"type": "cancelled", "searchId": search_id})
+                                return
+                            
+                            try:
+                                while True:
+                                    try:
+                                        result = results_queue.get_nowait()
+                                        yield _sse(result)
+                                        if result["type"] in ["seller_done", "seller_error"]:
+                                            completed_count = result["processed"]
+                                    except queue.Empty:
+                                        break
+                            except Exception:
+                                pass
+                            
+                            # Brief sleep to avoid busy-waiting
+                            time.sleep(0.05)
+                        
+                        # Drain any remaining results
+                        while not results_queue.empty():
+                            try:
+                                result = results_queue.get_nowait()
+                                yield _sse(result)
+                            except queue.Empty:
+                                break
+                    
+                finally:
+                    ctx.close()
+                    browser.close()
+                    
+        except Exception as e:
+            print(f"[following-stream] error: {e}")
+            yield _sse({"type": "error", "message": str(e), "searchId": search_id or None})
+        finally:
+            yield _sse({"type": "done", "searchId": search_id or None})
+            if search_id and search_id in CANCEL_FLAGS:
+                del CANCEL_FLAGS[search_id]
+
+    async def async_wrapper():
+        """Run sync generator in thread and yield results async."""
+        result_queue = queue.Queue()
+        error_holder = [None]
+        
+        def worker():
+            try:
+                for chunk in run_following_search():
+                    result_queue.put(("data", chunk))
+                result_queue.put(("done", None))
+            except Exception as e:
+                error_holder[0] = e
+                result_queue.put(("error", None))
+        
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        
+        while True:
+            try:
+                if await request.is_disconnected():
+                    CANCEL_FLAGS[search_id] = True
+                    break
+            except Exception:
+                pass
+            
+            start = time.time()
+            while True:
+                try:
+                    msg_type, data = result_queue.get_nowait()
+                    break
+                except queue.Empty:
+                    if time.time() - start > 0.1:
+                        if not thread.is_alive():
+                            if error_holder[0]:
+                                raise error_holder[0]
+                            try:
+                                msg_type, data = result_queue.get_nowait()
+                                break
+                            except queue.Empty:
+                                return
+                        await asyncio.sleep(0.01)
+                        start = time.time()
+                    else:
+                        await asyncio.sleep(0.001)
+            
+            if msg_type == "done":
+                break
+            elif msg_type == "error" and error_holder[0]:
+                raise error_holder[0]
+            elif msg_type == "data":
+                yield data
+
+    return StreamingResponse(
+        async_wrapper(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
