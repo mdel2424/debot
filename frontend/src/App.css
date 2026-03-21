@@ -128,11 +128,25 @@ body, .app-dark-ui {
 }
 
 .progress-counter {
+  background: #181818;
+  border: 1px solid #3a3a3a;
+  border-radius: 999px;
   font-size: 0.875rem;
   color: #cccccc;
   font-family: ui-monospace, 'SF Mono', Consolas, monospace;
   white-space: nowrap;
   font-weight: 500;
+  padding: 0.45rem 0.8rem;
+}
+
+.row-error {
+  background: #331111;
+  border: 1px solid #661111;
+  border-radius: 8px;
+  color: #ff8080;
+  font-size: 0.88rem;
+  margin-bottom: 0.75rem;
+  padding: 0.7rem 0.9rem;
 }
 
 /* Inputs */
@@ -475,12 +489,15 @@ body, .app-dark-ui {
   display: flex;
   align-items: center;
   gap: 1rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .seller-status {
   color: #888888;
   font-size: 0.85rem;
   font-family: ui-monospace, 'SF Mono', Consolas, monospace;
+  text-align: right;
 }
 
 .search-btn.small {
@@ -490,4 +507,12 @@ body, .app-dark-ui {
 
 .seller-row-card .results-scroll {
   margin-top: 0.5rem;
+}
+
+.seller-row-error {
+  margin-top: 0.25rem;
+}
+
+.seller-progress-counter {
+  margin-bottom: 0.6rem;
 }

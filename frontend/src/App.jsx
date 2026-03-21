@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import Sidebar from './components/Sidebar';
 import SearchRow from './components/SearchRow';
 import { streamSearch, cancelSearch, makeSearchId } from './hooks/useStream';
@@ -9,6 +9,11 @@ const pages = [
   { name: 'Home', icon: '🏠' },
   { name: 'Following', icon: '👥' },
 ];
+
+const DEFAULT_P2P = '21.5';
+const DEFAULT_LENGTH = '27';
+const DEFAULT_P2P_TOLERANCE = '0.5';
+const DEFAULT_LENGTH_TOLERANCE = '0.75';
 
 // Predefined list of followed sellers
 const FOLLOWING_ACCOUNTS = [
@@ -37,28 +42,63 @@ const FOLLOWING_ACCOUNTS = [
 
 const defaultSearch = { 
   seller: 'flashyfashion', 
-  length: '27', 
-  p2p: '21.5', 
-  p2pTolerance: '0.5', 
-  lengthTolerance: '1', 
+  length: DEFAULT_LENGTH, 
+  p2p: DEFAULT_P2P, 
+  p2pTolerance: DEFAULT_P2P_TOLERANCE, 
+  lengthTolerance: DEFAULT_LENGTH_TOLERANCE, 
   results: [], 
   loading: false, 
   error: '', 
+  errorCode: null,
   searchId: '', 
   controller: null, 
   progress: null 
 };
 
+const createProgressState = (overrides = {}) => ({
+  processed: 0,
+  total: 0,
+  matches: 0,
+  ...overrides,
+});
+
+const formatProgressLabel = (progress) => {
+  if (!progress) {
+    return null;
+  }
+
+  const processed = Number(progress.processed) || 0;
+  const matches = Number(progress.matches) || 0;
+  const total = Number(progress.total);
+
+  if (Number.isFinite(total) && total > 0) {
+    return `${matches} hits • ${processed}/${total} searched`;
+  }
+
+  return `${matches} hits • ${processed} searched`;
+};
+
+const formatSellerStatusLabel = (sellerRow) => {
+  const progress = sellerRow?.progress;
+  const hits = Number(progress?.matches);
+  const processed = Number(progress?.processed) || 0;
+  const total = Number(progress?.total) || 0;
+  const safeHits = Number.isFinite(hits) ? hits : (sellerRow?.results?.length || 0);
+
+  return `${safeHits} hits • ${processed} parsed / ${total} collected`;
+};
+
 function App() {
   const [activePage, setActivePage] = useState('Home');
   const [searchRows, setSearchRows] = useState([{ ...defaultSearch }]);
+  const followingSearchesRef = useRef(new Map());
   
   // Following tab state - pre-populated with accounts
   const [followingState, setFollowingState] = useState({
-    p2p: '21.5',
-    length: '27',
-    p2pTolerance: '0.5',
-    lengthTolerance: '1',
+    p2p: DEFAULT_P2P,
+    length: DEFAULT_LENGTH,
+    p2pTolerance: DEFAULT_P2P_TOLERANCE,
+    lengthTolerance: DEFAULT_LENGTH_TOLERANCE,
     loading: false,
     sellerRows: FOLLOWING_ACCOUNTS.map(acc => ({
       seller: acc.username,
@@ -67,11 +107,52 @@ function App() {
       loading: false,
       processed: false,
       error: null,
+      errorCode: null,
       searchId: '',
       controller: null,
+      progress: null,
     })),
     progress: null,
   });
+
+  const getStreamErrorDetails = (error) => {
+    if (typeof error === 'string') {
+      return { message: error, code: null };
+    }
+
+    return {
+      message: error?.message || 'Stream error',
+      code: error?.code || null,
+    };
+  };
+
+  const syncFollowingLoading = () => {
+    setFollowingState(prev => ({
+      ...prev,
+      loading: followingSearchesRef.current.size > 0,
+    }));
+  };
+
+  const registerFollowingSearch = (sellerUsername, searchId, controller) => {
+    followingSearchesRef.current.set(sellerUsername, { searchId, controller });
+    syncFollowingLoading();
+  };
+
+  const finishFollowingSearch = (sellerUsername, searchId, updates) => {
+    const activeSearch = followingSearchesRef.current.get(sellerUsername);
+    if (!activeSearch || activeSearch.searchId !== searchId) {
+      return false;
+    }
+
+    followingSearchesRef.current.delete(sellerUsername);
+    syncFollowingLoading();
+    updateFollowingSellerRow(sellerUsername, {
+      controller: null,
+      searchId: '',
+      ...updates,
+    });
+    return true;
+  };
 
   // Row state helpers
   const handleInput = (idx, field, value) => {
@@ -142,8 +223,8 @@ function App() {
   const buildPayload = (row, searchId, isBrowse = false) => {
     const p2p = parseFloat(row.p2p);
     const length = parseFloat(row.length);
-    const p2pTolerance = row.p2pTolerance === '' ? 1 : parseFloat(row.p2pTolerance);
-    const lengthTolerance = row.lengthTolerance === '' ? 0.5 : parseFloat(row.lengthTolerance);
+    const p2pTolerance = row.p2pTolerance === '' ? parseFloat(DEFAULT_P2P_TOLERANCE) : parseFloat(row.p2pTolerance);
+    const lengthTolerance = row.lengthTolerance === '' ? parseFloat(DEFAULT_LENGTH_TOLERANCE) : parseFloat(row.lengthTolerance);
     
     return {
       category: 'tops',
@@ -151,8 +232,8 @@ function App() {
         first: isNaN(p2p) ? null : p2p,
         second: isNaN(length) ? null : length,
       },
-      p2pTolerance: isNaN(p2pTolerance) ? 1 : p2pTolerance,
-      lengthTolerance: isNaN(lengthTolerance) ? 0.5 : lengthTolerance,
+      p2pTolerance: isNaN(p2pTolerance) ? parseFloat(DEFAULT_P2P_TOLERANCE) : p2pTolerance,
+      lengthTolerance: isNaN(lengthTolerance) ? parseFloat(DEFAULT_LENGTH_TOLERANCE) : lengthTolerance,
       seller: isBrowse ? "" : (row.seller || null),
       maxItems: isBrowse ? 100 : 40,
       maxLinks: isBrowse ? 10000 : 1000,
@@ -169,10 +250,11 @@ function App() {
     setRowState(idx, { 
       loading: true, 
       error: '', 
+      errorCode: null,
       results: [], 
       controller, 
       searchId,
-      progress: null 
+      progress: createProgressState({ phase: 'starting' }),
     });
     
     await streamSearch({
@@ -186,12 +268,17 @@ function App() {
         matches: 0, 
         phase: 'scanning' 
       }),
-      onError: (message) => setRowState(idx, { 
-        loading: false, 
-        error: message, 
-        controller: null 
-      }),
-      onDone: () => setRowState(idx, { loading: false, controller: null }),
+      onError: (error) => {
+        const { message, code } = getStreamErrorDetails(error);
+        setRowState(idx, { 
+          loading: false, 
+          error: message,
+          errorCode: code,
+          controller: null,
+          searchId: '',
+        });
+      },
+      onDone: () => setRowState(idx, { loading: false, controller: null, searchId: '' }),
     });
   };
 
@@ -204,10 +291,11 @@ function App() {
     setRowState(idx, { 
       loading: true, 
       error: '', 
+      errorCode: null,
       results: [], 
       controller, 
       searchId,
-      progress: null 
+      progress: createProgressState({ phase: 'starting' }),
     });
     
     await streamSearch({
@@ -222,12 +310,17 @@ function App() {
         }
       },
       onProgress: (progress) => updateProgress(idx, { ...progress, phase: 'browsing' }),
-      onError: (message) => setRowState(idx, { 
-        loading: false, 
-        error: message, 
-        controller: null 
-      }),
-      onDone: () => setRowState(idx, { loading: false, controller: null }),
+      onError: (error) => {
+        const { message, code } = getStreamErrorDetails(error);
+        setRowState(idx, { 
+          loading: false, 
+          error: message,
+          errorCode: code,
+          controller: null,
+          searchId: '',
+        });
+      },
+      onDone: () => setRowState(idx, { loading: false, controller: null, searchId: '' }),
     });
   };
 
@@ -245,7 +338,7 @@ function App() {
       }
     }
     
-    setRowState(idx, { loading: false, controller: null });
+    setRowState(idx, { loading: false, controller: null, searchId: '', error: '', errorCode: null });
   };
 
   // Following tab handlers
@@ -279,21 +372,28 @@ function App() {
 
   // Start searching a single seller in the following list
   const startFollowingSellerSearch = async (sellerUsername) => {
+    if (followingSearchesRef.current.has(sellerUsername)) {
+      return;
+    }
+
     const controller = new AbortController();
     const searchId = makeSearchId();
     
     const p2p = parseFloat(followingState.p2p);
     const length = parseFloat(followingState.length);
-    const p2pTolerance = followingState.p2pTolerance === '' ? 0.5 : parseFloat(followingState.p2pTolerance);
-    const lengthTolerance = followingState.lengthTolerance === '' ? 1 : parseFloat(followingState.lengthTolerance);
+    const p2pTolerance = followingState.p2pTolerance === '' ? parseFloat(DEFAULT_P2P_TOLERANCE) : parseFloat(followingState.p2pTolerance);
+    const lengthTolerance = followingState.lengthTolerance === '' ? parseFloat(DEFAULT_LENGTH_TOLERANCE) : parseFloat(followingState.lengthTolerance);
     
+    registerFollowingSearch(sellerUsername, searchId, controller);
     updateFollowingSellerRow(sellerUsername, {
       loading: true,
       error: null,
+      errorCode: null,
       results: [],
       searchId,
       controller,
       processed: false,
+      progress: createProgressState({ phase: 'starting' }),
     });
     
     const payload = {
@@ -302,8 +402,8 @@ function App() {
         first: isNaN(p2p) ? null : p2p,
         second: isNaN(length) ? null : length,
       },
-      p2pTolerance: isNaN(p2pTolerance) ? 0.5 : p2pTolerance,
-      lengthTolerance: isNaN(lengthTolerance) ? 1 : lengthTolerance,
+      p2pTolerance: isNaN(p2pTolerance) ? parseFloat(DEFAULT_P2P_TOLERANCE) : p2pTolerance,
+      lengthTolerance: isNaN(lengthTolerance) ? parseFloat(DEFAULT_LENGTH_TOLERANCE) : lengthTolerance,
       seller: sellerUsername,
       maxItems: 40,
       maxLinks: 1000,
@@ -316,63 +416,67 @@ function App() {
       onMatch: (evt) => addFollowingResult(sellerUsername, evt.item),
       onProgress: (progress) => updateFollowingSellerRow(sellerUsername, { progress }),
       onMeta: (meta) => updateFollowingSellerRow(sellerUsername, { 
-        progress: { total: meta.total, processed: 0, matches: 0 } 
+        progress: createProgressState({ total: meta.total })
       }),
-      onError: (message) => updateFollowingSellerRow(sellerUsername, { 
-        loading: false, 
-        error: message, 
-        controller: null,
-        processed: true,
-      }),
-      onDone: () => updateFollowingSellerRow(sellerUsername, { 
-        loading: false, 
-        controller: null,
-        processed: true,
-      }),
+      onError: (error) => {
+        const { message, code } = getStreamErrorDetails(error);
+        finishFollowingSearch(sellerUsername, searchId, {
+          loading: false,
+          error: message,
+          errorCode: code,
+          processed: true,
+        });
+      },
+      onDone: () => {
+        finishFollowingSearch(sellerUsername, searchId, {
+          loading: false,
+          processed: true,
+        });
+      },
     });
   };
 
   // Cancel a specific seller's search
   const cancelFollowingSellerSearch = async (sellerUsername) => {
+    const activeSearch = followingSearchesRef.current.get(sellerUsername);
     const sellerRow = followingState.sellerRows.find(r => r.seller === sellerUsername);
-    if (!sellerRow) return;
+    const searchId = activeSearch?.searchId || sellerRow?.searchId;
+    if (!searchId && !activeSearch?.controller) return;
     
-    await cancelSearch(sellerRow.searchId);
+    await cancelSearch(searchId);
     
-    if (sellerRow.controller) {
+    if (activeSearch?.controller) {
       try {
-        sellerRow.controller.abort();
+        activeSearch.controller.abort();
       } catch (e) {
         console.warn('[Cancel] Failed to abort controller:', e);
       }
     }
-    
-    updateFollowingSellerRow(sellerUsername, { loading: false, controller: null });
+
+    followingSearchesRef.current.delete(sellerUsername);
+    syncFollowingLoading();
+    updateFollowingSellerRow(sellerUsername, {
+      loading: false,
+      controller: null,
+      searchId: '',
+      error: null,
+      errorCode: null,
+    });
   };
 
   // Start searching ALL sellers in the following list
   const startBrowseAllFollowing = async () => {
-    setFollowingState(prev => ({ ...prev, loading: true }));
-    
-    // Start all searches in parallel
-    const promises = followingState.sellerRows.map(row => 
-      startFollowingSellerSearch(row.seller)
-    );
-    
-    await Promise.all(promises);
-    
-    setFollowingState(prev => ({ ...prev, loading: false }));
+    const sellersToStart = followingState.sellerRows
+      .map(row => row.seller)
+      .filter(seller => !followingSearchesRef.current.has(seller));
+
+    await Promise.all(sellersToStart.map(seller => startFollowingSellerSearch(seller)));
   };
 
   // Cancel ALL following searches
   const cancelAllFollowingSearches = async () => {
-    const promises = followingState.sellerRows
-      .filter(row => row.loading)
-      .map(row => cancelFollowingSellerSearch(row.seller));
-    
-    await Promise.all(promises);
-    
-    setFollowingState(prev => ({ ...prev, loading: false }));
+    const activeSellers = Array.from(followingSearchesRef.current.keys());
+    await Promise.all(activeSellers.map(seller => cancelFollowingSellerSearch(seller)));
   };
 
   return (
@@ -386,6 +490,7 @@ function App() {
                 key={idx}
                 row={row}
                 idx={idx}
+                progressLabel={formatProgressLabel(row.progress)}
                 handleInput={handleInput}
                 startStream={startStream}
                 cancelStream={cancelStream}
@@ -476,10 +581,16 @@ function App() {
                       <span className="seller-status">
                         {sellerRow.loading ? '⏳' : sellerRow.error ? '❌' : sellerRow.processed ? '✓' : ''}
                         {' '}
-                        {sellerRow.results.length} matches
+                        {formatSellerStatusLabel(sellerRow)}
                       </span>
                     </div>
                   </div>
+
+                  {sellerRow.error && (
+                    <div className="row-error seller-row-error">
+                      {sellerRow.error}
+                    </div>
+                  )}
                   
                   {sellerRow.results.length > 0 && (
                     <div className="results-scroll">

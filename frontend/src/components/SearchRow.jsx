@@ -1,6 +1,6 @@
 import React from 'react';
 
-const SearchRow = ({ row, idx, handleInput, startStream, cancelStream, startBrowse }) => {
+const SearchRow = ({ row, idx, progressLabel, handleInput, startStream, cancelStream, startBrowse }) => {
   return (
     <div className="search-row-card">
       <div className="search-row-inputs">
@@ -43,13 +43,19 @@ const SearchRow = ({ row, idx, handleInput, startStream, cancelStream, startBrow
               <button className="search-btn secondary" onClick={() => startBrowse(idx)}>Browse All</button>
             </div>
           )}
-          {row.progress && (
+          {progressLabel && (
             <div className="progress-counter">
-              {row.progress.processed || 0}/{row.progress.total || 0} • {row.progress.matches || 0} matches
+              {progressLabel}
             </div>
           )}
         </div>
       </div>
+
+      {row.error && (
+        <div className="row-error">
+          {row.error}
+        </div>
+      )}
 
       <div className="results-scroll">
         {/* Render results */}
@@ -67,7 +73,7 @@ const SearchRow = ({ row, idx, handleInput, startStream, cancelStream, startBrow
           const hasMeta = metaParts.length > 0;
 
           return (
-            <a className="result-card" key={`${res.url}-${i}` || i} href={res.url || '#'} target="_blank" rel="noreferrer">
+            <a className="result-card" key={res.url ? `${res.url}-${i}` : i} href={res.url || '#'} target="_blank" rel="noreferrer">
               {res.image ? (
                 <img className="result-img" src={res.image} alt="item" />
               ) : (

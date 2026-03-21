@@ -107,17 +107,20 @@ export async function streamSearch({
                 });
                 break;
               case 'meta':
-                onMeta?.({
-                  total: evt.links,
-                  seller: evt.seller
-                });
-                break;
+    onMeta?.({
+      total: evt.links,
+      seller: evt.seller
+    });
+    break;
               case 'cancelled':
               case 'done':
                 onDone?.();
                 return;
               case 'error':
-                onError?.(evt.message || 'Stream error');
+                onError?.({
+                  message: evt.message || 'Stream error',
+                  code: evt.code || null,
+                });
                 return;
               case 'hello':
                 console.log('[SSE] Hello from server:', evt.ts);
@@ -140,7 +143,10 @@ export async function streamSearch({
       onDone?.();
     } else {
       console.error('[SSE] Stream failed:', err);
-      onError?.(String(err));
+      onError?.({
+        message: String(err),
+        code: null,
+      });
     }
   }
 }
@@ -292,7 +298,10 @@ export async function streamFollowing({
                 onDone?.();
                 return;
               case 'error':
-                onError?.(evt.message || 'Stream error');
+                onError?.({
+                  message: evt.message || 'Stream error',
+                  code: evt.code || null,
+                });
                 return;
               case 'hello':
                 console.log('[SSE-Following] Hello from server:', evt.ts);
@@ -315,7 +324,10 @@ export async function streamFollowing({
       onDone?.();
     } else {
       console.error('[SSE-Following] Stream failed:', err);
-      onError?.(String(err));
+      onError?.({
+        message: String(err),
+        code: null,
+      });
     }
   }
 }

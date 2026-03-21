@@ -1,8 +1,10 @@
 """Depop scraping utilities using Playwright."""
 
 import re
+import time
+import json
 import datetime as dt
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable
 from urllib.parse import urljoin, urlparse, urlencode
 
 from playwright.sync_api import sync_playwright, Page, BrowserContext
@@ -10,7 +12,163 @@ from playwright.sync_api import sync_playwright, Page, BrowserContext
 # Constants
 PRICE_RX = re.compile(r"([$£€]\s?\d[\d,]*(?:\.\d{2})?)")
 RELTIME_RX = re.compile(r"\b(\d+)\s*(minute|hour|day|week|month)s?\s*ago\b", re.I)
+CREATED_AT_RX = re.compile(r'(?:\\\"|")created_at(?:\\\"|"):(?:\\\"|")([^"\\]+)(?:\\\"|")')
+SOLD_COUNT_RX = re.compile(r"(\d[\d,]*)\s*sold\b", re.I)
 BROWSE_URL = "https://www.depop.com/ca/category/mens/tops/?sort=newlyListed"
+CURRENCY_SYMBOLS = {
+    "USD": "US$",
+    "CAD": "$",
+    "GBP": "£",
+    "EUR": "€",
+}
+SCROLL_STEPS_PER_BATCH = 4
+SCROLL_STEP_RATIO = 0.7
+MAX_STALLED_SCROLL_STEPS = 2
+LOGIN_MODAL_MAX_ATTEMPTS = 6
+LOGIN_MODAL_WAIT_MS = 250
+LISTING_READY_TIMEOUT_MS = 1_500
+LISTING_READY_SELECTOR = (
+    "script[type='application/ld+json'], "
+    "p[aria-label='Price'], "
+    "time[datetime], "
+    "a[aria-label$=\"'s shop\"], "
+    "a:has-text('Visit shop'), "
+    "img[srcset], img[src]"
+)
+RATE_LIMIT_TEXT_SIGNALS = (
+    "too many requests",
+    "rate limited",
+    "rate limit",
+    "request limit",
+    "try again later",
+    "slow down",
+    "unusual traffic",
+    "temporarily blocked",
+)
+RATE_LIMIT_CHALLENGE_SIGNALS = (
+    "access denied",
+    "verify you are human",
+    "checking your browser",
+    "attention required",
+    "security check",
+    "please enable cookies",
+)
+CancelCheck = Optional[Callable[[], bool]]
+
+
+class SearchCancelled(Exception):
+    """Raised when a user cancels an in-flight search."""
+
+
+class RateLimitError(Exception):
+    """Raised when Depop is rate limiting or temporarily blocking requests."""
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
+        self.code = "rate_limited"
+
+
+def raise_if_cancelled(should_cancel: CancelCheck = None) -> None:
+    """Raise when the caller has requested cancellation."""
+    if should_cancel and should_cancel():
+        raise SearchCancelled("Search cancelled")
+
+
+def sleep_with_cancel(
+    delay_seconds: float,
+    should_cancel: CancelCheck = None,
+    interval_seconds: float = 0.1,
+) -> None:
+    """Sleep in short intervals so long waits can be interrupted promptly."""
+    remaining = max(delay_seconds, 0.0)
+    while remaining > 0:
+        raise_if_cancelled(should_cancel)
+        chunk = min(interval_seconds, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+    raise_if_cancelled(should_cancel)
+
+
+def extract_rate_limit_message(
+    text: str,
+    status: Optional[int] = None,
+    expected_content_missing: bool = False,
+) -> Optional[str]:
+    """Return a user-facing rate-limit message when text/status looks blocked."""
+    normalized = re.sub(r"\s+", " ", text or "").strip().lower()
+
+    if status == 429:
+        return "Depop returned HTTP 429 Too Many Requests."
+
+    if any(signal in normalized for signal in RATE_LIMIT_TEXT_SIGNALS):
+        return "Depop appears to be rate limiting requests right now."
+
+    if expected_content_missing and any(signal in normalized for signal in RATE_LIMIT_CHALLENGE_SIGNALS):
+        return "Depop appears to be temporarily blocking requests right now."
+
+    return None
+
+
+def _response_status(response: Any) -> Optional[int]:
+    """Safely read a Playwright response status when one exists."""
+    try:
+        status = getattr(response, "status", None)
+        return int(status) if status is not None else None
+    except Exception:
+        return None
+
+
+def _page_has_selector(page: Page, selector: str) -> bool:
+    """Best-effort check for whether a selector exists on the page."""
+    try:
+        return page.locator(selector).first.count() > 0
+    except Exception:
+        return False
+
+
+def check_page_for_rate_limit(
+    page: Page,
+    response_status: Optional[int] = None,
+    expect_product_links: bool = False,
+    expect_listing: bool = False,
+) -> None:
+    """Inspect the current page and raise when it looks rate limited."""
+    text_parts: List[str] = []
+
+    try:
+        text_parts.append(page.title() or "")
+    except Exception:
+        pass
+
+    try:
+        text_parts.append(page.inner_text("body", timeout=1_000) or "")
+    except Exception:
+        pass
+
+    expected_content_missing = False
+    if expect_product_links:
+        expected_content_missing = not _page_has_selector(page, 'a[href^="/products/"]')
+    elif expect_listing:
+        expected_content_missing = not any(
+            _page_has_selector(page, selector)
+            for selector in (
+                "script[type='application/ld+json']",
+                "p[aria-label='Price']",
+                "time[datetime]",
+                "a[aria-label$=\"'s shop\"]",
+                "a:has-text('Visit shop')",
+                "img[srcset], img[src]",
+            )
+        )
+
+    message = extract_rate_limit_message(
+        "\n".join(text_parts),
+        status=response_status,
+        expected_content_missing=expected_content_missing,
+    )
+    if message:
+        raise RateLimitError(message, status=response_status)
 
 
 def parse_iso_datetime(ts: str) -> Optional[dt.datetime]:
@@ -67,6 +225,151 @@ def build_seller_url(seller: str, groups: str = "tops", gender: str = "male") ->
     return base + "?" + urlencode(params)
 
 
+def extract_created_at_from_html(html: str) -> Optional[str]:
+    """Extract a created_at timestamp from page hydration HTML."""
+    m = CREATED_AT_RX.search(html or "")
+    return m.group(1) if m else None
+
+
+def extract_seller_username_from_href(href: Optional[str]) -> Optional[str]:
+    """Extract a seller username from a relative Depop shop link."""
+    if not href:
+        return None
+
+    path = urlparse(href).path.strip("/")
+    if not path:
+        return None
+
+    first_segment = path.split("/", 1)[0].strip()
+    if not first_segment or first_segment.lower() == "products":
+        return None
+    return first_segment
+
+
+def extract_seller_sold_count_from_text(text: str) -> Optional[int]:
+    """Extract the seller sold-count from visible page text or HTML."""
+    m = SOLD_COUNT_RX.search(text or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1).replace(",", ""))
+    except Exception:
+        return None
+
+
+def _pick_product_json_ld(page: Page) -> Optional[Dict[str, Any]]:
+    """Return the product JSON-LD payload when available."""
+    try:
+        texts = page.locator("script[type='application/ld+json']").all_inner_texts()
+    except Exception:
+        texts = []
+
+    for text in texts:
+        try:
+            payload = json.loads(text)
+        except Exception:
+            continue
+
+        entries = payload if isinstance(payload, list) else [payload]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("@type") == "Product":
+                return entry
+            if "description" in entry and "offers" in entry:
+                return entry
+
+    return None
+
+
+def _format_price_from_offer(offers: Any) -> str:
+    """Format a JSON-LD offer block to match the UI's display needs."""
+    offer = offers[0] if isinstance(offers, list) and offers else offers
+    if not isinstance(offer, dict):
+        return ""
+
+    price = str(offer.get("price") or "").strip()
+    currency = str(offer.get("priceCurrency") or "").upper().strip()
+    if not price:
+        return ""
+
+    symbol = CURRENCY_SYMBOLS.get(currency, f"{currency} " if currency else "")
+    if re.fullmatch(r"\d+(?:\.\d+)?", price):
+        try:
+            return f"{symbol}{float(price):.2f}"
+        except Exception:
+            pass
+    return f"{symbol}{price}".strip()
+
+
+def _extract_seller_name(page: Page, html: str) -> str:
+    """Extract the seller username from stable shop-link selectors."""
+    selectors = [
+        "a[aria-label$=\"'s shop\"]",
+        "a:has-text('Visit shop')",
+    ]
+
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            if loc.count():
+                text = (loc.inner_text(timeout=500) or "").strip().lstrip("@")
+                if text and text.lower() != "visit shop":
+                    return text
+
+                href = loc.get_attribute("href")
+                username = extract_seller_username_from_href(href)
+                if username:
+                    return username
+        except Exception:
+            continue
+
+    hrefs: List[Optional[str]] = []
+    try:
+        hrefs = page.eval_on_selector_all(
+            "a[href]",
+            """els => els
+                .map(el => el.getAttribute('href'))
+                .filter(Boolean)
+                .filter(href => href.includes('productId=') || /^\\/[A-Za-z0-9._-]+\\/?$/.test(href))
+            """,
+        )
+    except Exception:
+        pass
+
+    for href in hrefs:
+        username = extract_seller_username_from_href(href)
+        if username:
+            return username
+
+    m = re.search(r"item listed by ([A-Za-z0-9._-]+)", html or "", re.I)
+    if m:
+        return m.group(1)
+
+    return ""
+
+
+def extract_seller_sold_count(page: Page) -> Optional[int]:
+    """Extract the seller's sold count from a seller page."""
+    try:
+        body_text = page.inner_text("body", timeout=1_500) or ""
+        sold_count = extract_seller_sold_count_from_text(body_text)
+        if sold_count is not None:
+            return sold_count
+    except Exception:
+        pass
+
+    try:
+        html = page.content()
+        sold_count = extract_seller_sold_count_from_text(html)
+        if sold_count is not None:
+            return sold_count
+    except Exception:
+        pass
+
+    return None
+
+
 def accept_cookies(page: Page) -> None:
     """Dismiss cookie consent dialogs."""
     for text in ["Accept", "I agree", "Agree", "OK", "Got it"]:
@@ -80,7 +383,7 @@ def accept_cookies(page: Page) -> None:
 def dismiss_login_modal(page: Page) -> None:
     """Dismiss login/signup modal popup if it appears ('Want in?' modal)."""
     try:
-        # Wait up to 3 seconds for the modal to appear, checking periodically
+        # Try briefly in case the modal appears, but don't stall every page load.
         close_selectors = [
             # The X button in the modal - look for buttons near the modal content
             "button:has-text('×')",
@@ -95,8 +398,7 @@ def dismiss_login_modal(page: Page) -> None:
             "[class*='Modal'] button:not(:has-text('Sign up')):not(:has-text('Log in'))",
         ]
         
-        # Try for 3 seconds (6 attempts x 500ms)
-        for attempt in range(60):
+        for _ in range(LOGIN_MODAL_MAX_ATTEMPTS):
             # Check each selector
             for selector in close_selectors:
                 try:
@@ -104,7 +406,7 @@ def dismiss_login_modal(page: Page) -> None:
                     if close_btn.count() and close_btn.is_visible(timeout=300):
                         close_btn.click(timeout=2000)
                         print(f"[login-modal] Dismissed login modal via: {selector}")
-                        page.wait_for_timeout(500)
+                        page.wait_for_timeout(LOGIN_MODAL_WAIT_MS)
                         return
                 except Exception:
                     continue
@@ -128,18 +430,18 @@ def dismiss_login_modal(page: Page) -> None:
                 }""")
                 if clicked:
                     print("[login-modal] Dismissed login modal via JS click")
-                    page.wait_for_timeout(500)
+                    page.wait_for_timeout(LOGIN_MODAL_WAIT_MS)
                     return
             except Exception:
                 pass
             
             # Wait before next attempt
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(LOGIN_MODAL_WAIT_MS)
         
         # Try pressing Escape key as final fallback
         try:
             page.keyboard.press("Escape")
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(LOGIN_MODAL_WAIT_MS)
             print("[login-modal] Pressed Escape to dismiss modal")
         except Exception:
             pass
@@ -154,9 +456,7 @@ def remove_sold_sections(page: Page) -> None:
     """Remove sold items section from page."""
     try:
         page.evaluate("""() => {
-            const headings = Array.from(document.querySelectorAll(
-                "p._text_bevez_41._shared_bevez_6._bold_bevez_47.styles_headingText__YfI1k"
-            ));
+            const headings = Array.from(document.querySelectorAll("h1, h2, h3, h4, h5, h6, p, span, div"));
             for (const h of headings) {
                 if ((h.textContent || "").trim().toLowerCase() === "sold items") {
                     const section = h.closest("section") || h.parentElement;
@@ -172,7 +472,8 @@ def collect_listing_links(
     page: Page,
     max_scrolls: int = 2,
     per_scroll_wait_ms: int = 1200,
-    max_links: Optional[int] = None
+    max_links: Optional[int] = None,
+    should_cancel: CancelCheck = None,
 ) -> List[str]:
     """Collect product listing links from the current page."""
     seen: set = set()
@@ -181,23 +482,34 @@ def collect_listing_links(
     u = urlparse(page.url)
     origin = f"{u.scheme}://{u.netloc}"
     
-    selectors = [
-        'li.styles_listItem__Uv9lb a.styles_unstyledLink__DsttP[href^="/products/"]',
-        'li.styles_listItem__Uv9lb a[href^="/products/"]',
-        'a[href^="/products/"]',
-    ]
-    
-    last_count = -1
-    for _ in range(max_scrolls):
+    selectors = ['a[href^="/products/"]']
+
+    total_steps = max(max_scrolls, 0) * SCROLL_STEPS_PER_BATCH
+    total_steps = max(total_steps, 1)
+    stalled_steps = 0
+    last_count = 0
+
+    for step in range(total_steps):
+        raise_if_cancelled(should_cancel)
         for sel in selectors:
             try:
                 hrefs = page.eval_on_selector_all(sel, """
                     els => els
                         .filter(e => {
+                            const section = e.closest('section');
+                            if (section) {
+                                const headingEls = Array.from(
+                                    section.querySelectorAll('h1, h2, h3, h4, h5, h6, p, span, div')
+                                ).slice(0, 30);
+                                if (headingEls.some(el => ((el.textContent || '').trim().toLowerCase() === 'sold items'))) {
+                                    return false;
+                                }
+                            }
                             const listItem = e.closest('li');
-                            if (!listItem) return true;
-                            const text = listItem.textContent || '';
-                            if (text.toLowerCase().includes('sold')) return false;
+                            if (listItem) {
+                                const text = (listItem.textContent || '').toLowerCase();
+                                if (text.includes('sold out')) return false;
+                            }
                             return true;
                         })
                         .map(e => e.getAttribute('href'))
@@ -214,54 +526,94 @@ def collect_listing_links(
                     ordered.append(full)
                     if max_links and len(seen) >= max_links:
                         return ordered
-        
-        page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-        page.wait_for_timeout(per_scroll_wait_ms)
-        
+
         if len(seen) == last_count:
-            try:
-                page.keyboard.press("End")
-            except Exception:
-                pass
-            page.evaluate("window.scrollBy(0, 200)")
-            page.wait_for_timeout(400)
-            if len(seen) == last_count:
-                break
+            stalled_steps += 1
+        else:
+            stalled_steps = 0
         last_count = len(seen)
+
+        if step == total_steps - 1 or stalled_steps >= MAX_STALLED_SCROLL_STEPS:
+            break
+
+        try:
+            viewport_height = page.evaluate(
+                "() => window.innerHeight || document.documentElement.clientHeight || 800"
+            )
+        except Exception:
+            viewport_height = 800
+
+        scroll_amount = int((viewport_height or 800) * SCROLL_STEP_RATIO)
+        if scroll_amount <= 0:
+            scroll_amount = 560
+
+        page.evaluate("(amount) => window.scrollBy(0, amount)", scroll_amount)
+        page.wait_for_timeout(per_scroll_wait_ms)
+
+    if not ordered:
+        check_page_for_rate_limit(page, expect_product_links=True)
     
     return ordered
 
 
-def parse_listing(page: Page, url: str) -> Optional[Dict[str, Any]]:
+def parse_listing(
+    page: Page,
+    url: str,
+    should_cancel: CancelCheck = None,
+) -> Optional[Dict[str, Any]]:
     """Parse a single listing page and extract item details."""
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        
-        # Description
-        desc = ""
-        for selector in [
-            "p[class*='styles_textWrapper__']",
-            "[data-testid*='description'], [itemprop='description']",
-            "article, [class*='description']"
-        ]:
-            try:
-                loc = page.locator(selector).first
-                if loc.count():
-                    desc = (loc.inner_text(timeout=1_000) or "").strip()
-                    if desc:
-                        break
-            except Exception:
-                pass
-        
-        # Price
-        price_text = ""
+        raise_if_cancelled(should_cancel)
+        response = page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        raise_if_cancelled(should_cancel)
+        accept_cookies(page)
         try:
-            ploc = page.locator("p[aria-label='Price']").first
-            if ploc.count():
-                price_text = (ploc.inner_text(timeout=800) or "").strip()
+            page.wait_for_selector(LISTING_READY_SELECTOR, timeout=LISTING_READY_TIMEOUT_MS)
         except Exception:
             pass
-        
+        dismiss_login_modal(page)
+
+        check_page_for_rate_limit(
+            page,
+            response_status=_response_status(response),
+            expect_listing=True,
+        )
+        product_json_ld = _pick_product_json_ld(page)
+        page_html = ""
+
+        # Description
+        desc = ""
+        if isinstance(product_json_ld, dict):
+            desc = str(product_json_ld.get("description") or "").strip()
+
+        if not desc:
+            for selector in [
+                "p[class*='styles_textWrapper__']",
+                "[data-testid*='description'], [itemprop='description']",
+                "article, [class*='description']"
+            ]:
+                try:
+                    loc = page.locator(selector).first
+                    if loc.count():
+                        desc = (loc.inner_text(timeout=1_000) or "").strip()
+                        if desc:
+                            break
+                except Exception:
+                    pass
+
+        # Price
+        price_text = ""
+        if isinstance(product_json_ld, dict):
+            price_text = _format_price_from_offer(product_json_ld.get("offers"))
+
+        if not price_text:
+            try:
+                ploc = page.locator("p[aria-label='Price']").first
+                if ploc.count():
+                    price_text = (ploc.inner_text(timeout=800) or "").strip()
+            except Exception:
+                pass
+
         if not price_text:
             for sel in ["[data-testid*='price']", "[class*='price']", "[itemprop='price']"]:
                 try:
@@ -280,17 +632,25 @@ def parse_listing(page: Page, url: str) -> Optional[Dict[str, Any]]:
                 if m:
                     price_text = m.group(1)
             except Exception:
-                pass
-        
+                    pass
+
         # Image
         image_url = None
-        try:
-            img = page.locator("img.styles_imageItem__UWJs6").first
-            if img.count():
-                image_url = img.get_attribute("src")
-        except Exception:
-            pass
-        
+        if isinstance(product_json_ld, dict):
+            images = product_json_ld.get("image")
+            if isinstance(images, list) and images:
+                image_url = images[0]
+            elif isinstance(images, str):
+                image_url = images
+
+        if not image_url:
+            try:
+                img = page.locator("img.styles_imageItem__UWJs6").first
+                if img.count():
+                    image_url = img.get_attribute("src")
+            except Exception:
+                pass
+
         if not image_url:
             try:
                 img2 = page.locator("img[srcset], img[src]").first
@@ -303,25 +663,14 @@ def parse_listing(page: Page, url: str) -> Optional[Dict[str, Any]]:
                     if not image_url:
                         image_url = img2.get_attribute("src")
             except Exception:
-                pass
-        
+                    pass
+
         # Seller info
-        seller_name = ""
-        sold_count = 0
-        try:
-            sloc = page.locator("a.styles_username__zh8fr").first
-            if sloc.count():
-                seller_name = (sloc.inner_text(timeout=500) or "").strip()
-            
-            sold_loc = page.locator("div.styles_signal__D2W6L p").filter(has_text=re.compile(r"\d+\s*sold")).first
-            if sold_loc.count():
-                txt = sold_loc.inner_text(timeout=500)
-                m = re.search(r"(\d+)\s*sold", txt)
-                if m:
-                    sold_count = int(m.group(1))
-        except Exception:
-            pass
-        
+        seller_name = _extract_seller_name(page, "")
+        if not seller_name:
+            page_html = page.content()
+            seller_name = _extract_seller_name(page, page_html)
+
         # Listing time
         listed_at_iso: Optional[str] = None
         age_days: Optional[float] = None
@@ -343,7 +692,23 @@ def parse_listing(page: Page, url: str) -> Optional[Dict[str, Any]]:
                         listed_at_iso = rel_dt.isoformat()
         except Exception:
             pass
-        
+
+        if listed_at_iso is None:
+            if not page_html:
+                page_html = page.content()
+            created_at = extract_created_at_from_html(page_html)
+            parsed_dt = parse_iso_datetime(created_at or "")
+            if parsed_dt:
+                listed_at_iso = parsed_dt.isoformat()
+                age_days = age_days_from(parsed_dt)
+
+        if not any([desc, price_text, image_url, seller_name]):
+            check_page_for_rate_limit(
+                page,
+                response_status=_response_status(response),
+                expect_listing=True,
+            )
+
         return {
             "url": url,
             "description": desc,
@@ -352,8 +717,12 @@ def parse_listing(page: Page, url: str) -> Optional[Dict[str, Any]]:
             "listedAt": listed_at_iso,
             "ageDays": age_days,
             "seller": seller_name,
-            "soldCount": sold_count,
+            "soldCount": None,
         }
+    except SearchCancelled:
+        raise
+    except RateLimitError:
+        raise
     except Exception:
         return None
 
