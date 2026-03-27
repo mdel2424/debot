@@ -4,13 +4,17 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from main import _browse_all, _error_payload_for_exception, _run_with_rate_limit_retries, _sse  # noqa: E402
-from scraper import RateLimitError, SearchCancelled, sleep_with_cancel  # noqa: E402
+DEPENDENCY_IMPORT_ERROR = None
+
+try:
+    from main import _browse_all, _error_payload_for_exception, _run_with_rate_limit_retries, _sse  # noqa: E402
+    from scraper import RateLimitError, SearchCancelled, sleep_with_cancel  # noqa: E402
+except Exception as exc:  # pragma: no cover - protects VS Code discovery on wrong interpreter
+    DEPENDENCY_IMPORT_ERROR = exc
 
 
 class FakePage:
@@ -37,7 +41,15 @@ class FakeContext:
         return page
 
 
+@unittest.skipIf(
+    DEPENDENCY_IMPORT_ERROR is not None,
+    f"Stream helper tests require backend dependencies: {DEPENDENCY_IMPORT_ERROR}",
+)
 class StreamHelpersTest(unittest.TestCase):
+    @staticmethod
+    def _decode_events(events):
+        return [json.loads(chunk.decode("utf-8").split("data: ", 1)[1]) for chunk in events]
+
     def test_sleep_with_cancel_raises_search_cancelled(self):
         checks = {"count": 0}
 
@@ -82,6 +94,8 @@ class StreamHelpersTest(unittest.TestCase):
         browse_page = FakePage()
         first_batch = [f"u{i}" for i in range(1, 31)]
         second_batch = [f"u{i}" for i in range(1, 61)]
+        third_batch = [f"u{i}" for i in range(1, 91)]
+        fourth_batch = [f"u{i}" for i in range(1, 121)]
         parse_calls = []
 
         def fake_parse(page, url, should_cancel=None):
@@ -91,7 +105,10 @@ class StreamHelpersTest(unittest.TestCase):
         with (
             patch("builtins.print"),
             patch("main._load_page_with_retries"),
-            patch("main.collect_listing_links", side_effect=[first_batch, second_batch]) as collect_mock,
+            patch(
+                "main.collect_listing_links",
+                side_effect=[first_batch, second_batch, third_batch, fourth_batch],
+            ) as collect_mock,
             patch("main.parse_listing", side_effect=fake_parse),
             patch("main._process_item", side_effect=lambda item, *args: dict(item)),
             patch("main._resolve_seller_sold_count", return_value=99),
@@ -113,26 +130,27 @@ class StreamHelpersTest(unittest.TestCase):
                 )
             )
 
-        decoded = [json.loads(chunk.decode("utf-8").split("data: ", 1)[1]) for chunk in events]
+        decoded = self._decode_events(events)
         self.assertEqual(ctx.new_page_calls, 1)
         self.assertTrue(ctx.pages[0].closed)
         self.assertEqual(browse_page.waits, [500])
-        self.assertEqual(collect_mock.call_count, 2)
+        self.assertEqual(collect_mock.call_count, 4)
         self.assertEqual(decoded[-1]["type"], "done")
-        self.assertEqual(sum(evt["type"] == "match" for evt in decoded), 50)
-        self.assertEqual(len(parse_calls), 50)
-        self.assertEqual(parse_calls[-1], "u50")
+        self.assertEqual(sum(evt["type"] == "match" for evt in decoded), 100)
+        self.assertEqual(len(parse_calls), 100)
+        self.assertEqual(parse_calls[-1], "u100")
 
         progress_events = [evt for evt in decoded if evt["type"] == "progress"]
         self.assertEqual(progress_events[0]["total"], 0)
-        self.assertEqual(progress_events[-1]["processed"], 49)
-        self.assertEqual(progress_events[-1]["total"], 60)
+        self.assertEqual(progress_events[-1]["processed"], 99)
+        self.assertEqual(progress_events[-1]["total"], 120)
 
-    def test_browse_all_stops_after_1000_parsed_links_when_no_matches(self):
+    def test_browse_all_respects_requested_max_links_when_no_matches(self):
         ctx = FakeContext()
         browse_page = FakePage()
         first_batch = [f"u{i}" for i in range(1, 601)]
-        second_batch = [f"u{i}" for i in range(1, 1001)]
+        second_batch = [f"u{i}" for i in range(1, 1201)]
+        third_batch = [f"u{i}" for i in range(1, 1801)]
         parse_calls = []
 
         def fake_parse(page, url, should_cancel=None):
@@ -142,7 +160,10 @@ class StreamHelpersTest(unittest.TestCase):
         with (
             patch("builtins.print"),
             patch("main._load_page_with_retries"),
-            patch("main.collect_listing_links", side_effect=[first_batch, second_batch]) as collect_mock,
+            patch(
+                "main.collect_listing_links",
+                side_effect=[first_batch, second_batch, third_batch],
+            ) as collect_mock,
             patch("main.parse_listing", side_effect=fake_parse),
             patch("main._process_item", return_value=None),
             patch("main._resolve_seller_sold_count", return_value=99),
@@ -158,21 +179,68 @@ class StreamHelpersTest(unittest.TestCase):
                     0.5,
                     0.75,
                     max_items=100,
-                    max_links=10_000,
+                    max_links=1_500,
                     max_scrolls=4,
                     search_id="search-456",
                 )
             )
 
-        decoded = [json.loads(chunk.decode("utf-8").split("data: ", 1)[1]) for chunk in events]
+        decoded = self._decode_events(events)
         progress_events = [evt for evt in decoded if evt["type"] == "progress"]
 
-        self.assertEqual(collect_mock.call_count, 2)
-        self.assertEqual(len(parse_calls), 1000)
+        self.assertEqual(collect_mock.call_count, 3)
+        self.assertEqual(len(parse_calls), 1_500)
         self.assertEqual(decoded[-1]["type"], "done")
-        self.assertEqual(progress_events[-1]["processed"], 1000)
-        self.assertEqual(progress_events[-1]["total"], 1000)
+        self.assertEqual(progress_events[-1]["processed"], 1_500)
+        self.assertEqual(progress_events[-1]["total"], 1_800)
         self.assertEqual(sum(evt["type"] == "match" for evt in decoded), 0)
+
+    def test_browse_all_stops_after_repeated_no_growth_batches(self):
+        ctx = FakeContext()
+        browse_page = FakePage()
+        repeated_batch = [f"u{i}" for i in range(1, 49)]
+        parse_calls = []
+
+        def fake_parse(page, url, should_cancel=None):
+            parse_calls.append(url)
+            return {"seller": f"seller-{url}", "url": url}
+
+        with (
+            patch("builtins.print"),
+            patch("main._load_page_with_retries"),
+            patch(
+                "main.collect_listing_links",
+                side_effect=[repeated_batch, repeated_batch, repeated_batch, repeated_batch],
+            ) as collect_mock,
+            patch("main.parse_listing", side_effect=fake_parse),
+            patch("main._process_item", return_value=None),
+            patch("main._resolve_seller_sold_count", return_value=99),
+        ):
+            events = list(
+                _browse_all(
+                    ctx,
+                    browse_page,
+                    "tops",
+                    "male",
+                    21.5,
+                    27.0,
+                    0.5,
+                    0.75,
+                    max_items=100,
+                    max_links=200,
+                    max_scrolls=4,
+                    search_id="search-789",
+                )
+            )
+
+        decoded = self._decode_events(events)
+        progress_events = [evt for evt in decoded if evt["type"] == "progress"]
+
+        self.assertEqual(collect_mock.call_count, 4)
+        self.assertEqual(len(parse_calls), 48)
+        self.assertEqual(decoded[-1]["type"], "done")
+        self.assertEqual(progress_events[-1]["processed"], 48)
+        self.assertEqual(progress_events[-1]["total"], 48)
 
 
 if __name__ == "__main__":

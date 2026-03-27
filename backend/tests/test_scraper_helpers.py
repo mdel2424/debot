@@ -8,19 +8,24 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from scraper import (  # noqa: E402
-    LOGIN_MODAL_MAX_ATTEMPTS,
-    LOGIN_MODAL_WAIT_MS,
-    RateLimitError,
-    SearchCancelled,
-    collect_listing_links,
-    dismiss_login_modal,
-    extract_created_at_from_html,
-    extract_rate_limit_message,
-    extract_seller_sold_count_from_text,
-    extract_seller_username_from_href,
-    parse_listing,
-)
+DEPENDENCY_IMPORT_ERROR = None
+
+try:
+    from scraper import (  # noqa: E402
+        LOGIN_MODAL_MAX_ATTEMPTS,
+        LOGIN_MODAL_WAIT_MS,
+        RateLimitError,
+        SearchCancelled,
+        collect_listing_links,
+        dismiss_login_modal,
+        extract_created_at_from_html,
+        extract_rate_limit_message,
+        extract_seller_sold_count_from_text,
+        extract_seller_username_from_href,
+        parse_listing,
+    )
+except Exception as exc:  # pragma: no cover - protects VS Code discovery on wrong interpreter
+    DEPENDENCY_IMPORT_ERROR = exc
 
 
 class FakeLocator:
@@ -69,6 +74,7 @@ class FakeCollectPage:
         self._href_sequences = href_sequences
         self._eval_calls = 0
         self.scroll_amounts = []
+        self.scroll_to_bottom_calls = 0
         self.waits = []
         self.keyboard = FakeKeyboard()
 
@@ -82,6 +88,8 @@ class FakeCollectPage:
             return 1000
         if "window.scrollBy" in script:
             self.scroll_amounts.append(arg)
+        if "window.scrollTo" in script:
+            self.scroll_to_bottom_calls += 1
         return None
 
     def wait_for_timeout(self, ms):
@@ -143,6 +151,10 @@ class FakeNoModalPage:
         self.waits.append(ms)
 
 
+@unittest.skipIf(
+    DEPENDENCY_IMPORT_ERROR is not None,
+    f"Scraper helper tests require backend dependencies: {DEPENDENCY_IMPORT_ERROR}",
+)
 class ScraperHelpersTest(unittest.TestCase):
     def test_extract_created_at_from_hydration_html(self):
         html = (
@@ -205,6 +217,28 @@ class ScraperHelpersTest(unittest.TestCase):
         )
         self.assertTrue(page.scroll_amounts)
         self.assertTrue(all(amount == 700 for amount in page.scroll_amounts))
+
+    def test_collect_listing_links_uses_aggressive_end_scroll_for_browse_pages(self):
+        page = FakeCollectPage([
+            [f"/products/item-{i}/" for i in range(1, 49)],
+            [f"/products/item-{i}/" for i in range(1, 73)],
+            [f"/products/item-{i}/" for i in range(1, 97)],
+            [f"/products/item-{i}/" for i in range(1, 97)],
+        ])
+
+        links = collect_listing_links(
+            page,
+            max_scrolls=4,
+            per_scroll_wait_ms=25,
+            aggressive_end_scroll=True,
+        )
+
+        self.assertEqual(len(links), 96)
+        self.assertEqual(links[0], "https://www.depop.com/products/item-1/")
+        self.assertEqual(links[-1], "https://www.depop.com/products/item-96/")
+        self.assertEqual(page.keyboard.presses, ["End", "End", "End"])
+        self.assertEqual(page.scroll_to_bottom_calls, 3)
+        self.assertEqual(page.waits, [2500, 2500, 2500])
 
     def test_collect_listing_links_raises_when_cancelled(self):
         page = FakeCollectPage([["/products/a/"]] * 6)

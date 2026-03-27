@@ -3,7 +3,6 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-.python-version
 .venv/
 venv/
 .pytest_cache/

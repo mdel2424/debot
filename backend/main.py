@@ -53,10 +53,8 @@ app.add_middleware(
 # In-memory cancellation flags
 CANCEL_FLAGS: Dict[str, bool] = {}
 DEFAULT_P2P_TOL = 0.5
-DEFAULT_LENGTH_TOL = 0.75
+DEFAULT_LENGTH_TOL = 1.25
 RATE_LIMIT_RETRY_DELAYS = (2, 5)
-BROWSE_ALL_TARGET_MATCHES = 50
-BROWSE_ALL_MAX_PARSED_LINKS = 1000
 BROWSE_ALL_STALLED_BATCHES = 3
 
 # SSE helpers
@@ -420,8 +418,8 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                 max_items, max_links, max_scrolls, search_id):
     """Browse all listings on the category page."""
     should_cancel = _cancel_check(search_id)
-    target_matches = min(max_items, BROWSE_ALL_TARGET_MATCHES) if max_items else BROWSE_ALL_TARGET_MATCHES
-    max_parsed_links = min(max_links, BROWSE_ALL_MAX_PARSED_LINKS) if max_links else BROWSE_ALL_MAX_PARSED_LINKS
+    target_matches = max(max_items or 0, 1)
+    max_parsed_links = max(max_links or 0, 1)
     print(f"[stream] browsing: {BROWSE_URL}")
     
     _load_page_with_retries(
@@ -455,6 +453,7 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                 per_scroll_wait_ms=1200,
                 max_links=remaining_capacity,
                 should_cancel=should_cancel,
+                aggressive_end_scroll=True,
             )
             unique_new = [url for url in links if url not in seen_urls]
 

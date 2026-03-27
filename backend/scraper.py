@@ -24,6 +24,7 @@ CURRENCY_SYMBOLS = {
 SCROLL_STEPS_PER_BATCH = 4
 SCROLL_STEP_RATIO = 0.7
 MAX_STALLED_SCROLL_STEPS = 2
+BROWSE_END_SCROLL_WAIT_MS = 2500
 LOGIN_MODAL_MAX_ATTEMPTS = 6
 LOGIN_MODAL_WAIT_MS = 250
 LISTING_READY_TIMEOUT_MS = 1_500
@@ -474,6 +475,7 @@ def collect_listing_links(
     per_scroll_wait_ms: int = 1200,
     max_links: Optional[int] = None,
     should_cancel: CancelCheck = None,
+    aggressive_end_scroll: bool = False,
 ) -> List[str]:
     """Collect product listing links from the current page."""
     seen: set = set()
@@ -484,13 +486,7 @@ def collect_listing_links(
     
     selectors = ['a[href^="/products/"]']
 
-    total_steps = max(max_scrolls, 0) * SCROLL_STEPS_PER_BATCH
-    total_steps = max(total_steps, 1)
-    stalled_steps = 0
-    last_count = 0
-
-    for step in range(total_steps):
-        raise_if_cancelled(should_cancel)
+    def collect_visible_links() -> None:
         for sel in selectors:
             try:
                 hrefs = page.eval_on_selector_all(sel, """
@@ -516,7 +512,7 @@ def collect_listing_links(
                 """)
             except Exception:
                 hrefs = []
-            
+
             for href in hrefs:
                 if not href:
                     continue
@@ -525,30 +521,72 @@ def collect_listing_links(
                     seen.add(full)
                     ordered.append(full)
                     if max_links and len(seen) >= max_links:
-                        return ordered
+                        return
 
-        if len(seen) == last_count:
-            stalled_steps += 1
-        else:
-            stalled_steps = 0
-        last_count = len(seen)
+    if aggressive_end_scroll:
+        total_batches = max(max_scrolls, 1)
+        stalled_batches = 0
+        last_count = 0
+        wait_ms = max(per_scroll_wait_ms, BROWSE_END_SCROLL_WAIT_MS)
 
-        if step == total_steps - 1 or stalled_steps >= MAX_STALLED_SCROLL_STEPS:
-            break
+        for batch in range(total_batches):
+            raise_if_cancelled(should_cancel)
+            collect_visible_links()
+            if max_links and len(seen) >= max_links:
+                return ordered
 
-        try:
-            viewport_height = page.evaluate(
-                "() => window.innerHeight || document.documentElement.clientHeight || 800"
-            )
-        except Exception:
-            viewport_height = 800
+            if len(seen) == last_count:
+                stalled_batches += 1
+            else:
+                stalled_batches = 0
+            last_count = len(seen)
 
-        scroll_amount = int((viewport_height or 800) * SCROLL_STEP_RATIO)
-        if scroll_amount <= 0:
-            scroll_amount = 560
+            if batch == total_batches - 1 or stalled_batches >= MAX_STALLED_SCROLL_STEPS:
+                break
 
-        page.evaluate("(amount) => window.scrollBy(0, amount)", scroll_amount)
-        page.wait_for_timeout(per_scroll_wait_ms)
+            try:
+                page.keyboard.press("End")
+            except Exception:
+                pass
+            try:
+                page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                pass
+            page.wait_for_timeout(wait_ms)
+    else:
+        total_steps = max(max_scrolls, 0) * SCROLL_STEPS_PER_BATCH
+        total_steps = max(total_steps, 1)
+        stalled_steps = 0
+        last_count = 0
+
+        for step in range(total_steps):
+            raise_if_cancelled(should_cancel)
+            collect_visible_links()
+            if max_links and len(seen) >= max_links:
+                return ordered
+
+            if len(seen) == last_count:
+                stalled_steps += 1
+            else:
+                stalled_steps = 0
+            last_count = len(seen)
+
+            if step == total_steps - 1 or stalled_steps >= MAX_STALLED_SCROLL_STEPS:
+                break
+
+            try:
+                viewport_height = page.evaluate(
+                    "() => window.innerHeight || document.documentElement.clientHeight || 800"
+                )
+            except Exception:
+                viewport_height = 800
+
+            scroll_amount = int((viewport_height or 800) * SCROLL_STEP_RATIO)
+            if scroll_amount <= 0:
+                scroll_amount = 560
+
+            page.evaluate("(amount) => window.scrollBy(0, amount)", scroll_amount)
+            page.wait_for_timeout(per_scroll_wait_ms)
 
     if not ordered:
         check_page_for_rate_limit(page, expect_product_links=True)

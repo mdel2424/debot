@@ -11,9 +11,9 @@ const pages = [
 ];
 
 const DEFAULT_P2P = '21.5';
-const DEFAULT_LENGTH = '27';
+const DEFAULT_LENGTH = '27.25';
 const DEFAULT_P2P_TOLERANCE = '0.5';
-const DEFAULT_LENGTH_TOLERANCE = '0.75';
+const DEFAULT_LENGTH_TOLERANCE = '1.25';
 
 // Predefined list of followed sellers
 const FOLLOWING_ACCOUNTS = [
