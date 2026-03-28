@@ -76,6 +76,26 @@ def _cancel_check(search_id: str) -> Callable[[], bool]:
     return lambda: _is_cancelled(search_id)
 
 
+def _normalize_groups(groups_value: Any) -> list[str]:
+    """Normalize seller/category groups from request payloads."""
+    if isinstance(groups_value, str):
+        clean = groups_value.strip()
+        return [clean] if clean else ["tops"]
+
+    if isinstance(groups_value, (list, tuple, set)):
+        normalized = []
+        seen = set()
+        for group in groups_value:
+            clean = str(group or "").strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            normalized.append(clean)
+        return normalized or ["tops"]
+
+    return ["tops"]
+
+
 def _error_payload_for_exception(exc: Exception, search_id: str) -> Dict[str, Any]:
     """Normalize stream errors into a consistent SSE payload."""
     payload: Dict[str, Any] = {
@@ -236,7 +256,8 @@ async def search_stream(request: Request):
     headless = bool(payload.get("headless", True))
     slowmo = int(payload.get("slowmo") or 0)
     gender = payload.get("gender") or "male"
-    groups = payload.get("groups") or "tops"
+    groups = _normalize_groups(payload.get("groups") or "tops")
+    primary_group = groups[0]
     search_id = str(payload.get("searchId") or "")
     
     if search_id:
@@ -262,7 +283,7 @@ async def search_stream(request: Request):
                             )
                         else:
                             yield from _browse_all(
-                                ctx, page, groups, gender,
+                                ctx, page, primary_group, gender,
                                 target_p2p, target_length, p2p_tol, length_tol,
                                 max_items, max_links, max_scrolls, search_id
                             )
@@ -353,63 +374,83 @@ def _search_seller(ctx, page, seller, groups, gender,
                    max_items, max_links, max_scrolls, search_id):
     """Search a specific seller's listings."""
     should_cancel = _cancel_check(search_id)
-    search_url = build_seller_url(seller, groups=groups, gender=gender)
-    print(f"[stream] navigating: {search_url}")
-    
-    _load_page_with_retries(
-        page,
-        search_url,
-        search_id,
-        f"seller page for @{seller}",
-        expect_product_links=True,
-    )
-    seller_sold_count = extract_seller_sold_count(page) or 0
-    remove_sold_sections(page)
-    
+    normalized_groups = _normalize_groups(groups)
+
     yield _sse({"type": "progress", "phase": "landing", "processed": 0, "total": None, "matches": 0, "searchId": search_id or None})
-    
-    links = collect_listing_links(
-        page,
-        max_scrolls=max_scrolls,
-        max_links=max_links,
-        should_cancel=should_cancel,
-    )
-    total = len(links)
+
+    seller_sold_count = 0
+    seen_urls = set()
+    grouped_links = []
+
+    for group in normalized_groups:
+        raise_if_cancelled(should_cancel)
+        search_url = build_seller_url(seller, groups=group, gender=gender)
+        print(f"[stream] navigating: {search_url}")
+
+        _load_page_with_retries(
+            page,
+            search_url,
+            search_id,
+            f"seller page for @{seller} ({group})",
+            expect_product_links=True,
+        )
+
+        if seller_sold_count <= 0:
+            seller_sold_count = extract_seller_sold_count(page) or 0
+
+        remove_sold_sections(page)
+
+        remaining_capacity = max(max_links - len(seen_urls), 0)
+        if remaining_capacity <= 0:
+            break
+
+        links = collect_listing_links(
+            page,
+            max_scrolls=max_scrolls,
+            max_links=remaining_capacity,
+            should_cancel=should_cancel,
+        )
+        unique_links = [url for url in links if url not in seen_urls]
+        seen_urls.update(unique_links)
+        grouped_links.append((group, unique_links))
+
+    total = sum(len(urls) for _, urls in grouped_links)
     print(f"[stream] collected {total} links")
     
     yield _sse({"type": "meta", "links": total, "seller": seller, "searchId": search_id or None})
     
     matches = 0
     processed = 0
-    
-    for url in links:
-        raise_if_cancelled(should_cancel)
-        item = _run_with_rate_limit_retries(
-            lambda current_url=url: parse_listing(page, current_url, should_cancel=should_cancel),
-            should_cancel,
-            f"listing page {url}",
-        )
-        processed += 1
-        
-        if item:
-            # Stop if item is over 45 days old (listings are sorted by newest)
-            age_days = item.get("ageDays")
-            if age_days is not None and age_days > 45:
-                print(f"[stream] Item is {age_days:.1f} days old, stopping (max 45 days)")
-                yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None, "stopped": "age_limit"})
-                break
-            
-            match = _process_item(item, target_p2p, target_length, p2p_tol, length_tol)
-            if match:
-                match["soldCount"] = seller_sold_count
-                print(f"[stream] MATCH {processed}/{total} p2p={match['p2p']} len={match['length']}")
-                yield _sse({"type": "match", "item": match, "searchId": search_id or None})
-                matches += 1
-                
-                if matches >= max_items:
+
+    for group, links in grouped_links:
+        for url in links:
+            raise_if_cancelled(should_cancel)
+            item = _run_with_rate_limit_retries(
+                lambda current_url=url: parse_listing(page, current_url, should_cancel=should_cancel),
+                should_cancel,
+                f"listing page {url}",
+            )
+            processed += 1
+
+            if item:
+                age_days = item.get("ageDays")
+                if age_days is not None and age_days > 45:
+                    print(f"[stream] Item is {age_days:.1f} days old for group={group}, skipping remaining older listings")
+                    yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None, "stopped": "age_limit"})
                     break
-        
-        yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
+
+                match = _process_item(item, target_p2p, target_length, p2p_tol, length_tol)
+                if match:
+                    match["soldCount"] = seller_sold_count
+                    print(f"[stream] MATCH {processed}/{total} p2p={match['p2p']} len={match['length']}")
+                    yield _sse({"type": "match", "item": match, "searchId": search_id or None})
+                    matches += 1
+
+                    if matches >= max_items:
+                        yield _sse({"type": "done", "searchId": search_id or None})
+                        return
+
+            yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
     
     yield _sse({"type": "done", "searchId": search_id or None})
 

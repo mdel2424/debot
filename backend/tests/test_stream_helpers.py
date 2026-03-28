@@ -11,7 +11,7 @@ if str(BACKEND_DIR) not in sys.path:
 DEPENDENCY_IMPORT_ERROR = None
 
 try:
-    from main import _browse_all, _error_payload_for_exception, _run_with_rate_limit_retries, _sse  # noqa: E402
+    from main import _browse_all, _error_payload_for_exception, _run_with_rate_limit_retries, _search_seller, _sse  # noqa: E402
     from scraper import RateLimitError, SearchCancelled, sleep_with_cancel  # noqa: E402
 except Exception as exc:  # pragma: no cover - protects VS Code discovery on wrong interpreter
     DEPENDENCY_IMPORT_ERROR = exc
@@ -241,6 +241,61 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(decoded[-1]["type"], "done")
         self.assertEqual(progress_events[-1]["processed"], 48)
         self.assertEqual(progress_events[-1]["total"], 48)
+
+    def test_search_seller_aggregates_multiple_groups_into_one_stream(self):
+        ctx = FakeContext()
+        page = FakePage()
+        tops_links = ['tops-1', 'shared-2']
+        coats_links = ['shared-2', 'coats-3']
+        parse_calls = []
+
+        def fake_parse(current_page, url, should_cancel=None):
+            parse_calls.append(url)
+            return {'seller': 'drewzal', 'url': url}
+
+        with (
+            patch('builtins.print'),
+            patch('main._load_page_with_retries') as load_mock,
+            patch('main.extract_seller_sold_count', return_value=88),
+            patch('main.remove_sold_sections'),
+            patch('main.collect_listing_links', side_effect=[tops_links, coats_links]) as collect_mock,
+            patch('main.parse_listing', side_effect=fake_parse),
+            patch(
+                'main._process_item',
+                side_effect=lambda item, *args: {**item, 'p2p': 23.0, 'length': 28.0},
+            ),
+        ):
+            events = list(
+                _search_seller(
+                    ctx,
+                    page,
+                    'drewzal',
+                    ['tops', 'coats-jackets'],
+                    'male',
+                    21.5,
+                    27.25,
+                    0.5,
+                    1.25,
+                    max_items=40,
+                    max_links=100,
+                    max_scrolls=4,
+                    search_id='search-multi-group',
+                )
+            )
+
+        decoded = self._decode_events(events)
+        match_events = [evt for evt in decoded if evt['type'] == 'match']
+        progress_events = [evt for evt in decoded if evt['type'] == 'progress']
+        meta_event = next(evt for evt in decoded if evt['type'] == 'meta')
+
+        self.assertEqual(collect_mock.call_count, 2)
+        self.assertEqual(meta_event['links'], 3)
+        self.assertEqual(len(match_events), 3)
+        self.assertEqual(parse_calls, ['tops-1', 'shared-2', 'coats-3'])
+        self.assertTrue(all(evt['item']['soldCount'] == 88 for evt in match_events))
+        self.assertEqual(progress_events[-1]['processed'], 3)
+        self.assertEqual(progress_events[-1]['total'], 3)
+        self.assertEqual(load_mock.call_count, 2)
 
 
 if __name__ == "__main__":
