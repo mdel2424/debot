@@ -236,7 +236,8 @@ const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
     groups: page.group,
     gender: 'male',
     maxItems: 40,
-    maxLinks: 1000,
+    maxLinks: 128,
+    maxScrolls: 16,
     searchId,
   };
 

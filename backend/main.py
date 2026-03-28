@@ -522,8 +522,10 @@ def _search_seller(ctx, page, seller, groups, gender,
         links = collect_listing_links(
             page,
             max_scrolls=max_scrolls,
+            per_scroll_wait_ms=1200,
             max_links=remaining_capacity,
             should_cancel=should_cancel,
+            aggressive_end_scroll=True,
         )
         unique_links = [url for url in links if url not in seen_urls]
         seen_urls.update(unique_links)

@@ -303,6 +303,7 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(progress_events[-1]['processed'], 3)
         self.assertEqual(progress_events[-1]['total'], 3)
         self.assertEqual(load_mock.call_count, 2)
+        self.assertTrue(all(call.kwargs.get('aggressive_end_scroll') for call in collect_mock.call_args_list))
 
     def test_process_item_matches_bottoms_by_size_range(self):
         item = {
