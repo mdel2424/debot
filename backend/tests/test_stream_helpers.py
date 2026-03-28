@@ -93,7 +93,10 @@ class StreamHelpersTest(unittest.TestCase):
             retry_events,
             [(1, 3, 15, "listing page"), (2, 3, 30, "listing page"), (3, 3, 60, "listing page")],
         )
-        self.assertIn("Retried 3 times after the initial failure", str(ctx.exception))
+        self.assertEqual(
+            str(ctx.exception),
+            "Rate limited after 3 cooldown attempts while listing page.",
+        )
 
     def test_rate_limit_error_payload_is_encoded_as_sse_error(self):
         payload = _error_payload_for_exception(
@@ -316,6 +319,104 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(progress_events[-1]['total'], 3)
         self.assertEqual(load_mock.call_count, 2)
         self.assertTrue(all(call.kwargs.get('aggressive_end_scroll') for call in collect_mock.call_args_list))
+
+    def test_search_seller_collect_listing_rate_limit_emits_cooldown_and_recovers(self):
+        ctx = FakeContext()
+        page = FakePage()
+        emitted_progress = []
+
+        with (
+            patch('builtins.print'),
+            patch('main._load_page_with_retries'),
+            patch('main.extract_seller_sold_count', return_value=88),
+            patch('main.remove_sold_sections'),
+            patch(
+                'main.collect_listing_links',
+                side_effect=[RateLimitError("Depop appears to be rate limiting requests right now."), ['tops-1']],
+            ),
+            patch('main.sleep_with_cancel'),
+            patch('main.parse_listing', return_value={'seller': 'drewzal', 'url': 'tops-1'}),
+            patch(
+                'main._process_item',
+                return_value={'seller': 'drewzal', 'url': 'tops-1', 'p2p': 22.0, 'length': 27.0},
+            ),
+        ):
+            events = list(
+                _search_seller(
+                    ctx,
+                    page,
+                    'drewzal',
+                    ['tops'],
+                    'male',
+                    21.5,
+                    27.25,
+                    0.5,
+                    1.25,
+                    max_items=40,
+                    max_links=100,
+                    max_scrolls=4,
+                    search_id='search-rate-limit',
+                    emit_event=emitted_progress.append,
+                )
+            )
+
+        decoded = self._decode_events(events)
+        rate_limited_event = next(evt for evt in emitted_progress if evt['phase'] == 'rate_limited')
+        match_events = [evt for evt in decoded if evt['type'] == 'match']
+
+        self.assertEqual(rate_limited_event['retryAttempt'], 1)
+        self.assertEqual(rate_limited_event['retryTotalAttempts'], 3)
+        self.assertEqual(rate_limited_event['retryDelaySeconds'], 15)
+        self.assertEqual(rate_limited_event['message'], 'Paused while collecting listings.')
+        self.assertEqual(len(match_events), 1)
+        self.assertEqual(match_events[0]['item']['url'], 'tops-1')
+        self.assertEqual(decoded[-1]['type'], 'done')
+
+    def test_browse_all_collect_listing_rate_limit_emits_cooldown_and_recovers(self):
+        ctx = FakeContext()
+        browse_page = FakePage()
+        emitted_progress = []
+
+        with (
+            patch('builtins.print'),
+            patch('main._load_page_with_retries'),
+            patch(
+                'main.collect_listing_links',
+                side_effect=[RateLimitError("Depop appears to be rate limiting requests right now."), ['u1']],
+            ),
+            patch('main.sleep_with_cancel'),
+            patch('main.parse_listing', return_value={'seller': 'seller-u1', 'url': 'u1'}),
+            patch('main._process_item', return_value={'seller': 'seller-u1', 'url': 'u1'}),
+            patch('main._resolve_seller_sold_count', return_value=99),
+        ):
+            events = list(
+                _browse_all(
+                    ctx,
+                    browse_page,
+                    'tops',
+                    'male',
+                    21.5,
+                    27.0,
+                    0.5,
+                    0.75,
+                    max_items=1,
+                    max_links=10,
+                    max_scrolls=4,
+                    search_id='browse-rate-limit',
+                    emit_event=emitted_progress.append,
+                )
+            )
+
+        decoded = self._decode_events(events)
+        rate_limited_event = next(evt for evt in emitted_progress if evt['phase'] == 'rate_limited')
+        match_events = [evt for evt in decoded if evt['type'] == 'match']
+
+        self.assertEqual(rate_limited_event['retryAttempt'], 1)
+        self.assertEqual(rate_limited_event['retryDelaySeconds'], 15)
+        self.assertEqual(rate_limited_event['message'], 'Paused while collecting listings.')
+        self.assertEqual(len(match_events), 1)
+        self.assertEqual(match_events[0]['item']['soldCount'], 99)
+        self.assertEqual(decoded[-1]['type'], 'done')
 
     def test_process_item_matches_bottoms_by_size_range(self):
         item = {

@@ -28,7 +28,20 @@ const createProgressState = (overrides = {}) => ({
   ...overrides,
 });
 
+const getRetryCountdownSeconds = (progress, nowMs) => {
+  const retryAtMs = Date.parse(progress?.retryAvailableAt || '');
+  if (Number.isFinite(retryAtMs)) {
+    return Math.max(0, Math.ceil((retryAtMs - nowMs) / 1000));
+  }
+
+  return progress?.retryDelaySeconds || 0;
+};
+
 const getSellerStateTone = (sellerRow) => {
+  if (sellerRow?.progress?.phase === 'queued') {
+    return 'queued';
+  }
+
   if (sellerRow?.loading) {
     return 'loading';
   }
@@ -45,6 +58,10 @@ const getSellerStateTone = (sellerRow) => {
 };
 
 const getSellerStateLabel = (sellerRow) => {
+  if (sellerRow?.progress?.phase === 'queued') {
+    return 'Queued';
+  }
+
   if (sellerRow?.loading) {
     return 'Scanning';
   }
@@ -60,12 +77,16 @@ const getSellerStateLabel = (sellerRow) => {
   return 'Ready';
 };
 
-const formatSellerStatusLabel = (sellerRow) => {
+const formatSellerStatusLabel = (sellerRow, queuePosition = null) => {
   const progress = sellerRow?.progress;
   const hits = Number(progress?.matches);
   const processed = Number(progress?.processed) || 0;
   const total = Number(progress?.total) || 0;
   const safeHits = Number.isFinite(hits) ? hits : (sellerRow?.results?.length || 0);
+
+  if (progress?.phase === 'queued') {
+    return queuePosition ? `Queue position ${queuePosition}` : 'Waiting for the global queue';
+  }
 
   if (!sellerRow?.loading && !sellerRow?.error && !sellerRow?.processed && safeHits === 0 && processed === 0 && total === 0) {
     return 'Awaiting search';
@@ -78,24 +99,38 @@ const formatSellerStatusLabel = (sellerRow) => {
   return `${safeHits} matches • ${processed} parsed / ${total} collected`;
 };
 
-const getSellerProgressMessage = (sellerRow, nowMs) => {
+const getSellerProgressDetails = (sellerRow, nowMs, queuePosition = null) => {
   const progress = sellerRow?.progress;
   if (!progress) {
-    return '';
+    return null;
   }
 
   if (progress.phase === 'rate_limited' && progress.retryAvailableAt) {
-    const retryAtMs = Date.parse(progress.retryAvailableAt);
-    const secondsRemaining = Number.isFinite(retryAtMs)
-      ? Math.max(0, Math.ceil((retryAtMs - nowMs) / 1000))
-      : progress.retryDelaySeconds || 0;
+    const secondsRemaining = getRetryCountdownSeconds(progress, nowMs);
     const attempt = progress.retryAttempt || 1;
     const totalAttempts = progress.retryTotalAttempts || 1;
-    return `Rate limited. Retry ${attempt}/${totalAttempts} in ${secondsRemaining}s.`;
+    return {
+      primary: `Cooldown ${secondsRemaining}s • retry ${attempt}/${totalAttempts}`,
+      secondary: progress.message || 'Paused while retrying this seller.',
+    };
+  }
+
+  if (progress.phase === 'queued') {
+    return {
+      primary: queuePosition ? `Queued • slot ${queuePosition}` : 'Queued',
+      secondary: 'Waiting for the current seller to finish.',
+    };
   }
 
   const message = progress.message;
-  return typeof message === 'string' ? message.trim() : '';
+  if (typeof message === 'string' && message.trim()) {
+    return {
+      primary: message.trim(),
+      secondary: '',
+    };
+  }
+
+  return null;
 };
 
 const normalizeSellerUsername = (value = '') => {
@@ -327,6 +362,10 @@ const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
 function App() {
   const initialSellerAccounts = readStoredSellerAccounts();
   const searchRegistryRef = useRef(new Map());
+  const searchQueueRef = useRef([]);
+  const queueRunnerRef = useRef(false);
+  const activeQueueTaskRef = useRef(null);
+  const batchCounterRef = useRef(0);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [sellerManagerOpen, setSellerManagerOpen] = useState(false);
   const [activePageId, setActivePageId] = useState(() => readInitialPageId());
@@ -340,6 +379,10 @@ function App() {
     displayName: '',
     error: '',
   });
+  const [queueState, setQueueState] = useState({
+    active: null,
+    pending: [],
+  });
 
   const sellerAccountsSnapshot = JSON.stringify(sellerAccounts);
   const pageFiltersSnapshot = JSON.stringify(pageFilters);
@@ -348,8 +391,28 @@ function App() {
   const currentFilters = pageFilters[activePage.id] || getDefaultPageFilters(activePage.id);
   const sellerCount = sellerAccounts.length;
   const activeSearchCount = currentWorkspace.sellerRows.filter((row) => row.loading).length;
+  const queuedCountForPage = currentWorkspace.sellerRows.filter((row) => row.progress?.phase === 'queued').length;
   const totalHits = currentWorkspace.sellerRows.reduce((sum, row) => sum + row.results.length, 0);
-  const pageIsLoading = activeSearchCount > 0;
+  const pageIsLoading = activeSearchCount > 0 || queuedCountForPage > 0;
+  const queuePositionByKey = new Map(
+    queueState.pending.map((task, index) => [task.key, index + 1])
+  );
+  const activeQueuedTask = queueState.active;
+  const activeQueuedRow = activeQueuedTask
+    ? pageWorkspaces[activeQueuedTask.pageId]?.sellerRows.find(
+      (row) => row.seller === activeQueuedTask.sellerUsername
+    ) || null
+    : null;
+  const activeQueuedProgress = activeQueuedRow?.progress || null;
+
+  let globalQueueStatus = null;
+  if (activeQueuedTask && activeQueuedProgress?.phase === 'rate_limited') {
+    globalQueueStatus = `Global cooldown ${getRetryCountdownSeconds(activeQueuedProgress, nowMs)}s • retry ${activeQueuedProgress.retryAttempt || 1}/${activeQueuedProgress.retryTotalAttempts || 1}`;
+  } else if (activeQueuedTask) {
+    globalQueueStatus = `1 running • ${queueState.pending.length} queued`;
+  } else if (queueState.pending.length > 0) {
+    globalQueueStatus = `${queueState.pending.length} queued`;
+  }
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -441,6 +504,29 @@ function App() {
 
   const searchKeyFor = (pageId, sellerUsername) => `${pageId}::${sellerUsername}`;
 
+  const cloneQueueTask = (task) => {
+    if (!task) {
+      return null;
+    }
+
+    return {
+      ...task,
+      filters: task.filters ? { ...task.filters } : null,
+    };
+  };
+
+  const syncQueueState = () => {
+    setQueueState({
+      active: cloneQueueTask(activeQueueTaskRef.current),
+      pending: searchQueueRef.current.map(cloneQueueTask),
+    });
+  };
+
+  const nextBatchId = (prefix = 'batch') => {
+    batchCounterRef.current += 1;
+    return `${prefix}-${Date.now().toString(36)}-${batchCounterRef.current.toString(36)}`;
+  };
+
   const updateSellerRow = (pageId, sellerUsername, updates) => {
     setPageWorkspaces((prev) => ({
       ...prev,
@@ -473,6 +559,51 @@ function App() {
 
   const getSellerRow = (pageId, sellerUsername) =>
     pageWorkspaces[pageId]?.sellerRows.find((row) => row.seller === sellerUsername);
+
+  const isSellerScheduled = (pageId, sellerUsername) => {
+    const searchKey = searchKeyFor(pageId, sellerUsername);
+    if (searchRegistryRef.current.has(searchKey)) {
+      return true;
+    }
+
+    if (activeQueueTaskRef.current?.key === searchKey) {
+      return true;
+    }
+
+    return searchQueueRef.current.some((task) => task.key === searchKey);
+  };
+
+  const resetQueuedSellerRow = (task, message = '') => {
+    updateSellerRow(task.pageId, task.sellerUsername, {
+      loading: false,
+      controller: null,
+      searchId: '',
+      processed: false,
+      error: null,
+      errorCode: null,
+      results: [],
+      progress: message ? createProgressState({ phase: 'idle', message }) : null,
+    });
+  };
+
+  const removeQueuedTasks = (predicate, options = {}) => {
+    const removed = [];
+    searchQueueRef.current = searchQueueRef.current.filter((task) => {
+      if (predicate(task)) {
+        removed.push(task);
+        return false;
+      }
+
+      return true;
+    });
+
+    if (removed.length > 0) {
+      removed.forEach((task) => resetQueuedSellerRow(task, options.message || ''));
+      syncQueueState();
+    }
+
+    return removed;
+  };
 
   const finishSellerSearch = (pageId, sellerUsername, searchId, updates) => {
     const searchKey = searchKeyFor(pageId, sellerUsername);
@@ -564,6 +695,11 @@ function App() {
 
   const cancelSellerSearch = async (pageId, sellerUsername) => {
     const searchKey = searchKeyFor(pageId, sellerUsername);
+    const removedQueued = removeQueuedTasks((task) => task.key === searchKey);
+    if (removedQueued.length > 0) {
+      return;
+    }
+
     const activeSearch = searchRegistryRef.current.get(searchKey);
     const sellerRow = getSellerRow(pageId, sellerUsername);
     const searchId = activeSearch?.searchId || sellerRow?.searchId;
@@ -587,12 +723,16 @@ function App() {
       loading: false,
       controller: null,
       searchId: '',
+      processed: false,
       error: null,
       errorCode: null,
+      progress: null,
     });
   };
 
   const cancelSellerAcrossPages = async (sellerUsername) => {
+    removeQueuedTasks((task) => task.sellerUsername === sellerUsername);
+
     const activePages = CATEGORY_PAGES
       .map((page) => page.id)
       .filter((pageId) => searchRegistryRef.current.has(searchKeyFor(pageId, sellerUsername)));
@@ -637,17 +777,18 @@ function App() {
     });
   };
 
-  const startSellerSearch = async (pageId, sellerUsername) => {
+  const executeSellerSearch = async (task) => {
+    const { pageId, sellerUsername, filters } = task;
     const searchKey = searchKeyFor(pageId, sellerUsername);
     if (searchRegistryRef.current.has(searchKey)) {
-      return;
+      return { status: 'skipped', code: null };
     }
 
     const page = CATEGORY_PAGE_MAP[pageId];
-    const filters = pageFilters[pageId] || getDefaultPageFilters(pageId);
     const controller = new AbortController();
     const searchId = makeSearchId();
     const payload = buildSearchPayload(page, filters, sellerUsername, searchId);
+    let outcome = { status: 'done', code: null };
 
     searchRegistryRef.current.set(searchKey, { searchId, controller });
     updateSellerRow(pageId, sellerUsername, {
@@ -667,41 +808,139 @@ function App() {
       onMatch: (evt) => addSellerResult(pageId, sellerUsername, evt.item),
       onProgress: (progress) => updateSellerRow(pageId, sellerUsername, { progress }),
       onMeta: (meta) => updateSellerRow(pageId, sellerUsername, {
-        progress: createProgressState({ total: meta.total }),
+        progress: createProgressState({ phase: 'collecting', total: meta.total }),
       }),
       onError: (error) => {
         const { message, code } = getStreamErrorDetails(error);
+        const existingProgress = getSellerRow(pageId, sellerUsername)?.progress;
+        outcome = { status: 'error', code, message };
         finishSellerSearch(pageId, sellerUsername, searchId, {
           loading: false,
           error: message,
           errorCode: code,
           processed: true,
+          progress: existingProgress
+            ? {
+              ...existingProgress,
+              phase: 'error',
+              retryAttempt: null,
+              retryTotalAttempts: null,
+              retryDelaySeconds: null,
+              retryAvailableAt: null,
+            }
+            : null,
         });
       },
       onDone: () => {
+        const existingProgress = getSellerRow(pageId, sellerUsername)?.progress;
         finishSellerSearch(pageId, sellerUsername, searchId, {
           loading: false,
           processed: true,
+          progress: existingProgress
+            ? {
+              ...existingProgress,
+              phase: 'done',
+              retryAttempt: null,
+              retryTotalAttempts: null,
+              retryDelaySeconds: null,
+              retryAvailableAt: null,
+            }
+            : null,
         });
       },
     });
+
+    return outcome;
+  };
+
+  const pumpSearchQueue = async () => {
+    if (queueRunnerRef.current) {
+      return;
+    }
+
+    queueRunnerRef.current = true;
+    try {
+      while (searchQueueRef.current.length > 0) {
+        const nextTask = searchQueueRef.current.shift();
+        activeQueueTaskRef.current = nextTask;
+        syncQueueState();
+
+        const outcome = await executeSellerSearch(nextTask);
+
+        activeQueueTaskRef.current = null;
+        syncQueueState();
+
+        if (outcome?.status === 'error' && outcome.code === 'rate_limited' && nextTask.source === 'batch') {
+          removeQueuedTasks(
+            (task) => task.batchId === nextTask.batchId,
+            { message: 'Queue stopped after cooldown failure.' },
+          );
+        }
+      }
+    } finally {
+      queueRunnerRef.current = false;
+      activeQueueTaskRef.current = null;
+      syncQueueState();
+    }
+  };
+
+  const queueSellerSearch = (pageId, sellerUsername, options = {}) => {
+    const key = searchKeyFor(pageId, sellerUsername);
+    if (isSellerScheduled(pageId, sellerUsername)) {
+      return false;
+    }
+
+    const task = {
+      key,
+      pageId,
+      sellerUsername,
+      filters: normalizePageFilters(pageId, options.filters ?? pageFilters[pageId]),
+      batchId: options.batchId || nextBatchId(options.source === 'batch' ? 'batch' : 'manual'),
+      source: options.source || 'manual',
+    };
+
+    searchQueueRef.current = [...searchQueueRef.current, task];
+    updateSellerRow(pageId, sellerUsername, {
+      loading: false,
+      processed: false,
+      error: null,
+      errorCode: null,
+      results: [],
+      controller: null,
+      searchId: '',
+      progress: createProgressState({ phase: 'queued' }),
+    });
+    syncQueueState();
+    void pumpSearchQueue();
+    return true;
+  };
+
+  const startSellerSearch = async (pageId, sellerUsername) => {
+    queueSellerSearch(pageId, sellerUsername, { source: 'manual' });
   };
 
   const startSearchAllForPage = async (pageId) => {
+    const batchId = nextBatchId('batch');
     const sellersToStart = pageWorkspaces[pageId].sellerRows
       .map((row) => row.seller)
-      .filter((sellerUsername) => !searchRegistryRef.current.has(searchKeyFor(pageId, sellerUsername)));
+      .filter((sellerUsername) => !isSellerScheduled(pageId, sellerUsername));
 
     if (sellersToStart.length === 0) {
       return;
     }
 
-    await Promise.all(
-      sellersToStart.map((sellerUsername) => startSellerSearch(pageId, sellerUsername))
-    );
+    sellersToStart.forEach((sellerUsername) => {
+      queueSellerSearch(pageId, sellerUsername, {
+        source: 'batch',
+        batchId,
+        filters: pageFilters[pageId],
+      });
+    });
   };
 
   const cancelPageSearches = async (pageId) => {
+    removeQueuedTasks((task) => task.pageId === pageId);
+
     const activeSellers = pageWorkspaces[pageId].sellerRows
       .filter((row) => row.loading)
       .map((row) => row.seller);
@@ -932,9 +1171,9 @@ function App() {
               <span className="workspace-pill">
                 {sellerCount} sellers • {totalHits} hits
               </span>
-              {activeSearchCount > 0 && (
+              {globalQueueStatus && (
                 <span className="workspace-pill muted">
-                  {activeSearchCount} active
+                  {globalQueueStatus}
                 </span>
               )}
             </div>
@@ -982,11 +1221,18 @@ function App() {
           ) : (
             <div className="following-sellers">
               {currentWorkspace.sellerRows.map((sellerRow) => (
-                <div
-                  key={`${activePage.id}-${sellerRow.seller}`}
-                  className={`seller-row-card ${sellerRow.loading ? 'loading' : ''}`}
-                >
-                  <div className="seller-header">
+                (() => {
+                  const sellerKey = searchKeyFor(activePage.id, sellerRow.seller);
+                  const queuePosition = queuePositionByKey.get(sellerKey) || null;
+                  const progressDetails = getSellerProgressDetails(sellerRow, nowMs, queuePosition);
+                  const isQueued = sellerRow.progress?.phase === 'queued';
+
+                  return (
+                    <div
+                      key={`${activePage.id}-${sellerRow.seller}`}
+                      className={`seller-row-card ${sellerRow.loading ? 'loading' : ''}`}
+                    >
+                      <div className="seller-header">
                     <div className="seller-info">
                       <a
                         href={buildSellerPageHref(sellerRow.seller, activePage)}
@@ -1000,13 +1246,13 @@ function App() {
                     </div>
 
                     <div className="seller-controls">
-                      {sellerRow.loading ? (
+                      {sellerRow.loading || isQueued ? (
                         <button
                           type="button"
                           className="search-btn stop small"
                           onClick={() => cancelSellerSearch(activePage.id, sellerRow.seller)}
                         >
-                          Stop
+                          {sellerRow.loading ? 'Stop' : 'Remove'}
                         </button>
                       ) : (
                         <button
@@ -1023,15 +1269,22 @@ function App() {
                           {getSellerStateLabel(sellerRow)}
                         </span>
                         <span className="seller-status">
-                          {formatSellerStatusLabel(sellerRow)}
+                          {formatSellerStatusLabel(sellerRow, queuePosition)}
                         </span>
                       </div>
                     </div>
                   </div>
 
-                  {getSellerProgressMessage(sellerRow, nowMs) && (
+                  {progressDetails && (
                     <div className="seller-progress-message">
-                      {getSellerProgressMessage(sellerRow, nowMs)}
+                      <div className="seller-progress-primary">
+                        {progressDetails.primary}
+                      </div>
+                      {progressDetails.secondary && (
+                        <div className="seller-progress-secondary">
+                          {progressDetails.secondary}
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -1104,7 +1357,9 @@ function App() {
                       No matching items found in the latest listings.
                     </div>
                   )}
-                </div>
+                    </div>
+                  );
+                })()
               ))}
             </div>
           )}

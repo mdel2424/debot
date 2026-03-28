@@ -163,7 +163,7 @@ def _run_with_rate_limit_retries(
         except RateLimitError as exc:
             if attempt >= len(RATE_LIMIT_RETRY_DELAYS):
                 raise RateLimitError(
-                    f"{exc} Retried {len(RATE_LIMIT_RETRY_DELAYS)} times after the initial failure and still hit a limit.",
+                    f"Rate limited after {len(RATE_LIMIT_RETRY_DELAYS)} cooldown attempts while {label}.",
                     status=exc.status,
                 ) from exc
 
@@ -235,7 +235,7 @@ def _resolve_seller_sold_count(ctx, seller_cache: Dict[str, int], seller: str,
             profile_page,
             build_seller_url(seller_key, groups=groups, gender=gender),
             search_id,
-            f"seller stats for @{seller_key}",
+            "checking seller sold count",
             on_rate_limit=on_rate_limit,
         )
         sold_count = extract_seller_sold_count(profile_page) or 0
@@ -520,7 +520,7 @@ def _search_seller(ctx, page, seller, groups, gender,
             "processed": processed,
             "total": total if total else None,
             "matches": matches,
-            "message": f"Rate limited on {label}. Cooling down {delay}s before retry {attempt}/{total_attempts}.",
+            "message": f"Paused while {label}.",
             "retryAttempt": attempt,
             "retryTotalAttempts": total_attempts,
             "retryDelaySeconds": delay,
@@ -543,7 +543,7 @@ def _search_seller(ctx, page, seller, groups, gender,
             page,
             search_url,
             search_id,
-            f"seller page for @{seller} ({group})",
+            "opening seller page",
             expect_product_links=True,
             on_rate_limit=notify_rate_limit,
         )
@@ -557,13 +557,18 @@ def _search_seller(ctx, page, seller, groups, gender,
         if remaining_capacity <= 0:
             break
 
-        links = collect_listing_links(
-            page,
-            max_scrolls=max_scrolls,
-            per_scroll_wait_ms=1200,
-            max_links=remaining_capacity,
-            should_cancel=should_cancel,
-            aggressive_end_scroll=True,
+        links = _run_with_rate_limit_retries(
+            lambda current_page=page, current_capacity=remaining_capacity: collect_listing_links(
+                current_page,
+                max_scrolls=max_scrolls,
+                per_scroll_wait_ms=1200,
+                max_links=current_capacity,
+                should_cancel=should_cancel,
+                aggressive_end_scroll=True,
+            ),
+            should_cancel,
+            "collecting listings",
+            on_rate_limit=notify_rate_limit,
         )
         unique_links = [url for url in links if url not in seen_urls]
         seen_urls.update(unique_links)
@@ -580,7 +585,7 @@ def _search_seller(ctx, page, seller, groups, gender,
             item = _run_with_rate_limit_retries(
                 lambda current_url=url: parse_listing(page, current_url, should_cancel=should_cancel),
                 should_cancel,
-                f"listing page {url}",
+                "opening listing page",
                 on_rate_limit=notify_rate_limit,
             )
             processed += 1
@@ -643,7 +648,7 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
             "processed": processed,
             "total": len(seen_urls),
             "matches": matches,
-            "message": f"Rate limited on {label}. Cooling down {delay}s before retry {attempt}/{total_attempts}.",
+            "message": f"Paused while {label}.",
             "retryAttempt": attempt,
             "retryTotalAttempts": total_attempts,
             "retryDelaySeconds": delay,
@@ -657,7 +662,7 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
         page,
         browse_url,
         search_id,
-        "browse page",
+        "opening browse page",
         expect_product_links=True,
         on_rate_limit=notify_rate_limit,
     )
@@ -675,13 +680,18 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
             if remaining_capacity <= 0:
                 break
 
-            links = collect_listing_links(
-                page,
-                max_scrolls=max_scrolls,
-                per_scroll_wait_ms=1200,
-                max_links=remaining_capacity,
-                should_cancel=should_cancel,
-                aggressive_end_scroll=True,
+            links = _run_with_rate_limit_retries(
+                lambda current_page=page, current_capacity=remaining_capacity: collect_listing_links(
+                    current_page,
+                    max_scrolls=max_scrolls,
+                    per_scroll_wait_ms=1200,
+                    max_links=current_capacity,
+                    should_cancel=should_cancel,
+                    aggressive_end_scroll=True,
+                ),
+                should_cancel,
+                "collecting listings",
+                on_rate_limit=notify_rate_limit,
             )
             unique_new = [url for url in links if url not in seen_urls]
 
@@ -705,7 +715,7 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                 item = _run_with_rate_limit_retries(
                     lambda current_url=url: parse_listing(item_page, current_url, should_cancel=should_cancel),
                     should_cancel,
-                    f"listing page {url}",
+                    "opening listing page",
                     on_rate_limit=notify_rate_limit,
                 )
                 

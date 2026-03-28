@@ -514,6 +514,11 @@ body,
   color: #f4f4f1;
 }
 
+.seller-status-badge.queued {
+  background: rgba(228, 214, 196, 0.05);
+  color: #d7c9b8;
+}
+
 .seller-status-badge.complete {
   color: #d9dfda;
 }
@@ -544,6 +549,16 @@ body,
   padding: 0.8rem 0.92rem;
   position: relative;
   z-index: 1;
+}
+
+.seller-progress-primary {
+  color: var(--color-text-primary);
+  font-weight: 600;
+}
+
+.seller-progress-secondary {
+  color: var(--color-text-muted);
+  margin-top: 0.28rem;
 }
 
 .seller-row-error,
