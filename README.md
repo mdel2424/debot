@@ -84,7 +84,7 @@ After that, use `Run Debot.desktop` from your Desktop or app launcher.
 1. Open the frontend in your browser at `http://localhost:5173`
 2. Enter a seller username to search their listings, or leave blank and click "Browse All" to search the entire tops category
 3. Set your target P2P and length measurements with optional tolerances
-   Default search values are `21.5 ±0.5 x 27.25 ±1.25`
+   Default search values are `21.5 ±0.5 x 27.25 ±1`
 4. Click "Search" to start streaming results
 
 ## Testing

@@ -2,7 +2,7 @@ const MEASUREMENT_DEFAULTS = Object.freeze({
   first: '21.5',
   second: '27.25',
   firstTolerance: '0.5',
-  secondTolerance: '1.25',
+  secondTolerance: '1',
 });
 
 const BOTTOMS_SIZE_OPTIONS = [
@@ -97,6 +97,12 @@ export const CATEGORY_PAGE_MAP = Object.fromEntries(
 );
 
 export const DEFAULT_CATEGORY_PAGE_ID = CATEGORY_PAGES[0].id;
+export const CATEGORY_FILTER_DEFAULTS_SIGNATURE = JSON.stringify(
+  CATEGORY_PAGES.map((page) => ({
+    id: page.id,
+    defaults: page.defaults,
+  }))
+);
 
 export function getDefaultPageFilters(pageId) {
   const page = CATEGORY_PAGE_MAP[pageId] || CATEGORY_PAGE_MAP[DEFAULT_CATEGORY_PAGE_ID];

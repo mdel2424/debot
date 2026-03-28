@@ -16,7 +16,6 @@ export const DEFAULT_FOLLOWING_ACCOUNTS = [
   { name: 'Way Back Vintage', username: 'waybackco' },
   { name: 'Rutland Retros', username: 'rutlandretros' },
   { name: 'Alex Vinson', username: 'flashyfashion' },
-  { name: 'Relocation Vintage', username: 'relocationvintage' },
   { name: 'Vintage Quebec', username: 'vintagequebec_' },
   { name: 'Best Choice Vintage', username: 'bestchoicevintage' },
   { name: 'Drewzal', username: 'drewzal' },

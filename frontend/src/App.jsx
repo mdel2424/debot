@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { cancelSearch, makeSearchId, streamSearch } from './hooks/useStream';
 import { DEFAULT_FOLLOWING_ACCOUNTS } from './data/defaultSellers';
 import {
+  CATEGORY_FILTER_DEFAULTS_SIGNATURE,
   CATEGORY_PAGES,
   CATEGORY_PAGE_MAP,
   DEFAULT_CATEGORY_PAGE_ID,
@@ -14,6 +15,7 @@ import './index.css';
 const FOLLOWING_STORAGE_KEY = 'debot.followingAccounts.v1';
 const ACTIVE_PAGE_STORAGE_KEY = 'debot.categoryPage.v1';
 const PAGE_FILTERS_STORAGE_KEY = 'debot.categoryFilters.v1';
+const PAGE_FILTERS_VERSION_STORAGE_KEY = 'debot.categoryFilters.defaults.v1';
 
 const createProgressState = (overrides = {}) => ({
   processed: 0,
@@ -283,6 +285,16 @@ const readStoredPageFilters = () => {
   }
 
   try {
+    const storedDefaultsSignature = window.localStorage.getItem(PAGE_FILTERS_VERSION_STORAGE_KEY);
+    if (storedDefaultsSignature !== CATEGORY_FILTER_DEFAULTS_SIGNATURE) {
+      window.localStorage.removeItem(PAGE_FILTERS_STORAGE_KEY);
+      window.localStorage.setItem(
+        PAGE_FILTERS_VERSION_STORAGE_KEY,
+        CATEGORY_FILTER_DEFAULTS_SIGNATURE
+      );
+      return getDefaultFiltersByPage();
+    }
+
     const raw = window.localStorage.getItem(PAGE_FILTERS_STORAGE_KEY);
     if (!raw) {
       return getDefaultFiltersByPage();
@@ -449,6 +461,10 @@ function App() {
     }
 
     try {
+      window.localStorage.setItem(
+        PAGE_FILTERS_VERSION_STORAGE_KEY,
+        CATEGORY_FILTER_DEFAULTS_SIGNATURE
+      );
       window.localStorage.setItem(PAGE_FILTERS_STORAGE_KEY, pageFiltersSnapshot);
     } catch (error) {
       console.warn('[App] Failed to persist page filters:', error);
