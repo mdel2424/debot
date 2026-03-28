@@ -15,6 +15,7 @@ RELTIME_RX = re.compile(r"\b(\d+)\s*(minute|hour|day|week|month)s?\s*ago\b", re.
 CREATED_AT_RX = re.compile(r'(?:\\\"|")created_at(?:\\\"|"):(?:\\\"|")([^"\\]+)(?:\\\"|")')
 SOLD_COUNT_RX = re.compile(r"(\d[\d,]*)\s*sold\b", re.I)
 BROWSE_URL = "https://www.depop.com/ca/category/mens/tops/?sort=newlyListed"
+SIZE_LINE_RX = re.compile(r"^\s*size(?:\s*[:\-])?\s+(.+?)\s*$", re.I)
 CURRENCY_SYMBOLS = {
     "USD": "US$",
     "CAD": "$",
@@ -226,6 +227,12 @@ def build_seller_url(seller: str, groups: str = "tops", gender: str = "male") ->
     return base + "?" + urlencode(params)
 
 
+def build_browse_url(groups: str = "tops", gender: str = "male") -> str:
+    """Build a Depop category browse URL."""
+    gender_segment = "mens" if (gender or "").lower() == "male" else "womens"
+    return f"https://www.depop.com/ca/category/{gender_segment}/{groups}/?sort=newlyListed"
+
+
 def extract_created_at_from_html(html: str) -> Optional[str]:
     """Extract a created_at timestamp from page hydration HTML."""
     m = CREATED_AT_RX.search(html or "")
@@ -279,6 +286,42 @@ def _pick_product_json_ld(page: Page) -> Optional[Dict[str, Any]]:
                 return entry
             if "description" in entry and "offers" in entry:
                 return entry
+
+    return None
+
+
+def extract_size_label_from_text(text: str) -> Optional[str]:
+    """Extract the visible Depop size label from listing text."""
+    if not text:
+        return None
+
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+
+    for idx, line in enumerate(lines):
+        match = SIZE_LINE_RX.match(line)
+        if match:
+            candidate = match.group(1).strip(" :.-")
+            if candidate:
+                return candidate
+
+            if idx + 1 < len(lines):
+                follow_up = lines[idx + 1].strip(" :.-")
+                if follow_up and len(follow_up) <= 20:
+                    return follow_up
+
+    inline_match = re.search(
+        r"\bsize(?:\s*[:\-])?\s+("
+        r"us\s*\d+(?:\.\d+)?|"
+        r"\d+(?:\.\d+)?\"?|"
+        r"xxxs|xxs|xs|s|m|l|xl|xxl|xxxl|"
+        r"one size|o/s|os"
+        r")\b",
+        text,
+        re.I,
+    )
+    if inline_match:
+        return inline_match.group(1).strip()
 
     return None
 
@@ -618,6 +661,7 @@ def parse_listing(
         )
         product_json_ld = _pick_product_json_ld(page)
         page_html = ""
+        body_text = ""
 
         # Description
         desc = ""
@@ -709,6 +753,15 @@ def parse_listing(
             page_html = page.content()
             seller_name = _extract_seller_name(page, page_html)
 
+        try:
+            body_text = page.inner_text("body", timeout=1_500) or ""
+        except Exception:
+            body_text = ""
+
+        size_label = extract_size_label_from_text(body_text)
+        if not size_label:
+            size_label = extract_size_label_from_text(desc)
+
         # Listing time
         listed_at_iso: Optional[str] = None
         age_days: Optional[float] = None
@@ -755,6 +808,7 @@ def parse_listing(
             "listedAt": listed_at_iso,
             "ageDays": age_days,
             "seller": seller_name,
+            "sizeLabel": size_label,
             "soldCount": None,
         }
     except SearchCancelled:

@@ -52,14 +52,10 @@ body, .app-dark-ui {
 }
 
 .sidebar-nav li {
-  padding: 0.875rem 1rem;
+  padding: 0;
   margin-bottom: 0.25rem;
   border-radius: 8px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
   transition: all 0.2s ease;
-  font-weight: 500;
 }
 
 .sidebar-nav li.active {
@@ -71,9 +67,28 @@ body, .app-dark-ui {
   background: #222222;
 }
 
+.sidebar-nav-button {
+  align-items: center;
+  background: transparent;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  font: inherit;
+  font-weight: 500;
+  gap: 0.75rem;
+  padding: 0.875rem 1rem;
+  text-align: left;
+  width: 100%;
+}
+
 .sidebar-icon {
+  align-items: center;
+  display: inline-flex;
+  justify-content: center;
   margin-right: 0.75rem;
   font-size: 1.1rem;
+  min-width: 28px;
 }
 
 /* Main Content */
@@ -174,6 +189,10 @@ body, .app-dark-ui {
   width: 60px;
   padding: 0.75rem 0.5rem;
   text-align: center;
+}
+
+.input-dark.input-select {
+  min-width: 120px;
 }
 
 .input-dark:focus {
@@ -331,6 +350,20 @@ body, .app-dark-ui {
 
 .workspace-pill.muted {
   color: #aaaaaa;
+}
+
+.filter-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.filter-label span {
+  color: #8e8e8e;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .empty-state-card {

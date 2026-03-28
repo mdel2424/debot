@@ -5,6 +5,7 @@ import asyncio
 import datetime as dt
 import json
 import queue
+import re
 import threading
 import time
 from typing import Dict, Any, Optional, Callable
@@ -17,6 +18,7 @@ from playwright.sync_api import sync_playwright
 from parser import parser
 from scraper import (
     build_seller_url,
+    build_browse_url,
     accept_cookies,
     check_page_for_rate_limit,
     dismiss_login_modal,
@@ -26,7 +28,6 @@ from scraper import (
     extract_seller_sold_count,
     create_browser_context,
     get_following_list,
-    BROWSE_URL,
     RateLimitError,
     SearchCancelled,
     raise_if_cancelled,
@@ -56,6 +57,8 @@ DEFAULT_P2P_TOL = 0.5
 DEFAULT_LENGTH_TOL = 1.25
 RATE_LIMIT_RETRY_DELAYS = (2, 5)
 BROWSE_ALL_STALLED_BATCHES = 3
+MEASUREMENT_CATEGORIES = {"tops", "coats-jackets"}
+SUPPORTED_CATEGORIES = MEASUREMENT_CATEGORIES | {"bottoms", "footwear", "accessories"}
 
 # SSE helpers
 SSE_PREAMBLE = (":" + (" " * 2048) + "\n").encode("utf-8")
@@ -94,6 +97,40 @@ def _normalize_groups(groups_value: Any) -> list[str]:
         return normalized or ["tops"]
 
     return ["tops"]
+
+
+def _normalize_size_range(size_range_value: Any) -> Dict[str, Any] | None:
+    """Normalize optional size-range filters from request payloads."""
+    if not isinstance(size_range_value, dict):
+        return None
+
+    def _coerce_number(value: Any) -> float | None:
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    min_size = _coerce_number(size_range_value.get("min"))
+    max_size = _coerce_number(size_range_value.get("max"))
+    if min_size is None and max_size is None:
+        return None
+
+    if min_size is None:
+        min_size = max_size
+    if max_size is None:
+        max_size = min_size
+
+    if min_size is None or max_size is None:
+        return None
+
+    lower = min(min_size, max_size)
+    upper = max(min_size, max_size)
+    system = str(size_range_value.get("system") or "").strip().upper() or None
+    return {
+        "min": lower,
+        "max": upper,
+        "system": system,
+    }
 
 
 def _error_payload_for_exception(exc: Exception, search_id: str) -> Dict[str, Any]:
@@ -208,25 +245,99 @@ def _resolve_seller_sold_count(ctx, seller_cache: Dict[str, int], seller: str,
     return sold_count
 
 
+def _extract_bottoms_size(size_label: str) -> Optional[float]:
+    """Extract a numeric waist size from a Depop bottoms label."""
+    text = (size_label or "").strip().lower()
+    if not text:
+        return None
+
+    match = None
+    for pattern in (
+        r"\bw\s*(\d{2})(?:\.\d+)?\b",
+        r"\b(\d{2})(?:\.\d+)?\s*(?:\"|in)?\b",
+    ):
+        match = re.search(pattern, text, re.I)
+        if match:
+            break
+
+    if not match:
+        return None
+
+    try:
+        return float(match.group(1))
+    except Exception:
+        return None
+
+
+def _extract_footwear_size(size_label: str) -> Optional[float]:
+    """Extract a numeric US shoe size from a Depop footwear label."""
+    text = (size_label or "").strip().upper()
+    if not text:
+        return None
+
+    match = re.search(r"\bUS\s*(\d+(?:\.\d+)?)\b", text)
+    if not match:
+        match = re.search(r"\b(\d+(?:\.\d+)?)\b", text)
+
+    if not match:
+        return None
+
+    try:
+        return float(match.group(1))
+    except Exception:
+        return None
+
+
+def _build_match_payload(item: Dict[str, Any], p2p: Optional[float] = None,
+                         length: Optional[float] = None) -> Dict[str, Any]:
+    """Format a parsed listing into the stream match payload."""
+    return {
+        "url": item.get("url"),
+        "image": item.get("image"),
+        "price": item.get("price"),
+        "p2p": p2p,
+        "length": length,
+        "ageDays": item.get("ageDays"),
+        "listedAt": item.get("listedAt"),
+        "seller": item.get("seller"),
+        "sizeLabel": item.get("sizeLabel"),
+        "soldCount": item.get("soldCount"),
+    }
+
+
 def _process_item(item: Dict[str, Any], target_p2p: float, target_length: float,
-                  p2p_tol: float, length_tol: float) -> Dict[str, Any] | None:
-    """Check if item matches measurement criteria and return formatted result."""
-    text = item.get("description", "")
-    w, L = parser.extract_tops(text)
-    
-    if parser.within(w, target_p2p, p2p_tol) and parser.within(L, target_length, length_tol):
-        return {
-            "url": item.get("url"),
-            "image": item.get("image"),
-            "price": item.get("price"),
-            "p2p": w,
-            "length": L,
-            "ageDays": item.get("ageDays"),
-            "listedAt": item.get("listedAt"),
-            "seller": item.get("seller"),
-            "soldCount": item.get("soldCount"),
-        }
-    return None
+                  p2p_tol: float, length_tol: float, category: str = "tops",
+                  size_range: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+    """Check if item matches the active category filter and return a formatted result."""
+    if category in MEASUREMENT_CATEGORIES:
+        text = item.get("description", "")
+        w, L = parser.extract_tops(text)
+
+        if parser.within(w, target_p2p, p2p_tol) and parser.within(L, target_length, length_tol):
+            return _build_match_payload(item, p2p=w, length=L)
+        return None
+
+    if category == "accessories":
+        return _build_match_payload(item)
+
+    if category == "bottoms":
+        size_value = _extract_bottoms_size(item.get("sizeLabel") or "")
+    elif category == "footwear":
+        size_value = _extract_footwear_size(item.get("sizeLabel") or "")
+    else:
+        size_value = None
+
+    if size_value is None:
+        return None
+
+    lower = float(size_range.get("min")) if size_range and size_range.get("min") is not None else None
+    upper = float(size_range.get("max")) if size_range and size_range.get("max") is not None else None
+    if lower is not None and size_value < lower:
+        return None
+    if upper is not None and size_value > upper:
+        return None
+
+    return _build_match_payload(item)
 
 
 @app.post("/api/search/stream")
@@ -237,7 +348,7 @@ async def search_stream(request: Request):
     
     # Parse request
     category = (payload.get("category") or "tops").lower()
-    if category != "tops":
+    if category not in SUPPORTED_CATEGORIES:
         async def empty_gen():
             yield SSE_PREAMBLE
             yield _sse({"type": "done"})
@@ -248,6 +359,7 @@ async def search_stream(request: Request):
     target_length = float(ms["second"]) if ms.get("second") is not None else None
     p2p_tol = float(payload.get("p2pTolerance") or DEFAULT_P2P_TOL)
     length_tol = float(payload.get("lengthTolerance") or DEFAULT_LENGTH_TOL)
+    size_range = _normalize_size_range(payload.get("sizeRange"))
     
     seller = (payload.get("seller") or "").strip()
     max_items = int(payload.get("maxItems") or 40)
@@ -279,13 +391,15 @@ async def search_stream(request: Request):
                             yield from _search_seller(
                                 ctx, page, seller, groups, gender,
                                 target_p2p, target_length, p2p_tol, length_tol,
-                                max_items, max_links, max_scrolls, search_id
+                                max_items, max_links, max_scrolls, search_id,
+                                category, size_range,
                             )
                         else:
                             yield from _browse_all(
                                 ctx, page, primary_group, gender,
                                 target_p2p, target_length, p2p_tol, length_tol,
-                                max_items, max_links, max_scrolls, search_id
+                                max_items, max_links, max_scrolls, search_id,
+                                category, size_range,
                             )
                     except SearchCancelled:
                         yield _sse({"type": "cancelled", "searchId": search_id or None})
@@ -371,7 +485,8 @@ async def search_stream(request: Request):
 
 def _search_seller(ctx, page, seller, groups, gender,
                    target_p2p, target_length, p2p_tol, length_tol,
-                   max_items, max_links, max_scrolls, search_id):
+                   max_items, max_links, max_scrolls, search_id,
+                   category="tops", size_range=None):
     """Search a specific seller's listings."""
     should_cancel = _cancel_check(search_id)
     normalized_groups = _normalize_groups(groups)
@@ -439,10 +554,21 @@ def _search_seller(ctx, page, seller, groups, gender,
                     yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None, "stopped": "age_limit"})
                     break
 
-                match = _process_item(item, target_p2p, target_length, p2p_tol, length_tol)
+                match = _process_item(
+                    item,
+                    target_p2p,
+                    target_length,
+                    p2p_tol,
+                    length_tol,
+                    category,
+                    size_range,
+                )
                 if match:
                     match["soldCount"] = seller_sold_count
-                    print(f"[stream] MATCH {processed}/{total} p2p={match['p2p']} len={match['length']}")
+                    print(
+                        f"[stream] MATCH {processed}/{total} "
+                        f"p2p={match.get('p2p')} len={match.get('length')} size={match.get('sizeLabel')}"
+                    )
                     yield _sse({"type": "match", "item": match, "searchId": search_id or None})
                     matches += 1
 
@@ -456,16 +582,18 @@ def _search_seller(ctx, page, seller, groups, gender,
 
 
 def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, length_tol,
-                max_items, max_links, max_scrolls, search_id):
+                max_items, max_links, max_scrolls, search_id,
+                category="tops", size_range=None):
     """Browse all listings on the category page."""
     should_cancel = _cancel_check(search_id)
     target_matches = max(max_items or 0, 1)
     max_parsed_links = max(max_links or 0, 1)
-    print(f"[stream] browsing: {BROWSE_URL}")
+    browse_url = build_browse_url(groups=groups, gender=gender)
+    print(f"[stream] browsing: {browse_url}")
     
     _load_page_with_retries(
         page,
-        BROWSE_URL,
+        browse_url,
         search_id,
         "browse page",
         expect_product_links=True,
@@ -524,7 +652,15 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                 processed += 1
                 
                 if item:
-                    match = _process_item(item, target_p2p, target_length, p2p_tol, length_tol)
+                    match = _process_item(
+                        item,
+                        target_p2p,
+                        target_length,
+                        p2p_tol,
+                        length_tol,
+                        category,
+                        size_range,
+                    )
                     if match:
                         seller_name = (match.get("seller") or "").strip()
                         sold_count = _resolve_seller_sold_count(

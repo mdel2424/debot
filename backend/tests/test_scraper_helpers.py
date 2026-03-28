@@ -22,6 +22,7 @@ try:
         extract_rate_limit_message,
         extract_seller_sold_count_from_text,
         extract_seller_username_from_href,
+        extract_size_label_from_text,
         parse_listing,
     )
 except Exception as exc:  # pragma: no cover - protects VS Code discovery on wrong interpreter
@@ -178,6 +179,11 @@ class ScraperHelpersTest(unittest.TestCase):
         self.assertEqual(extract_seller_sold_count_from_text("249 sold · Active today"), 249)
         self.assertEqual(extract_seller_sold_count_from_text("1,249 sold"), 1249)
         self.assertIsNone(extract_seller_sold_count_from_text("Sold items"))
+
+    def test_extract_size_label_from_text(self):
+        self.assertEqual(extract_size_label_from_text("Condition\nGood\nSize 34\""), '34"')
+        self.assertEqual(extract_size_label_from_text("Size\nUS 10.5\nColor\nBlack"), 'US 10.5')
+        self.assertIsNone(extract_size_label_from_text("No size line here"))
 
     def test_extract_rate_limit_message(self):
         self.assertEqual(

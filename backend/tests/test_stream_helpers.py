@@ -11,7 +11,14 @@ if str(BACKEND_DIR) not in sys.path:
 DEPENDENCY_IMPORT_ERROR = None
 
 try:
-    from main import _browse_all, _error_payload_for_exception, _run_with_rate_limit_retries, _search_seller, _sse  # noqa: E402
+    from main import (  # noqa: E402
+        _browse_all,
+        _error_payload_for_exception,
+        _process_item,
+        _run_with_rate_limit_retries,
+        _search_seller,
+        _sse,
+    )
     from scraper import RateLimitError, SearchCancelled, sleep_with_cancel  # noqa: E402
 except Exception as exc:  # pragma: no cover - protects VS Code discovery on wrong interpreter
     DEPENDENCY_IMPORT_ERROR = exc
@@ -296,6 +303,78 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(progress_events[-1]['processed'], 3)
         self.assertEqual(progress_events[-1]['total'], 3)
         self.assertEqual(load_mock.call_count, 2)
+
+    def test_process_item_matches_bottoms_by_size_range(self):
+        item = {
+            "url": "https://www.depop.com/products/example-bottoms/",
+            "image": "https://example.com/image.jpg",
+            "price": "$60.00",
+            "description": "Vintage jeans",
+            "sizeLabel": '34"',
+            "seller": "seller-one",
+            "ageDays": 2.5,
+            "listedAt": "2026-03-28T00:00:00+00:00",
+        }
+
+        match = _process_item(
+            item,
+            None,
+            None,
+            0.5,
+            1.25,
+            "bottoms",
+            {"min": 30, "max": 34, "system": "WAIST"},
+        )
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match["sizeLabel"], '34"')
+        self.assertIsNone(match["p2p"])
+        self.assertIsNone(match["length"])
+
+    def test_process_item_matches_footwear_by_size_range(self):
+        item = {
+            "url": "https://www.depop.com/products/example-shoes/",
+            "image": "https://example.com/shoe.jpg",
+            "price": "$110.00",
+            "description": "Leather loafers",
+            "sizeLabel": "US 10.5",
+            "seller": "seller-two",
+        }
+
+        match = _process_item(
+            item,
+            None,
+            None,
+            0.5,
+            1.25,
+            "footwear",
+            {"min": 10, "max": 11, "system": "US"},
+        )
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match["sizeLabel"], "US 10.5")
+
+    def test_process_item_allows_all_accessories(self):
+        item = {
+            "url": "https://www.depop.com/products/example-bag/",
+            "image": None,
+            "price": "$48.00",
+            "description": "Vintage bag",
+            "seller": "seller-three",
+        }
+
+        match = _process_item(
+            item,
+            None,
+            None,
+            0.5,
+            1.25,
+            "accessories",
+            None,
+        )
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match["url"], item["url"])
 
 
 if __name__ == "__main__":
