@@ -28,6 +28,38 @@ const createProgressState = (overrides = {}) => ({
   ...overrides,
 });
 
+const getSellerStateTone = (sellerRow) => {
+  if (sellerRow?.loading) {
+    return 'loading';
+  }
+
+  if (sellerRow?.error) {
+    return 'error';
+  }
+
+  if (sellerRow?.processed) {
+    return 'complete';
+  }
+
+  return 'idle';
+};
+
+const getSellerStateLabel = (sellerRow) => {
+  if (sellerRow?.loading) {
+    return 'Scanning';
+  }
+
+  if (sellerRow?.error) {
+    return 'Issue';
+  }
+
+  if (sellerRow?.processed) {
+    return (sellerRow?.results?.length || 0) > 0 ? 'Matched' : 'Complete';
+  }
+
+  return 'Ready';
+};
+
 const formatSellerStatusLabel = (sellerRow) => {
   const progress = sellerRow?.progress;
   const hits = Number(progress?.matches);
@@ -36,10 +68,14 @@ const formatSellerStatusLabel = (sellerRow) => {
   const safeHits = Number.isFinite(hits) ? hits : (sellerRow?.results?.length || 0);
 
   if (!sellerRow?.loading && !sellerRow?.error && !sellerRow?.processed && safeHits === 0 && processed === 0 && total === 0) {
-    return 'Ready';
+    return 'Awaiting search';
   }
 
-  return `${safeHits} hits • ${processed} parsed / ${total} collected`;
+  if (sellerRow?.loading && processed === 0 && total === 0 && safeHits === 0) {
+    return 'Collecting live listings';
+  }
+
+  return `${safeHits} matches • ${processed} parsed / ${total} collected`;
 };
 
 const getSellerProgressMessage = (sellerRow, nowMs) => {
@@ -877,7 +913,8 @@ function App() {
       <main className="main-content home-main-content">
         <div className="following-container home-workspace">
           <div className="following-header home-header">
-            <div>
+            <div className="home-header-copy">
+              <div className="home-header-kicker">Depop category workspace</div>
               <h1>{activePage.headline}</h1>
               <p className="following-description">
                 {activePage.description}
@@ -981,11 +1018,14 @@ function App() {
                         </button>
                       )}
 
-                      <span className="seller-status">
-                        {sellerRow.loading ? '⏳' : sellerRow.error ? '❌' : sellerRow.processed ? '✓' : ''}
-                        {' '}
-                        {formatSellerStatusLabel(sellerRow)}
-                      </span>
+                      <div className="seller-status-stack">
+                        <span className={`seller-status-badge ${getSellerStateTone(sellerRow)}`}>
+                          {getSellerStateLabel(sellerRow)}
+                        </span>
+                        <span className="seller-status">
+                          {formatSellerStatusLabel(sellerRow)}
+                        </span>
+                      </div>
                     </div>
                   </div>
 
@@ -1050,7 +1090,7 @@ function App() {
                             <div className="result-price">{result.price || ''}</div>
                             {metaParts.length > 0 && (
                               <div className="result-meta">
-                                {metaParts.join(' | ')}
+                                {metaParts.join(' · ')}
                               </div>
                             )}
                           </a>

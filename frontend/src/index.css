@@ -1,27 +1,82 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=Manrope:wght@400;500;600;700;800&family=Newsreader:opsz,wght@6..72,500;6..72,600;6..72,700&display=swap");
 @import "tailwindcss";
 
 :root {
-  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+  --font-body: "Manrope", "Segoe UI", sans-serif;
+  --font-display: "Newsreader", Georgia, serif;
+  --font-mono: "IBM Plex Mono", "SFMono-Regular", monospace;
+  --color-background: #0f0d0b;
+  --color-panel: #141210;
+  --color-panel-elevated: #1a1714;
+  --color-panel-muted: #201d19;
+  --color-border: rgba(236, 228, 214, 0.09);
+  --color-border-strong: rgba(236, 228, 214, 0.16);
+  --color-text-primary: #f2ece2;
+  --color-text-secondary: #b9b0a2;
+  --color-text-muted: #857b6f;
+  --color-accent-soft: #e4d6c4;
+  --color-accent-ink: #14110d;
+  --shadow-panel:
+    0 10px 30px rgba(0, 0, 0, 0.24),
+    inset 0 1px 0 rgba(255, 255, 255, 0.02);
+  color: var(--color-text-primary);
+  color-scheme: dark;
+  font-family: var(--font-body);
+  font-feature-settings: "liga" 1, "calt" 1;
+  font-synthesis: none;
+  font-weight: 500;
   line-height: 1.5;
-  font-weight: 400;
-  color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
-  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
   -moz-osx-font-smoothing: grayscale;
+  -webkit-font-smoothing: antialiased;
 }
 
-html, body, #root { height: 100%; margin: 0; }
+html,
+body,
+#root {
+  background: var(--color-background);
+  height: 100%;
+  margin: 0;
+}
 
-/* drop the flex centering on body */
+html {
+  scrollbar-gutter: stable;
+}
+
 body {
-  min-width: 320px;
   min-height: 100vh;
+  min-width: 320px;
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    color: #213547;
-    background-color: #ffffff;
-  }
+body,
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+a {
+  color: inherit;
+}
+
+button,
+input,
+select,
+textarea {
+  outline: none;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+a:focus-visible {
+  box-shadow: 0 0 0 4px rgba(228, 214, 196, 0.12);
+  outline: none;
+}
+
+::selection {
+  background: rgba(228, 214, 196, 0.22);
+  color: #fffdf8;
 }
