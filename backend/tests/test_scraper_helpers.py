@@ -23,6 +23,8 @@ try:
         extract_seller_sold_count_from_text,
         extract_seller_username_from_href,
         extract_size_label_from_text,
+        flush_debug_logs,
+        log_debug,
         parse_listing,
     )
 except Exception as exc:  # pragma: no cover - protects VS Code discovery on wrong interpreter
@@ -266,9 +268,19 @@ class ScraperHelpersTest(unittest.TestCase):
 
         with mock.patch("builtins.print"):
             dismiss_login_modal(page)
+            flush_debug_logs()
 
         self.assertEqual(page.keyboard.presses, ["Escape"])
         self.assertEqual(page.waits, [LOGIN_MODAL_WAIT_MS] * (LOGIN_MODAL_MAX_ATTEMPTS + 1))
+
+    def test_log_debug_collapses_repeated_escape_messages(self):
+        with mock.patch("builtins.print") as print_mock:
+            flush_debug_logs()
+            log_debug("[login-modal] Pressed Escape to dismiss modal", aggregate_key="login_modal_escape")
+            log_debug("[login-modal] Pressed Escape to dismiss modal", aggregate_key="login_modal_escape")
+            flush_debug_logs()
+
+        print_mock.assert_called_once_with("[login-modal] Pressed Escape to dismiss modal x2")
 
 
 if __name__ == "__main__":

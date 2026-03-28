@@ -757,6 +757,13 @@ body, .app-dark-ui {
   margin-top: 0.25rem;
 }
 
+.seller-progress-message {
+  color: #b9b9b9;
+  font-size: 0.83rem;
+  margin-top: -0.1rem;
+  margin-bottom: 0.5rem;
+}
+
 .seller-progress-counter {
   margin-bottom: 0.6rem;
 }

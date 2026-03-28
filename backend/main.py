@@ -22,12 +22,14 @@ from scraper import (
     accept_cookies,
     check_page_for_rate_limit,
     dismiss_login_modal,
+    flush_debug_logs,
     remove_sold_sections,
     collect_listing_links,
     parse_listing,
     extract_seller_sold_count,
     create_browser_context,
     get_following_list,
+    log_debug,
     RateLimitError,
     SearchCancelled,
     raise_if_cancelled,
@@ -55,7 +57,7 @@ app.add_middleware(
 CANCEL_FLAGS: Dict[str, bool] = {}
 DEFAULT_P2P_TOL = 0.5
 DEFAULT_LENGTH_TOL = 1.25
-RATE_LIMIT_RETRY_DELAYS = (2, 5)
+RATE_LIMIT_RETRY_DELAYS = (15, 30)
 BROWSE_ALL_STALLED_BATCHES = 3
 MEASUREMENT_CATEGORIES = {"tops", "coats-jackets"}
 SUPPORTED_CATEGORIES = MEASUREMENT_CATEGORIES | {"bottoms", "footwear", "accessories"}
@@ -149,6 +151,7 @@ def _run_with_rate_limit_retries(
     action,
     should_cancel: Callable[[], bool],
     label: str,
+    on_rate_limit: Optional[Callable[[int, int, Exception, str], None]] = None,
 ):
     """Retry rare rate-limit failures with bounded, cancelable backoff."""
     for attempt in range(len(RATE_LIMIT_RETRY_DELAYS) + 1):
@@ -165,7 +168,9 @@ def _run_with_rate_limit_retries(
                 ) from exc
 
             delay = RATE_LIMIT_RETRY_DELAYS[attempt]
-            print(f"[stream] Rate limited during {label}; retrying in {delay}s")
+            if on_rate_limit:
+                on_rate_limit(attempt + 1, delay, exc, label)
+            log_debug(f"[stream] Rate limited during {label}; retrying in {delay}s")
             sleep_with_cancel(delay, should_cancel)
 
 
@@ -186,6 +191,7 @@ def _load_page_with_retries(
     *,
     expect_product_links: bool = False,
     expect_listing: bool = False,
+    on_rate_limit: Optional[Callable[[int, int, Exception, str], None]] = None,
 ) -> None:
     """Navigate to a page with cancellation and rate-limit retries."""
     should_cancel = _cancel_check(search_id)
@@ -208,12 +214,13 @@ def _load_page_with_retries(
             expect_listing=expect_listing,
         )
 
-    _run_with_rate_limit_retries(action, should_cancel, label)
+    _run_with_rate_limit_retries(action, should_cancel, label, on_rate_limit=on_rate_limit)
 
 
 def _resolve_seller_sold_count(ctx, seller_cache: Dict[str, int], seller: str,
                                search_id: str = "",
-                               groups: str = "tops", gender: str = "male") -> int:
+                               groups: str = "tops", gender: str = "male",
+                               on_rate_limit: Optional[Callable[[int, int, Exception, str], None]] = None) -> int:
     """Load and cache seller sold counts from seller pages."""
     seller_key = (seller or "").strip().lstrip("@")
     if not seller_key:
@@ -229,6 +236,7 @@ def _resolve_seller_sold_count(ctx, seller_cache: Dict[str, int], seller: str,
             build_seller_url(seller_key, groups=groups, gender=gender),
             search_id,
             f"seller stats for @{seller_key}",
+            on_rate_limit=on_rate_limit,
         )
         sold_count = extract_seller_sold_count(profile_page) or 0
     except SearchCancelled:
@@ -236,7 +244,7 @@ def _resolve_seller_sold_count(ctx, seller_cache: Dict[str, int], seller: str,
     except RateLimitError:
         raise
     except Exception as e:
-        print(f"[seller-stats] Failed to load @{seller_key}: {e}")
+        log_debug(f"[seller-stats] Failed to load @{seller_key}: {e}")
         sold_count = 0
     finally:
         profile_page.close()
@@ -344,7 +352,7 @@ def _process_item(item: Dict[str, Any], target_p2p: float, target_length: float,
 async def search_stream(request: Request):
     """SSE streaming search endpoint."""
     payload = await request.json()
-    print("[stream] payload:", payload)
+    log_debug(f"[stream] payload: {payload}")
     
     # Parse request
     category = (payload.get("category") or "tops").lower()
@@ -375,6 +383,12 @@ async def search_stream(request: Request):
     if search_id:
         CANCEL_FLAGS[search_id] = False
 
+    result_queue = queue.Queue()
+    error_holder = [None]
+
+    def emit_stream_event(payload: Dict[str, Any]) -> None:
+        result_queue.put(("data", _sse(payload)))
+
     def run_search():
         """Synchronous search generator."""
         try:
@@ -393,6 +407,7 @@ async def search_stream(request: Request):
                                 target_p2p, target_length, p2p_tol, length_tol,
                                 max_items, max_links, max_scrolls, search_id,
                                 category, size_range,
+                                emit_event=emit_stream_event,
                             )
                         else:
                             yield from _browse_all(
@@ -400,6 +415,7 @@ async def search_stream(request: Request):
                                 target_p2p, target_length, p2p_tol, length_tol,
                                 max_items, max_links, max_scrolls, search_id,
                                 category, size_range,
+                                emit_event=emit_stream_event,
                             )
                     except SearchCancelled:
                         yield _sse({"type": "cancelled", "searchId": search_id or None})
@@ -408,22 +424,20 @@ async def search_stream(request: Request):
                     browser.close()
                     
         except RateLimitError as e:
-            print(f"[stream] rate limited: {e}")
+            log_debug(f"[stream] rate limited: {e}")
             yield _sse(_error_payload_for_exception(e, search_id))
         except SearchCancelled:
             yield _sse({"type": "cancelled", "searchId": search_id or None})
         except Exception as e:
-            print(f"[stream] error: {e}")
+            log_debug(f"[stream] error: {e}")
             yield _sse(_error_payload_for_exception(e, search_id))
         finally:
+            flush_debug_logs()
             if search_id and search_id in CANCEL_FLAGS:
                 del CANCEL_FLAGS[search_id]
 
     async def async_wrapper():
         """Run sync generator in thread and yield results async."""
-        result_queue = queue.Queue()
-        error_holder = [None]
-        
         def worker():
             try:
                 for chunk in run_search():
@@ -486,10 +500,28 @@ async def search_stream(request: Request):
 def _search_seller(ctx, page, seller, groups, gender,
                    target_p2p, target_length, p2p_tol, length_tol,
                    max_items, max_links, max_scrolls, search_id,
-                   category="tops", size_range=None):
+                   category="tops", size_range=None, emit_event: Optional[Callable[[Dict[str, Any]], None]] = None):
     """Search a specific seller's listings."""
     should_cancel = _cancel_check(search_id)
     normalized_groups = _normalize_groups(groups)
+    processed = 0
+    matches = 0
+    total = 0
+
+    def notify_rate_limit(attempt: int, delay: int, exc: Exception, label: str) -> None:
+        if not emit_event:
+            return
+        emit_event({
+            "type": "progress",
+            "phase": "rate_limited",
+            "processed": processed,
+            "total": total if total else None,
+            "matches": matches,
+            "message": f"Rate limited on {label}. Cooling down {delay}s before retry {attempt}/{len(RATE_LIMIT_RETRY_DELAYS)}.",
+            "retryAttempt": attempt,
+            "retryDelaySeconds": delay,
+            "searchId": search_id or None,
+        })
 
     yield _sse({"type": "progress", "phase": "landing", "processed": 0, "total": None, "matches": 0, "searchId": search_id or None})
 
@@ -500,7 +532,7 @@ def _search_seller(ctx, page, seller, groups, gender,
     for group in normalized_groups:
         raise_if_cancelled(should_cancel)
         search_url = build_seller_url(seller, groups=group, gender=gender)
-        print(f"[stream] navigating: {search_url}")
+        log_debug(f"[stream] navigating: {search_url}")
 
         _load_page_with_retries(
             page,
@@ -508,6 +540,7 @@ def _search_seller(ctx, page, seller, groups, gender,
             search_id,
             f"seller page for @{seller} ({group})",
             expect_product_links=True,
+            on_rate_limit=notify_rate_limit,
         )
 
         if seller_sold_count <= 0:
@@ -532,12 +565,9 @@ def _search_seller(ctx, page, seller, groups, gender,
         grouped_links.append((group, unique_links))
 
     total = sum(len(urls) for _, urls in grouped_links)
-    print(f"[stream] collected {total} links")
+    log_debug(f"[stream] collected {total} links for @{seller}")
     
     yield _sse({"type": "meta", "links": total, "seller": seller, "searchId": search_id or None})
-    
-    matches = 0
-    processed = 0
 
     for group, links in grouped_links:
         for url in links:
@@ -546,13 +576,14 @@ def _search_seller(ctx, page, seller, groups, gender,
                 lambda current_url=url: parse_listing(page, current_url, should_cancel=should_cancel),
                 should_cancel,
                 f"listing page {url}",
+                on_rate_limit=notify_rate_limit,
             )
             processed += 1
 
             if item:
                 age_days = item.get("ageDays")
                 if age_days is not None and age_days > 45:
-                    print(f"[stream] Item is {age_days:.1f} days old for group={group}, skipping remaining older listings")
+                    log_debug(f"[stream] Item is {age_days:.1f} days old for @{seller} group={group}, skipping remaining older listings")
                     yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None, "stopped": "age_limit"})
                     break
 
@@ -567,8 +598,8 @@ def _search_seller(ctx, page, seller, groups, gender,
                 )
                 if match:
                     match["soldCount"] = seller_sold_count
-                    print(
-                        f"[stream] MATCH {processed}/{total} "
+                    log_debug(
+                        f"[stream] MATCH seller=@{seller} url={match.get('url')} "
                         f"p2p={match.get('p2p')} len={match.get('length')} size={match.get('sizeLabel')}"
                     )
                     yield _sse({"type": "match", "item": match, "searchId": search_id or None})
@@ -585,13 +616,32 @@ def _search_seller(ctx, page, seller, groups, gender,
 
 def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, length_tol,
                 max_items, max_links, max_scrolls, search_id,
-                category="tops", size_range=None):
+                category="tops", size_range=None, emit_event: Optional[Callable[[Dict[str, Any]], None]] = None):
     """Browse all listings on the category page."""
     should_cancel = _cancel_check(search_id)
     target_matches = max(max_items or 0, 1)
     max_parsed_links = max(max_links or 0, 1)
     browse_url = build_browse_url(groups=groups, gender=gender)
-    print(f"[stream] browsing: {browse_url}")
+    processed = 0
+    matches = 0
+    seen_urls = set()
+
+    def notify_rate_limit(attempt: int, delay: int, exc: Exception, label: str) -> None:
+        if not emit_event:
+            return
+        emit_event({
+            "type": "progress",
+            "phase": "rate_limited",
+            "processed": processed,
+            "total": len(seen_urls),
+            "matches": matches,
+            "message": f"Rate limited on {label}. Cooling down {delay}s before retry {attempt}/{len(RATE_LIMIT_RETRY_DELAYS)}.",
+            "retryAttempt": attempt,
+            "retryDelaySeconds": delay,
+            "searchId": search_id or None,
+        })
+
+    log_debug(f"[stream] browsing: {browse_url}")
     
     _load_page_with_retries(
         page,
@@ -599,14 +649,11 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
         search_id,
         "browse page",
         expect_product_links=True,
+        on_rate_limit=notify_rate_limit,
     )
     page.wait_for_timeout(500)
     
     yield _sse({"type": "progress", "phase": "browsing", "processed": 0, "total": 0, "matches": 0, "searchId": search_id or None})
-    
-    processed = 0
-    matches = 0
-    seen_urls = set()
     stalled_batches = 0
     seller_stats_cache: Dict[str, int] = {}
     item_page = ctx.new_page()
@@ -637,7 +684,7 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
 
             stalled_batches = 0
             seen_urls.update(unique_new)
-            print(f"[stream] Collected {len(unique_new)} new browse links ({len(seen_urls)} total)")
+            log_debug(f"[stream] Collected {len(unique_new)} new browse links ({len(seen_urls)} total)")
 
             for url in unique_new:
                 raise_if_cancelled(should_cancel)
@@ -649,6 +696,7 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                     lambda current_url=url: parse_listing(item_page, current_url, should_cancel=should_cancel),
                     should_cancel,
                     f"listing page {url}",
+                    on_rate_limit=notify_rate_limit,
                 )
                 
                 processed += 1
@@ -672,12 +720,13 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                             search_id=search_id,
                             groups=groups,
                             gender=gender,
+                            on_rate_limit=notify_rate_limit,
                         )
                         match["soldCount"] = sold_count
 
                         # Check seller reputation in browse mode
                         if sold_count > 50:
-                            print(f"[stream] MATCH seller={seller_name} ({sold_count} sold)")
+                            log_debug(f"[stream] MATCH seller=@{seller_name} url={match.get('url')} sold={sold_count}")
                             yield _sse({"type": "match", "item": match, "seller": seller_name, "searchId": search_id or None})
                             matches += 1
                             
@@ -699,7 +748,7 @@ async def cancel_stream(payload: Dict[str, Any] = Body(...)):
     if not search_id:
         return {"ok": False, "error": "missing searchId"}
     CANCEL_FLAGS[search_id] = True
-    print(f"[cancel] requested for searchId={search_id}")
+    log_debug(f"[cancel] requested for searchId={search_id}")
     return {"ok": True, "searchId": search_id}
 
 
@@ -707,7 +756,7 @@ async def cancel_stream(payload: Dict[str, Any] = Body(...)):
 async def browse_following_stream(request: Request):
     """SSE streaming endpoint to browse all accounts a user is following."""
     payload = await request.json()
-    print("[following-stream] payload:", payload)
+    log_debug(f"[following-stream] payload: {payload}")
     
     username = (payload.get("username") or "").strip().lstrip("@")
     if not username:
@@ -811,7 +860,7 @@ async def browse_following_stream(request: Request):
                                         # Stop if item is over 45 days old
                                         age_days = item.get("ageDays")
                                         if age_days is not None and age_days > 45:
-                                            print(f"[following-thread] {seller_name}: Item is {age_days:.1f} days old, stopping")
+                                            log_debug(f"[following-thread] {seller_name}: Item is {age_days:.1f} days old, stopping")
                                             break
                                         
                                         match = _process_item(item, target_p2p, target_length, p2p_tol, length_tol)
@@ -847,7 +896,7 @@ async def browse_following_stream(request: Request):
                         except SearchCancelled:
                             return
                         except Exception as e:
-                            print(f"[following-thread] Error searching {seller_name}: {e}")
+                            log_debug(f"[following-thread] Error searching {seller_name}: {e}")
                             with lock:
                                 processed_sellers[0] += 1
                                 results_queue.put({
@@ -901,14 +950,15 @@ async def browse_following_stream(request: Request):
                     browser.close()
                     
         except RateLimitError as e:
-            print(f"[following-stream] rate limited: {e}")
+            log_debug(f"[following-stream] rate limited: {e}")
             yield _sse(_error_payload_for_exception(e, search_id))
         except SearchCancelled:
             yield _sse({"type": "cancelled", "searchId": search_id or None})
         except Exception as e:
-            print(f"[following-stream] error: {e}")
+            log_debug(f"[following-stream] error: {e}")
             yield _sse(_error_payload_for_exception(e, search_id))
         finally:
+            flush_debug_logs()
             yield _sse({"type": "done", "searchId": search_id or None})
             if search_id and search_id in CANCEL_FLAGS:
                 del CANCEL_FLAGS[search_id]

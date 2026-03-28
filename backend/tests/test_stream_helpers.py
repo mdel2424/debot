@@ -70,6 +70,7 @@ class StreamHelpersTest(unittest.TestCase):
     def test_run_with_rate_limit_retries_uses_expected_backoff(self):
         attempts = []
         delays = []
+        retry_events = []
 
         def action():
             attempts.append("try")
@@ -77,10 +78,16 @@ class StreamHelpersTest(unittest.TestCase):
 
         with patch("builtins.print"), patch("main.sleep_with_cancel", side_effect=lambda delay, should_cancel=None: delays.append(delay)):
             with self.assertRaises(RateLimitError) as ctx:
-                _run_with_rate_limit_retries(action, lambda: False, "listing page")
+                _run_with_rate_limit_retries(
+                    action,
+                    lambda: False,
+                    "listing page",
+                    on_rate_limit=lambda attempt, delay, exc, label: retry_events.append((attempt, delay, label)),
+                )
 
         self.assertEqual(len(attempts), 3)
-        self.assertEqual(delays, [2, 5])
+        self.assertEqual(delays, [15, 30])
+        self.assertEqual(retry_events, [(1, 15, "listing page"), (2, 30, "listing page")])
         self.assertIn("Retried 2 times after the initial failure", str(ctx.exception))
 
     def test_rate_limit_error_payload_is_encoded_as_sse_error(self):

@@ -19,6 +19,8 @@ const createProgressState = (overrides = {}) => ({
   processed: 0,
   total: 0,
   matches: 0,
+  phase: 'idle',
+  message: '',
   ...overrides,
 });
 
@@ -34,6 +36,11 @@ const formatSellerStatusLabel = (sellerRow) => {
   }
 
   return `${safeHits} hits • ${processed} parsed / ${total} collected`;
+};
+
+const getSellerProgressMessage = (sellerRow) => {
+  const message = sellerRow?.progress?.message;
+  return typeof message === 'string' ? message.trim() : '';
 };
 
 const normalizeSellerUsername = (value = '') => {
@@ -953,6 +960,12 @@ function App() {
                       </span>
                     </div>
                   </div>
+
+                  {getSellerProgressMessage(sellerRow) && (
+                    <div className="seller-progress-message">
+                      {getSellerProgressMessage(sellerRow)}
+                    </div>
+                  )}
 
                   {sellerRow.error && (
                     <div className="row-error seller-row-error">

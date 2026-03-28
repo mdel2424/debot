@@ -103,7 +103,10 @@ export async function streamSearch({
                   processed: evt.processed,
                   total: evt.total,
                   matches: evt.matches,
-                  phase: evt.phase || 'parsing'
+                  phase: evt.phase || 'parsing',
+                  message: evt.message || '',
+                  retryAttempt: evt.retryAttempt || null,
+                  retryDelaySeconds: evt.retryDelaySeconds || null,
                 });
                 break;
               case 'meta':

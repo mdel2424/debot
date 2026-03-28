@@ -56,6 +56,7 @@ RATE_LIMIT_CHALLENGE_SIGNALS = (
     "please enable cookies",
 )
 CancelCheck = Optional[Callable[[], bool]]
+_PENDING_LOG_COUNTS: Dict[str, int] = {"login_modal_escape": 0}
 
 
 class SearchCancelled(Exception):
@@ -69,6 +70,25 @@ class RateLimitError(Exception):
         super().__init__(message)
         self.status = status
         self.code = "rate_limited"
+
+
+def flush_debug_logs() -> None:
+    """Flush any buffered log summaries."""
+    escape_count = _PENDING_LOG_COUNTS.get("login_modal_escape", 0)
+    if escape_count:
+        suffix = f" x{escape_count}" if escape_count > 1 else ""
+        print(f"[login-modal] Pressed Escape to dismiss modal{suffix}")
+        _PENDING_LOG_COUNTS["login_modal_escape"] = 0
+
+
+def log_debug(message: str, *, aggregate_key: Optional[str] = None) -> None:
+    """Print debug logs while collapsing repeated noisy messages."""
+    if aggregate_key:
+        _PENDING_LOG_COUNTS[aggregate_key] = _PENDING_LOG_COUNTS.get(aggregate_key, 0) + 1
+        return
+
+    flush_debug_logs()
+    print(message)
 
 
 def raise_if_cancelled(should_cancel: CancelCheck = None) -> None:
@@ -449,7 +469,7 @@ def dismiss_login_modal(page: Page) -> None:
                     close_btn = page.locator(selector).first
                     if close_btn.count() and close_btn.is_visible(timeout=300):
                         close_btn.click(timeout=2000)
-                        print(f"[login-modal] Dismissed login modal via: {selector}")
+                        log_debug(f"[login-modal] Dismissed login modal via: {selector}")
                         page.wait_for_timeout(LOGIN_MODAL_WAIT_MS)
                         return
                 except Exception:
@@ -473,7 +493,7 @@ def dismiss_login_modal(page: Page) -> None:
                     return false;
                 }""")
                 if clicked:
-                    print("[login-modal] Dismissed login modal via JS click")
+                    log_debug("[login-modal] Dismissed login modal via JS click")
                     page.wait_for_timeout(LOGIN_MODAL_WAIT_MS)
                     return
             except Exception:
@@ -486,14 +506,14 @@ def dismiss_login_modal(page: Page) -> None:
         try:
             page.keyboard.press("Escape")
             page.wait_for_timeout(LOGIN_MODAL_WAIT_MS)
-            print("[login-modal] Pressed Escape to dismiss modal")
+            log_debug("[login-modal] Pressed Escape to dismiss modal", aggregate_key="login_modal_escape")
         except Exception:
             pass
         except Exception:
             pass
             
     except Exception as e:
-        print(f"[login-modal] Error dismissing login modal: {e}")
+        log_debug(f"[login-modal] Error dismissing login modal: {e}")
 
 
 def remove_sold_sections(page: Page) -> None:
@@ -841,7 +861,7 @@ def get_following_list(page: Page, username: str) -> List[str]:
     and extract all usernames they are following.
     """
     profile_url = f"https://www.depop.com/{username.strip().lstrip('@').strip('/')}/"
-    print(f"[following] Navigating to {profile_url}")
+    log_debug(f"[following] Navigating to {profile_url}")
     
     page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
     accept_cookies(page)
@@ -908,7 +928,7 @@ def get_following_list(page: Page, username: str) -> List[str]:
                 pass
                 
     except Exception as e:
-        print(f"[following] Error extracting following list: {e}")
+        log_debug(f"[following] Error extracting following list: {e}")
     
-    print(f"[following] Found {len(following_usernames)} accounts")
+    log_debug(f"[following] Found {len(following_usernames)} accounts")
     return following_usernames
