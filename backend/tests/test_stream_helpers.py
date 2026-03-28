@@ -14,6 +14,7 @@ try:
     from main import (  # noqa: E402
         _browse_all,
         _error_payload_for_exception,
+        MAX_LISTING_AGE_DAYS,
         _process_item,
         _run_with_rate_limit_retries,
         _search_seller,
@@ -372,7 +373,7 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(match_events[0]['item']['url'], 'tops-1')
         self.assertEqual(decoded[-1]['type'], 'done')
 
-    def test_search_seller_does_not_stop_on_first_old_listing(self):
+    def test_search_seller_keeps_scanning_items_inside_age_window(self):
         ctx = FakeContext()
         page = FakePage()
         parse_results = [
@@ -423,6 +424,63 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(progress_events[-1]['processed'], 2)
         self.assertEqual(progress_events[-1]['total'], 2)
 
+    def test_search_seller_stops_current_group_once_listing_exceeds_age_window(self):
+        ctx = FakeContext()
+        page = FakePage()
+        parse_results = [
+            {'seller': 'onthemarkco', 'url': 'recent-top', 'ageDays': 12.0},
+            {'seller': 'onthemarkco', 'url': 'stale-top', 'ageDays': float(MAX_LISTING_AGE_DAYS) + 1},
+            {'seller': 'onthemarkco', 'url': 'fresh-coat', 'ageDays': 4.0},
+        ]
+        parse_calls = []
+
+        def fake_parse(current_page, url, should_cancel=None):
+            parse_calls.append(url)
+            return parse_results[len(parse_calls) - 1]
+
+        with (
+            patch('builtins.print'),
+            patch('main._load_page_with_retries'),
+            patch('main.extract_seller_sold_count', return_value=110),
+            patch('main.remove_sold_sections'),
+            patch('main.collect_listing_links', side_effect=[['recent-top', 'stale-top', 'never-top'], ['fresh-coat']]),
+            patch('main.parse_listing', side_effect=fake_parse),
+            patch(
+                'main._process_item',
+                side_effect=lambda item, *args: (
+                    {'seller': item['seller'], 'url': item['url'], 'p2p': 21.5, 'length': 27.0}
+                    if item['url'] in {'recent-top', 'fresh-coat'}
+                    else None
+                ),
+            ),
+        ):
+            events = list(
+                _search_seller(
+                    ctx,
+                    page,
+                    'onthemarkco',
+                    ['tops', 'coats-jackets'],
+                    'male',
+                    21.5,
+                    27.25,
+                    0.5,
+                    1.25,
+                    max_items=40,
+                    max_links=100,
+                    max_scrolls=4,
+                    search_id='search-age-cutoff',
+                )
+            )
+
+        decoded = self._decode_events(events)
+        match_events = [evt for evt in decoded if evt['type'] == 'match']
+        progress_events = [evt for evt in decoded if evt['type'] == 'progress']
+
+        self.assertEqual(parse_calls, ['recent-top', 'stale-top', 'fresh-coat'])
+        self.assertEqual([evt['item']['url'] for evt in match_events], ['recent-top', 'fresh-coat'])
+        self.assertEqual(progress_events[-1]['processed'], 3)
+        self.assertEqual(progress_events[-1]['total'], 3)
+
     def test_browse_all_collect_listing_rate_limit_emits_cooldown_and_recovers(self):
         ctx = FakeContext()
         browse_page = FakePage()
@@ -467,6 +525,58 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(rate_limited_event['message'], 'Paused while collecting listings.')
         self.assertEqual(len(match_events), 1)
         self.assertEqual(match_events[0]['item']['soldCount'], 99)
+        self.assertEqual(decoded[-1]['type'], 'done')
+
+    def test_browse_all_aggregates_multiple_groups_and_stops_stale_group(self):
+        ctx = FakeContext()
+        browse_page = FakePage()
+        parse_calls = []
+
+        parse_results = {
+            'top-1': {'seller': 'seller-top', 'url': 'top-1', 'ageDays': 3.0},
+            'stale-top': {'seller': 'seller-top', 'url': 'stale-top', 'ageDays': float(MAX_LISTING_AGE_DAYS) + 5},
+            'coat-1': {'seller': 'seller-coat', 'url': 'coat-1', 'ageDays': 6.0},
+        }
+
+        def fake_parse(page, url, should_cancel=None):
+            parse_calls.append(url)
+            return parse_results[url]
+
+        with (
+            patch('builtins.print'),
+            patch('main._load_page_with_retries') as load_mock,
+            patch('main.collect_listing_links', side_effect=[['top-1', 'stale-top', 'never-top'], ['coat-1']]) as collect_mock,
+            patch('main.parse_listing', side_effect=fake_parse),
+            patch(
+                'main._process_item',
+                side_effect=lambda item, *args: {**item, 'p2p': 22.0, 'length': 28.0} if item['url'] != 'stale-top' else None,
+            ),
+            patch('main._resolve_seller_sold_count', return_value=99),
+        ):
+            events = list(
+                _browse_all(
+                    ctx,
+                    browse_page,
+                    ['tops', 'coats-jackets'],
+                    'male',
+                    21.5,
+                    27.0,
+                    0.5,
+                    0.75,
+                    max_items=2,
+                    max_links=50,
+                    max_scrolls=4,
+                    search_id='browse-multi-group',
+                )
+            )
+
+        decoded = self._decode_events(events)
+        match_events = [evt for evt in decoded if evt['type'] == 'match']
+
+        self.assertEqual(load_mock.call_count, 2)
+        self.assertEqual(collect_mock.call_count, 2)
+        self.assertEqual(parse_calls, ['top-1', 'stale-top', 'coat-1'])
+        self.assertEqual([evt['item']['url'] for evt in match_events], ['top-1', 'coat-1'])
         self.assertEqual(decoded[-1]['type'], 'done')
 
     def test_process_item_matches_bottoms_by_size_range(self):

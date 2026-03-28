@@ -232,7 +232,27 @@ body,
 }
 
 .home-controls {
+  align-items: flex-end;
+  justify-content: space-between;
   margin-bottom: 0.25rem;
+}
+
+.home-controls-fields,
+.home-controls-actions {
+  align-items: flex-end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.85rem;
+}
+
+.home-controls-fields {
+  flex: 1 1 520px;
+}
+
+.home-controls-actions {
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  margin-left: auto;
 }
 
 .filter-label {
@@ -293,6 +313,10 @@ body,
 
 .input-dark.input-select {
   min-width: 128px;
+}
+
+.home-controls .search-btn {
+  align-self: flex-end;
 }
 
 .search-btn {
@@ -923,6 +947,19 @@ body,
     align-items: stretch;
     border-radius: 22px;
     padding: 0.9rem;
+  }
+
+  .home-controls {
+    justify-content: flex-start;
+  }
+
+  .home-controls-fields,
+  .home-controls-actions {
+    width: 100%;
+  }
+
+  .home-controls-actions {
+    margin-left: 0;
   }
 
   .following-inputs .input-dark,

@@ -318,8 +318,14 @@ const readInitialPageId = () => {
   return resolvePageId(storedValue);
 };
 
-const buildSellerPageHref = (sellerUsername, page) =>
-  `https://www.depop.com/${sellerUsername}/?groups=${page.group}&gender=male`;
+const buildSellerPageHref = (sellerUsername, page) => {
+  const params = new URLSearchParams({ sort: 'recent', gender: 'male' });
+  if (!Array.isArray(page.group) && page.group) {
+    params.set('groups', page.group);
+  }
+
+  return `https://www.depop.com/${sellerUsername}/?${params.toString()}`;
+};
 
 const parseMeasurementNumber = (value, fallback) => {
   const parsed = parseFloat(value);
@@ -1311,34 +1317,38 @@ function App() {
           </div>
 
           <div className="following-inputs home-controls">
-            {renderFilterControls()}
+            <div className="home-controls-fields">
+              {renderFilterControls()}
+            </div>
 
-            <button
-              type="button"
-              className="search-btn secondary"
-              onClick={() => resetPageFilters(activePage.id)}
-            >
-              Reset filters
-            </button>
-
-            {pageIsLoading ? (
+            <div className="home-controls-actions">
               <button
                 type="button"
-                className="search-btn stop"
-                onClick={() => cancelPageSearches(activePage.id)}
+                className="search-btn secondary"
+                onClick={() => resetPageFilters(activePage.id)}
               >
-                Stop Page
+                Reset filters
               </button>
-            ) : (
-              <button
-                type="button"
-                className="search-btn"
-                onClick={() => startSearchAllForPage(activePage.id)}
-                disabled={currentWorkspace.sellerRows.length === 0}
-              >
-                Search All Sellers
-              </button>
-            )}
+
+              {pageIsLoading ? (
+                <button
+                  type="button"
+                  className="search-btn stop"
+                  onClick={() => cancelPageSearches(activePage.id)}
+                >
+                  Stop Page
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="search-btn"
+                  onClick={() => startSearchAllForPage(activePage.id)}
+                  disabled={currentWorkspace.sellerRows.length === 0}
+                >
+                  Search All Sellers
+                </button>
+              )}
+            </div>
           </div>
 
           {currentWorkspace.sellerRows.length === 0 ? (

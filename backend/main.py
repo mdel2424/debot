@@ -59,6 +59,7 @@ DEFAULT_P2P_TOL = 0.5
 DEFAULT_LENGTH_TOL = 1.25
 RATE_LIMIT_RETRY_DELAYS = (15, 30, 60)
 BROWSE_ALL_STALLED_BATCHES = 3
+MAX_LISTING_AGE_DAYS = 90
 MEASUREMENT_CATEGORIES = {"tops", "coats-jackets"}
 SUPPORTED_CATEGORIES = MEASUREMENT_CATEGORIES | {"bottoms", "footwear", "accessories"}
 
@@ -147,6 +148,21 @@ def _error_payload_for_exception(exc: Exception, search_id: str) -> Dict[str, An
     return payload
 
 
+def _listing_exceeds_age_window(item: Dict[str, Any] | None, max_age_days: int = MAX_LISTING_AGE_DAYS) -> bool:
+    """Return whether a parsed listing is older than the allowed recency window."""
+    if not item:
+        return False
+
+    age_days = item.get("ageDays")
+    if age_days is None:
+        return False
+
+    try:
+        return float(age_days) > float(max_age_days)
+    except Exception:
+        return False
+
+
 def _run_with_rate_limit_retries(
     action,
     should_cancel: Callable[[], bool],
@@ -219,7 +235,7 @@ def _load_page_with_retries(
 
 def _resolve_seller_sold_count(ctx, seller_cache: Dict[str, int], seller: str,
                                search_id: str = "",
-                               groups: str = "tops", gender: str = "male",
+                               groups: Any = "tops", gender: str = "male",
                                on_rate_limit: Optional[Callable[[int, int, int, Exception, str], None]] = None) -> int:
     """Load and cache seller sold counts from seller pages."""
     seller_key = (seller or "").strip().lstrip("@")
@@ -229,11 +245,13 @@ def _resolve_seller_sold_count(ctx, seller_cache: Dict[str, int], seller: str,
     if seller_key in seller_cache:
         return seller_cache[seller_key]
 
+    groups_value = _normalize_groups(groups)[0]
+
     profile_page = ctx.new_page()
     try:
         _load_page_with_retries(
             profile_page,
-            build_seller_url(seller_key, groups=groups, gender=gender),
+            build_seller_url(seller_key, groups=groups_value, gender=gender),
             search_id,
             "checking seller sold count",
             on_rate_limit=on_rate_limit,
@@ -377,7 +395,6 @@ async def search_stream(request: Request):
     slowmo = int(payload.get("slowmo") or 0)
     gender = payload.get("gender") or "male"
     groups = _normalize_groups(payload.get("groups") or "tops")
-    primary_group = groups[0]
     search_id = str(payload.get("searchId") or "")
     
     if search_id:
@@ -411,7 +428,7 @@ async def search_stream(request: Request):
                             )
                         else:
                             yield from _browse_all(
-                                ctx, page, primary_group, gender,
+                                ctx, page, groups, gender,
                                 target_p2p, target_length, p2p_tol, length_tol,
                                 max_items, max_links, max_scrolls, search_id,
                                 category, size_range,
@@ -580,7 +597,7 @@ def _search_seller(ctx, page, seller, groups, gender,
     yield _sse({"type": "meta", "links": total, "seller": seller, "searchId": search_id or None})
 
     for group, links in grouped_links:
-        for url in links:
+        for idx, url in enumerate(links):
             raise_if_cancelled(should_cancel)
             item = _run_with_rate_limit_retries(
                 lambda current_url=url: parse_listing(page, current_url, should_cancel=should_cancel),
@@ -591,6 +608,16 @@ def _search_seller(ctx, page, seller, groups, gender,
             processed += 1
 
             if item:
+                if _listing_exceeds_age_window(item):
+                    age_days = float(item.get("ageDays"))
+                    total -= max(len(links) - idx - 1, 0)
+                    log_debug(
+                        f"[stream] stopping @{seller} group={group} at {age_days:.1f}d "
+                        f"(>{MAX_LISTING_AGE_DAYS}d window)"
+                    )
+                    yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
+                    break
+
                 match = _process_item(
                     item,
                     target_p2p,
@@ -614,7 +641,7 @@ def _search_seller(ctx, page, seller, groups, gender,
                         return
 
             yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
-    
+
     yield _sse({"type": "done", "searchId": search_id or None})
 
 
@@ -623,9 +650,9 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                 category="tops", size_range=None, emit_event: Optional[Callable[[Dict[str, Any]], None]] = None):
     """Browse all listings on the category page."""
     should_cancel = _cancel_check(search_id)
+    normalized_groups = _normalize_groups(groups)
     target_matches = max(max_items or 0, 1)
     max_parsed_links = max(max_links or 0, 1)
-    browse_url = build_browse_url(groups=groups, gender=gender)
     processed = 0
     matches = 0
     seen_urls = set()
@@ -650,105 +677,125 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
             "searchId": search_id or None,
         })
 
-    log_debug(f"[stream] browsing: {browse_url}")
-    
-    _load_page_with_retries(
-        page,
-        browse_url,
-        search_id,
-        "opening browse page",
-        expect_product_links=True,
-        on_rate_limit=notify_rate_limit,
-    )
-    page.wait_for_timeout(500)
-    
     yield _sse({"type": "progress", "phase": "browsing", "processed": 0, "total": 0, "matches": 0, "searchId": search_id or None})
-    stalled_batches = 0
     seller_stats_cache: Dict[str, int] = {}
     item_page = ctx.new_page()
     try:
-        while processed < max_parsed_links and matches < target_matches:
-            raise_if_cancelled(should_cancel)
-
-            remaining_capacity = max_parsed_links - len(seen_urls)
-            if remaining_capacity <= 0:
+        for group in normalized_groups:
+            if processed >= max_parsed_links or matches >= target_matches:
                 break
 
-            links = _run_with_rate_limit_retries(
-                lambda current_page=page, current_capacity=remaining_capacity: collect_listing_links(
-                    current_page,
-                    max_scrolls=max_scrolls,
-                    per_scroll_wait_ms=1200,
-                    max_links=current_capacity,
-                    should_cancel=should_cancel,
-                    aggressive_end_scroll=True,
-                ),
-                should_cancel,
-                "collecting listings",
+            browse_url = build_browse_url(groups=group, gender=gender)
+            log_debug(f"[stream] browsing: {browse_url}")
+
+            _load_page_with_retries(
+                page,
+                browse_url,
+                search_id,
+                "opening browse page",
+                expect_product_links=True,
                 on_rate_limit=notify_rate_limit,
             )
-            unique_new = [url for url in links if url not in seen_urls]
-
-            if not unique_new:
-                stalled_batches += 1
-                if stalled_batches >= BROWSE_ALL_STALLED_BATCHES:
-                    break
-                page.wait_for_timeout(400)
-                continue
+            page.wait_for_timeout(500)
 
             stalled_batches = 0
-            seen_urls.update(unique_new)
-            log_debug(f"[stream] Collected {len(unique_new)} new browse links ({len(seen_urls)} total)")
+            stop_group_for_age = False
 
-            for url in unique_new:
+            while processed < max_parsed_links and matches < target_matches:
                 raise_if_cancelled(should_cancel)
 
-                if processed >= max_parsed_links or matches >= target_matches:
+                remaining_capacity = max_parsed_links - len(seen_urls)
+                if remaining_capacity <= 0:
                     break
 
-                item = _run_with_rate_limit_retries(
-                    lambda current_url=url: parse_listing(item_page, current_url, should_cancel=should_cancel),
+                links = _run_with_rate_limit_retries(
+                    lambda current_page=page, current_capacity=remaining_capacity: collect_listing_links(
+                        current_page,
+                        max_scrolls=max_scrolls,
+                        per_scroll_wait_ms=1200,
+                        max_links=current_capacity,
+                        should_cancel=should_cancel,
+                        aggressive_end_scroll=True,
+                    ),
                     should_cancel,
-                    "opening listing page",
+                    "collecting listings",
                     on_rate_limit=notify_rate_limit,
                 )
-                
-                processed += 1
-                
-                if item:
-                    match = _process_item(
-                        item,
-                        target_p2p,
-                        target_length,
-                        p2p_tol,
-                        length_tol,
-                        category,
-                        size_range,
-                    )
-                    if match:
-                        seller_name = (match.get("seller") or "").strip()
-                        sold_count = _resolve_seller_sold_count(
-                            ctx,
-                            seller_stats_cache,
-                            seller_name,
-                            search_id=search_id,
-                            groups=groups,
-                            gender=gender,
-                            on_rate_limit=notify_rate_limit,
-                        )
-                        match["soldCount"] = sold_count
+                unique_new = [url for url in links if url not in seen_urls]
 
-                        # Check seller reputation in browse mode
-                        if sold_count > 50:
-                            log_debug(f"[stream] MATCH seller=@{seller_name} url={match.get('url')} sold={sold_count}")
-                            yield _sse({"type": "match", "item": match, "seller": seller_name, "searchId": search_id or None})
-                            matches += 1
-                            
-                            if matches >= target_matches:
-                                yield _sse({"type": "done", "searchId": search_id or None})
-                                return
-                
-                yield _sse({"type": "progress", "processed": processed, "total": len(seen_urls), "matches": matches, "searchId": search_id or None})
+                if not unique_new:
+                    stalled_batches += 1
+                    if stalled_batches >= BROWSE_ALL_STALLED_BATCHES:
+                        break
+                    page.wait_for_timeout(400)
+                    continue
+
+                stalled_batches = 0
+                seen_urls.update(unique_new)
+                log_debug(f"[stream] Collected {len(unique_new)} new browse links for {group} ({len(seen_urls)} total)")
+
+                for url in unique_new:
+                    raise_if_cancelled(should_cancel)
+
+                    if processed >= max_parsed_links or matches >= target_matches:
+                        break
+
+                    item = _run_with_rate_limit_retries(
+                        lambda current_url=url: parse_listing(item_page, current_url, should_cancel=should_cancel),
+                        should_cancel,
+                        "opening listing page",
+                        on_rate_limit=notify_rate_limit,
+                    )
+
+                    processed += 1
+
+                    if item:
+                        if _listing_exceeds_age_window(item):
+                            age_days = float(item.get("ageDays"))
+                            stop_group_for_age = True
+                            log_debug(
+                                f"[stream] stopping browse group={group} at {age_days:.1f}d "
+                                f"(>{MAX_LISTING_AGE_DAYS}d window)"
+                            )
+                            yield _sse({"type": "progress", "processed": processed, "total": len(seen_urls), "matches": matches, "searchId": search_id or None})
+                            break
+
+                        match = _process_item(
+                            item,
+                            target_p2p,
+                            target_length,
+                            p2p_tol,
+                            length_tol,
+                            category,
+                            size_range,
+                        )
+                        if match:
+                            seller_name = (match.get("seller") or "").strip()
+                            sold_count = _resolve_seller_sold_count(
+                                ctx,
+                                seller_stats_cache,
+                                seller_name,
+                                search_id=search_id,
+                                groups=group,
+                                gender=gender,
+                                on_rate_limit=notify_rate_limit,
+                            )
+                            match["soldCount"] = sold_count
+
+                            # Check seller reputation in browse mode
+                            if sold_count > 50:
+                                log_debug(f"[stream] MATCH seller=@{seller_name} url={match.get('url')} sold={sold_count}")
+                                yield _sse({"type": "match", "item": match, "seller": seller_name, "searchId": search_id or None})
+                                matches += 1
+
+                                if matches >= target_matches:
+                                    yield _sse({"type": "done", "searchId": search_id or None})
+                                    return
+
+                    yield _sse({"type": "progress", "processed": processed, "total": len(seen_urls), "matches": matches, "searchId": search_id or None})
+
+                if stop_group_for_age:
+                    break
     finally:
         item_page.close()
     
@@ -793,7 +840,7 @@ async def browse_following_stream(request: Request):
     headless = bool(payload.get("headless", False))
     slowmo = int(payload.get("slowmo") or 0)
     gender = payload.get("gender") or "male"
-    groups = payload.get("groups") or "tops"
+    groups = _normalize_groups(payload.get("groups") or "tops")[0]
     search_id = str(payload.get("searchId") or "")
     
     if search_id:
@@ -871,10 +918,12 @@ async def browse_following_stream(request: Request):
                                         f"listing page {url}",
                                     )
                                     if item:
-                                        # Stop if item is over 45 days old
-                                        age_days = item.get("ageDays")
-                                        if age_days is not None and age_days > 45:
-                                            log_debug(f"[following-thread] {seller_name}: Item is {age_days:.1f} days old, stopping")
+                                        if _listing_exceeds_age_window(item):
+                                            age_days = float(item.get("ageDays"))
+                                            log_debug(
+                                                f"[following-thread] {seller_name}: Item is {age_days:.1f} days old, "
+                                                f"stopping at {MAX_LISTING_AGE_DAYS}d window"
+                                            )
                                             break
                                         
                                         match = _process_item(item, target_p2p, target_length, p2p_tol, length_tol)
