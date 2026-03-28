@@ -106,7 +106,9 @@ export async function streamSearch({
                   phase: evt.phase || 'parsing',
                   message: evt.message || '',
                   retryAttempt: evt.retryAttempt || null,
+                  retryTotalAttempts: evt.retryTotalAttempts || null,
                   retryDelaySeconds: evt.retryDelaySeconds || null,
+                  retryAvailableAt: evt.retryAvailableAt || null,
                 });
                 break;
               case 'meta':

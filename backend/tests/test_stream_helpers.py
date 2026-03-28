@@ -82,13 +82,18 @@ class StreamHelpersTest(unittest.TestCase):
                     action,
                     lambda: False,
                     "listing page",
-                    on_rate_limit=lambda attempt, delay, exc, label: retry_events.append((attempt, delay, label)),
+                    on_rate_limit=lambda attempt, total_attempts, delay, exc, label: retry_events.append(
+                        (attempt, total_attempts, delay, label)
+                    ),
                 )
 
-        self.assertEqual(len(attempts), 3)
-        self.assertEqual(delays, [15, 30])
-        self.assertEqual(retry_events, [(1, 15, "listing page"), (2, 30, "listing page")])
-        self.assertIn("Retried 2 times after the initial failure", str(ctx.exception))
+        self.assertEqual(len(attempts), 4)
+        self.assertEqual(delays, [15, 30, 60])
+        self.assertEqual(
+            retry_events,
+            [(1, 3, 15, "listing page"), (2, 3, 30, "listing page"), (3, 3, 60, "listing page")],
+        )
+        self.assertIn("Retried 3 times after the initial failure", str(ctx.exception))
 
     def test_rate_limit_error_payload_is_encoded_as_sse_error(self):
         payload = _error_payload_for_exception(

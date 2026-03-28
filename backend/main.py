@@ -57,7 +57,7 @@ app.add_middleware(
 CANCEL_FLAGS: Dict[str, bool] = {}
 DEFAULT_P2P_TOL = 0.5
 DEFAULT_LENGTH_TOL = 1.25
-RATE_LIMIT_RETRY_DELAYS = (15, 30)
+RATE_LIMIT_RETRY_DELAYS = (15, 30, 60)
 BROWSE_ALL_STALLED_BATCHES = 3
 MEASUREMENT_CATEGORIES = {"tops", "coats-jackets"}
 SUPPORTED_CATEGORIES = MEASUREMENT_CATEGORIES | {"bottoms", "footwear", "accessories"}
@@ -151,7 +151,7 @@ def _run_with_rate_limit_retries(
     action,
     should_cancel: Callable[[], bool],
     label: str,
-    on_rate_limit: Optional[Callable[[int, int, Exception, str], None]] = None,
+    on_rate_limit: Optional[Callable[[int, int, int, Exception, str], None]] = None,
 ):
     """Retry rare rate-limit failures with bounded, cancelable backoff."""
     for attempt in range(len(RATE_LIMIT_RETRY_DELAYS) + 1):
@@ -169,7 +169,7 @@ def _run_with_rate_limit_retries(
 
             delay = RATE_LIMIT_RETRY_DELAYS[attempt]
             if on_rate_limit:
-                on_rate_limit(attempt + 1, delay, exc, label)
+                on_rate_limit(attempt + 1, len(RATE_LIMIT_RETRY_DELAYS), delay, exc, label)
             log_debug(f"[stream] Rate limited during {label}; retrying in {delay}s")
             sleep_with_cancel(delay, should_cancel)
 
@@ -191,7 +191,7 @@ def _load_page_with_retries(
     *,
     expect_product_links: bool = False,
     expect_listing: bool = False,
-    on_rate_limit: Optional[Callable[[int, int, Exception, str], None]] = None,
+    on_rate_limit: Optional[Callable[[int, int, int, Exception, str], None]] = None,
 ) -> None:
     """Navigate to a page with cancellation and rate-limit retries."""
     should_cancel = _cancel_check(search_id)
@@ -220,7 +220,7 @@ def _load_page_with_retries(
 def _resolve_seller_sold_count(ctx, seller_cache: Dict[str, int], seller: str,
                                search_id: str = "",
                                groups: str = "tops", gender: str = "male",
-                               on_rate_limit: Optional[Callable[[int, int, Exception, str], None]] = None) -> int:
+                               on_rate_limit: Optional[Callable[[int, int, int, Exception, str], None]] = None) -> int:
     """Load and cache seller sold counts from seller pages."""
     seller_key = (seller or "").strip().lstrip("@")
     if not seller_key:
@@ -508,18 +508,23 @@ def _search_seller(ctx, page, seller, groups, gender,
     matches = 0
     total = 0
 
-    def notify_rate_limit(attempt: int, delay: int, exc: Exception, label: str) -> None:
+    def notify_rate_limit(attempt: int, total_attempts: int, delay: int, exc: Exception, label: str) -> None:
         if not emit_event:
             return
+        retry_available_at = (
+            dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delay)
+        ).isoformat()
         emit_event({
             "type": "progress",
             "phase": "rate_limited",
             "processed": processed,
             "total": total if total else None,
             "matches": matches,
-            "message": f"Rate limited on {label}. Cooling down {delay}s before retry {attempt}/{len(RATE_LIMIT_RETRY_DELAYS)}.",
+            "message": f"Rate limited on {label}. Cooling down {delay}s before retry {attempt}/{total_attempts}.",
             "retryAttempt": attempt,
+            "retryTotalAttempts": total_attempts,
             "retryDelaySeconds": delay,
+            "retryAvailableAt": retry_available_at,
             "searchId": search_id or None,
         })
 
@@ -626,18 +631,23 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
     matches = 0
     seen_urls = set()
 
-    def notify_rate_limit(attempt: int, delay: int, exc: Exception, label: str) -> None:
+    def notify_rate_limit(attempt: int, total_attempts: int, delay: int, exc: Exception, label: str) -> None:
         if not emit_event:
             return
+        retry_available_at = (
+            dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delay)
+        ).isoformat()
         emit_event({
             "type": "progress",
             "phase": "rate_limited",
             "processed": processed,
             "total": len(seen_urls),
             "matches": matches,
-            "message": f"Rate limited on {label}. Cooling down {delay}s before retry {attempt}/{len(RATE_LIMIT_RETRY_DELAYS)}.",
+            "message": f"Rate limited on {label}. Cooling down {delay}s before retry {attempt}/{total_attempts}.",
             "retryAttempt": attempt,
+            "retryTotalAttempts": total_attempts,
             "retryDelaySeconds": delay,
+            "retryAvailableAt": retry_available_at,
             "searchId": search_id or None,
         })
 

@@ -21,6 +21,10 @@ const createProgressState = (overrides = {}) => ({
   matches: 0,
   phase: 'idle',
   message: '',
+  retryAttempt: null,
+  retryTotalAttempts: null,
+  retryDelaySeconds: null,
+  retryAvailableAt: null,
   ...overrides,
 });
 
@@ -38,8 +42,23 @@ const formatSellerStatusLabel = (sellerRow) => {
   return `${safeHits} hits • ${processed} parsed / ${total} collected`;
 };
 
-const getSellerProgressMessage = (sellerRow) => {
-  const message = sellerRow?.progress?.message;
+const getSellerProgressMessage = (sellerRow, nowMs) => {
+  const progress = sellerRow?.progress;
+  if (!progress) {
+    return '';
+  }
+
+  if (progress.phase === 'rate_limited' && progress.retryAvailableAt) {
+    const retryAtMs = Date.parse(progress.retryAvailableAt);
+    const secondsRemaining = Number.isFinite(retryAtMs)
+      ? Math.max(0, Math.ceil((retryAtMs - nowMs) / 1000))
+      : progress.retryDelaySeconds || 0;
+    const attempt = progress.retryAttempt || 1;
+    const totalAttempts = progress.retryTotalAttempts || 1;
+    return `Rate limited. Retry ${attempt}/${totalAttempts} in ${secondsRemaining}s.`;
+  }
+
+  const message = progress.message;
   return typeof message === 'string' ? message.trim() : '';
 };
 
@@ -272,6 +291,7 @@ const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
 function App() {
   const initialSellerAccounts = readStoredSellerAccounts();
   const searchRegistryRef = useRef(new Map());
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [sellerManagerOpen, setSellerManagerOpen] = useState(false);
   const [activePageId, setActivePageId] = useState(() => readInitialPageId());
   const [sellerAccounts, setSellerAccounts] = useState(initialSellerAccounts);
@@ -363,6 +383,14 @@ function App() {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [sellerManagerOpen]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+
+    return () => window.clearInterval(intervalId);
+  }, []);
 
   const getStreamErrorDetails = (error) => {
     if (typeof error === 'string') {
@@ -961,9 +989,9 @@ function App() {
                     </div>
                   </div>
 
-                  {getSellerProgressMessage(sellerRow) && (
+                  {getSellerProgressMessage(sellerRow, nowMs) && (
                     <div className="seller-progress-message">
-                      {getSellerProgressMessage(sellerRow)}
+                      {getSellerProgressMessage(sellerRow, nowMs)}
                     </div>
                   )}
 
