@@ -118,7 +118,7 @@ const getSellerProgressDetails = (sellerRow, nowMs, queuePosition = null) => {
   if (progress.phase === 'queued') {
     return {
       primary: queuePosition ? `Queued • slot ${queuePosition}` : 'Queued',
-      secondary: 'Waiting for the current seller to finish.',
+      secondary: progress.message || 'Waiting for global cooldown to end.',
     };
   }
 
@@ -363,7 +363,6 @@ function App() {
   const initialSellerAccounts = readStoredSellerAccounts();
   const searchRegistryRef = useRef(new Map());
   const searchQueueRef = useRef([]);
-  const queueRunnerRef = useRef(false);
   const activeQueueTaskRef = useRef(null);
   const batchCounterRef = useRef(0);
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -374,14 +373,16 @@ function App() {
   const [pageWorkspaces, setPageWorkspaces] = useState(() =>
     buildPageWorkspaces(initialSellerAccounts)
   );
+  const pageWorkspacesRef = useRef(pageWorkspaces);
   const [sellerForm, setSellerForm] = useState({
     username: '',
     displayName: '',
     error: '',
   });
   const [queueState, setQueueState] = useState({
-    active: null,
+    active: [],
     pending: [],
+    frozen: null,
   });
 
   const sellerAccountsSnapshot = JSON.stringify(sellerAccounts);
@@ -397,22 +398,28 @@ function App() {
   const queuePositionByKey = new Map(
     queueState.pending.map((task, index) => [task.key, index + 1])
   );
-  const activeQueuedTask = queueState.active;
-  const activeQueuedRow = activeQueuedTask
-    ? pageWorkspaces[activeQueuedTask.pageId]?.sellerRows.find(
-      (row) => row.seller === activeQueuedTask.sellerUsername
+  const frozenTask = queueState.frozen;
+  const frozenTaskRow = frozenTask
+    ? pageWorkspaces[frozenTask.pageId]?.sellerRows.find(
+      (row) => row.seller === frozenTask.sellerUsername
     ) || null
     : null;
-  const activeQueuedProgress = activeQueuedRow?.progress || null;
+  const frozenTaskProgress = frozenTaskRow?.progress || null;
 
   let globalQueueStatus = null;
-  if (activeQueuedTask && activeQueuedProgress?.phase === 'rate_limited') {
-    globalQueueStatus = `Global cooldown ${getRetryCountdownSeconds(activeQueuedProgress, nowMs)}s • retry ${activeQueuedProgress.retryAttempt || 1}/${activeQueuedProgress.retryTotalAttempts || 1}`;
-  } else if (activeQueuedTask) {
-    globalQueueStatus = `1 running • ${queueState.pending.length} queued`;
+  if (frozenTask && frozenTaskProgress?.phase === 'rate_limited') {
+    globalQueueStatus = `Global cooldown ${getRetryCountdownSeconds(frozenTaskProgress, nowMs)}s • retry ${frozenTaskProgress.retryAttempt || 1}/${frozenTaskProgress.retryTotalAttempts || 1}`;
+  } else if (queueState.active.length > 0 && queueState.pending.length > 0) {
+    globalQueueStatus = `${queueState.active.length} active • ${queueState.pending.length} paused`;
+  } else if (queueState.active.length > 0) {
+    globalQueueStatus = `${queueState.active.length} active`;
   } else if (queueState.pending.length > 0) {
     globalQueueStatus = `${queueState.pending.length} queued`;
   }
+
+  useEffect(() => {
+    pageWorkspacesRef.current = pageWorkspaces;
+  }, [pageWorkspaces]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -517,8 +524,9 @@ function App() {
 
   const syncQueueState = () => {
     setQueueState({
-      active: cloneQueueTask(activeQueueTaskRef.current),
+      active: Array.from(searchRegistryRef.current.values()).map((entry) => cloneQueueTask(entry.task)),
       pending: searchQueueRef.current.map(cloneQueueTask),
+      frozen: cloneQueueTask(activeQueueTaskRef.current),
     });
   };
 
@@ -558,7 +566,7 @@ function App() {
   };
 
   const getSellerRow = (pageId, sellerUsername) =>
-    pageWorkspaces[pageId]?.sellerRows.find((row) => row.seller === sellerUsername);
+    pageWorkspacesRef.current[pageId]?.sellerRows.find((row) => row.seller === sellerUsername);
 
   const isSellerScheduled = (pageId, sellerUsername) => {
     const searchKey = searchKeyFor(pageId, sellerUsername);
@@ -618,6 +626,7 @@ function App() {
       searchId: '',
       ...updates,
     });
+    syncQueueState();
     return true;
   };
 
@@ -728,6 +737,20 @@ function App() {
       errorCode: null,
       progress: null,
     });
+
+    if (activeQueueTaskRef.current?.key === searchKey) {
+      activeQueueTaskRef.current = null;
+    }
+
+    syncQueueState();
+    if (!activeQueueTaskRef.current && searchQueueRef.current.length > 0) {
+      const pendingTasks = [...searchQueueRef.current];
+      searchQueueRef.current = [];
+      syncQueueState();
+      pendingTasks.forEach((task) => {
+        void executeSellerSearch(task).then((outcome) => handleSearchCompletion(task, outcome));
+      });
+    }
   };
 
   const cancelSellerAcrossPages = async (sellerUsername) => {
@@ -777,6 +800,104 @@ function App() {
     });
   };
 
+  const resumePendingTasks = () => {
+    if (activeQueueTaskRef.current || searchQueueRef.current.length === 0) {
+      syncQueueState();
+      return;
+    }
+
+    const pendingTasks = [...searchQueueRef.current];
+    searchQueueRef.current = [];
+    syncQueueState();
+    pendingTasks.forEach((task) => {
+      void executeSellerSearch(task).then((outcome) => handleSearchCompletion(task, outcome));
+    });
+  };
+
+  const pauseSearchEntryForCooldown = (entry, message = 'Waiting for global cooldown to end.') => {
+    const pausedTask = {
+      ...entry.task,
+      resetResults: false,
+    };
+
+    if (!searchQueueRef.current.some((task) => task.key === pausedTask.key)) {
+      searchQueueRef.current = [...searchQueueRef.current, pausedTask];
+    }
+
+    searchRegistryRef.current.delete(pausedTask.key);
+    updateSellerRow(pausedTask.pageId, pausedTask.sellerUsername, {
+      loading: false,
+      controller: null,
+      searchId: '',
+      processed: false,
+      error: null,
+      errorCode: null,
+      progress: createProgressState({ phase: 'queued', message }),
+    });
+
+    void cancelSearch(entry.searchId);
+    try {
+      entry.controller?.abort();
+    } catch (error) {
+      console.warn('[Queue] Failed to abort paused search:', error);
+    }
+  };
+
+  const handleGlobalRateLimit = (task) => {
+    const searchKey = task.key;
+
+    if (activeQueueTaskRef.current?.key === searchKey) {
+      syncQueueState();
+      return;
+    }
+
+    if (activeQueueTaskRef.current && activeQueueTaskRef.current.key !== searchKey) {
+      const entry = searchRegistryRef.current.get(searchKey);
+      if (entry) {
+        pauseSearchEntryForCooldown(entry);
+      }
+      syncQueueState();
+      return;
+    }
+
+    activeQueueTaskRef.current = task;
+
+    Array.from(searchRegistryRef.current.entries()).forEach(([key, entry]) => {
+      if (key === searchKey) {
+        return;
+      }
+      pauseSearchEntryForCooldown(entry);
+    });
+
+    syncQueueState();
+  };
+
+  const handleSearchCompletion = (task, outcome) => {
+    if (outcome?.status === 'paused') {
+      syncQueueState();
+      return;
+    }
+
+    if (activeQueueTaskRef.current?.key === task.key) {
+      if (outcome?.status === 'error' && outcome.code === 'rate_limited') {
+        activeQueueTaskRef.current = null;
+        removeQueuedTasks(
+          () => true,
+          { message: 'Queue paused after cooldown failure.' },
+        );
+        syncQueueState();
+        return;
+      }
+
+      activeQueueTaskRef.current = null;
+      syncQueueState();
+      resumePendingTasks();
+      return;
+    }
+
+    syncQueueState();
+  };
+
   const executeSellerSearch = async (task) => {
     const { pageId, sellerUsername, filters } = task;
     const searchKey = searchKeyFor(pageId, sellerUsername);
@@ -789,32 +910,45 @@ function App() {
     const searchId = makeSearchId();
     const payload = buildSearchPayload(page, filters, sellerUsername, searchId);
     let outcome = { status: 'done', code: null };
+    let finalized = false;
 
-    searchRegistryRef.current.set(searchKey, { searchId, controller });
-    updateSellerRow(pageId, sellerUsername, {
+    searchRegistryRef.current.set(searchKey, { searchId, controller, task });
+    const sellerRowUpdate = {
       loading: true,
       error: null,
       errorCode: null,
-      results: [],
       searchId,
       controller,
       processed: false,
       progress: createProgressState({ phase: 'starting' }),
-    });
+    };
+    if (task.resetResults !== false) {
+      sellerRowUpdate.results = [];
+    }
+    updateSellerRow(pageId, sellerUsername, sellerRowUpdate);
+    syncQueueState();
 
     await streamSearch({
       payload,
       controller,
       onMatch: (evt) => addSellerResult(pageId, sellerUsername, evt.item),
-      onProgress: (progress) => updateSellerRow(pageId, sellerUsername, { progress }),
+      onProgress: (progress) => {
+        updateSellerRow(pageId, sellerUsername, { progress });
+        if (progress.phase === 'rate_limited') {
+          handleGlobalRateLimit(task);
+        }
+      },
       onMeta: (meta) => updateSellerRow(pageId, sellerUsername, {
-        progress: createProgressState({ phase: 'collecting', total: meta.total }),
+        progress: createProgressState({
+          phase: 'collecting',
+          total: meta.total,
+          matches: getSellerRow(pageId, sellerUsername)?.results?.length || 0,
+        }),
       }),
       onError: (error) => {
         const { message, code } = getStreamErrorDetails(error);
         const existingProgress = getSellerRow(pageId, sellerUsername)?.progress;
-        outcome = { status: 'error', code, message };
-        finishSellerSearch(pageId, sellerUsername, searchId, {
+        const didFinish = finishSellerSearch(pageId, sellerUsername, searchId, {
           loading: false,
           error: message,
           errorCode: code,
@@ -830,10 +964,16 @@ function App() {
             }
             : null,
         });
+        if (didFinish) {
+          finalized = true;
+          outcome = { status: 'error', code, message };
+        } else {
+          outcome = { status: 'paused', code: null };
+        }
       },
       onDone: () => {
         const existingProgress = getSellerRow(pageId, sellerUsername)?.progress;
-        finishSellerSearch(pageId, sellerUsername, searchId, {
+        const didFinish = finishSellerSearch(pageId, sellerUsername, searchId, {
           loading: false,
           processed: true,
           progress: existingProgress
@@ -847,41 +987,20 @@ function App() {
             }
             : null,
         });
+        if (didFinish) {
+          finalized = true;
+          outcome = { status: 'done', code: null };
+        } else {
+          outcome = { status: 'paused', code: null };
+        }
       },
     });
 
+    if (!finalized && !searchRegistryRef.current.has(searchKey)) {
+      return { status: 'paused', code: null };
+    }
+
     return outcome;
-  };
-
-  const pumpSearchQueue = async () => {
-    if (queueRunnerRef.current) {
-      return;
-    }
-
-    queueRunnerRef.current = true;
-    try {
-      while (searchQueueRef.current.length > 0) {
-        const nextTask = searchQueueRef.current.shift();
-        activeQueueTaskRef.current = nextTask;
-        syncQueueState();
-
-        const outcome = await executeSellerSearch(nextTask);
-
-        activeQueueTaskRef.current = null;
-        syncQueueState();
-
-        if (outcome?.status === 'error' && outcome.code === 'rate_limited' && nextTask.source === 'batch') {
-          removeQueuedTasks(
-            (task) => task.batchId === nextTask.batchId,
-            { message: 'Queue stopped after cooldown failure.' },
-          );
-        }
-      }
-    } finally {
-      queueRunnerRef.current = false;
-      activeQueueTaskRef.current = null;
-      syncQueueState();
-    }
   };
 
   const queueSellerSearch = (pageId, sellerUsername, options = {}) => {
@@ -897,21 +1016,33 @@ function App() {
       filters: normalizePageFilters(pageId, options.filters ?? pageFilters[pageId]),
       batchId: options.batchId || nextBatchId(options.source === 'batch' ? 'batch' : 'manual'),
       source: options.source || 'manual',
+      resetResults: options.resetResults !== false,
     };
 
-    searchQueueRef.current = [...searchQueueRef.current, task];
-    updateSellerRow(pageId, sellerUsername, {
-      loading: false,
-      processed: false,
-      error: null,
-      errorCode: null,
-      results: [],
-      controller: null,
-      searchId: '',
-      progress: createProgressState({ phase: 'queued' }),
-    });
-    syncQueueState();
-    void pumpSearchQueue();
+    if (activeQueueTaskRef.current) {
+      const queuedRowUpdate = {
+        loading: false,
+        processed: false,
+        error: null,
+        errorCode: null,
+        controller: null,
+        searchId: '',
+        progress: createProgressState({
+          phase: 'queued',
+          message: 'Waiting for global cooldown to end.',
+        }),
+      };
+      if (task.resetResults) {
+        queuedRowUpdate.results = [];
+      }
+
+      searchQueueRef.current = [...searchQueueRef.current, task];
+      updateSellerRow(pageId, sellerUsername, queuedRowUpdate);
+      syncQueueState();
+      return true;
+    }
+
+    void executeSellerSearch(task).then((outcome) => handleSearchCompletion(task, outcome));
     return true;
   };
 

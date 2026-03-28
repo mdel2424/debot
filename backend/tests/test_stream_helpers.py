@@ -372,6 +372,57 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(match_events[0]['item']['url'], 'tops-1')
         self.assertEqual(decoded[-1]['type'], 'done')
 
+    def test_search_seller_does_not_stop_on_first_old_listing(self):
+        ctx = FakeContext()
+        page = FakePage()
+        parse_results = [
+            {'seller': 'onthemarkco', 'url': 'old-1', 'ageDays': 56.0},
+            {'seller': 'onthemarkco', 'url': 'fresh-2', 'ageDays': 2.0},
+        ]
+
+        with (
+            patch('builtins.print'),
+            patch('main._load_page_with_retries'),
+            patch('main.extract_seller_sold_count', return_value=110),
+            patch('main.remove_sold_sections'),
+            patch('main.collect_listing_links', return_value=['old-1', 'fresh-2']),
+            patch('main.parse_listing', side_effect=parse_results),
+            patch(
+                'main._process_item',
+                side_effect=lambda item, *args: (
+                    None if item.get('url') == 'old-1'
+                    else {'seller': 'onthemarkco', 'url': 'fresh-2', 'p2p': 21.0, 'length': 28.0}
+                ),
+            ),
+        ):
+            events = list(
+                _search_seller(
+                    ctx,
+                    page,
+                    'onthemarkco',
+                    ['tops'],
+                    'male',
+                    21.5,
+                    27.25,
+                    0.5,
+                    1.25,
+                    max_items=40,
+                    max_links=100,
+                    max_scrolls=4,
+                    search_id='search-old-then-fresh',
+                )
+            )
+
+        decoded = self._decode_events(events)
+        match_events = [evt for evt in decoded if evt['type'] == 'match']
+        progress_events = [evt for evt in decoded if evt['type'] == 'progress']
+
+        self.assertEqual(len(match_events), 1)
+        self.assertEqual(match_events[0]['item']['url'], 'fresh-2')
+        self.assertFalse(any(evt.get('stopped') == 'age_limit' for evt in progress_events))
+        self.assertEqual(progress_events[-1]['processed'], 2)
+        self.assertEqual(progress_events[-1]['total'], 2)
+
     def test_browse_all_collect_listing_rate_limit_emits_cooldown_and_recovers(self):
         ctx = FakeContext()
         browse_page = FakePage()

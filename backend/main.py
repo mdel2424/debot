@@ -591,12 +591,6 @@ def _search_seller(ctx, page, seller, groups, gender,
             processed += 1
 
             if item:
-                age_days = item.get("ageDays")
-                if age_days is not None and age_days > 45:
-                    log_debug(f"[stream] Item is {age_days:.1f} days old for @{seller} group={group}, skipping remaining older listings")
-                    yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None, "stopped": "age_limit"})
-                    break
-
                 match = _process_item(
                     item,
                     target_p2p,
