@@ -5,6 +5,7 @@ import asyncio
 import datetime as dt
 import json
 import queue
+import random
 import re
 import threading
 import time
@@ -27,6 +28,7 @@ from scraper import (
     collect_listing_links,
     parse_listing,
     extract_seller_sold_count,
+    extract_retry_after_seconds,
     create_browser_context,
     get_following_list,
     log_debug,
@@ -57,11 +59,15 @@ app.add_middleware(
 CANCEL_FLAGS: Dict[str, bool] = {}
 DEFAULT_P2P_TOL = 0.5
 DEFAULT_LENGTH_TOL = 1.25
-RATE_LIMIT_RETRY_DELAYS = (15, 30, 60)
+RATE_LIMIT_RETRY_DELAYS = (60, 180, 600)
+TRANSIENT_NAVIGATION_RETRY_DELAYS = (1, 2, 4)
 BROWSE_ALL_STALLED_BATCHES = 3
 MAX_LISTING_AGE_DAYS = 90
+RECENT_RATE_LIMIT_PACING_WINDOW_SECONDS = 180
+RECENT_RATE_LIMIT_JITTER_RANGE_SECONDS = (1.25, 3.0)
 MEASUREMENT_CATEGORIES = {"tops", "coats-jackets"}
 SUPPORTED_CATEGORIES = MEASUREMENT_CATEGORIES | {"bottoms", "footwear", "accessories"}
+RECENT_RATE_LIMIT_UNTIL_TS = 0.0
 
 # SSE helpers
 SSE_PREAMBLE = (":" + (" " * 2048) + "\n").encode("utf-8")
@@ -163,11 +169,51 @@ def _listing_exceeds_age_window(item: Dict[str, Any] | None, max_age_days: int =
         return False
 
 
+def _mark_recent_rate_limit(delay_seconds: int) -> None:
+    """Extend the pacing window after a detected rate limit."""
+    global RECENT_RATE_LIMIT_UNTIL_TS
+    pacing_until = time.time() + max(min(delay_seconds, RECENT_RATE_LIMIT_PACING_WINDOW_SECONDS), 0)
+    RECENT_RATE_LIMIT_UNTIL_TS = max(RECENT_RATE_LIMIT_UNTIL_TS, pacing_until)
+
+
+def _sleep_request_jitter(should_cancel: Callable[[], bool], force: bool = False) -> None:
+    """Slow follow-up requests slightly after a recent rate limit to reduce bursts."""
+    if not force and time.time() >= RECENT_RATE_LIMIT_UNTIL_TS:
+        return
+
+    delay_seconds = random.uniform(*RECENT_RATE_LIMIT_JITTER_RANGE_SECONDS)
+    sleep_with_cancel(delay_seconds, should_cancel)
+
+
+def _rate_limit_delay_for_attempt(exc: RateLimitError, attempt_index: int) -> int:
+    """Choose a retry delay using Retry-After when available, but never below our floor."""
+    floor_delay = RATE_LIMIT_RETRY_DELAYS[attempt_index]
+    hinted_delay = int(exc.retry_after_seconds or 0)
+    return max(floor_delay, hinted_delay)
+
+
+def _is_transient_navigation_error(exc: Exception) -> bool:
+    """Detect Playwright navigation errors that are safe to recover by rebuilding the session."""
+    message = str(exc or "").lower()
+    return any(
+        signal in message
+        for signal in (
+            "ns_binding_aborted",
+            "frame was detached",
+            "page was closed",
+            "context was closed",
+            "target page, context or browser has been closed",
+            "navigation failed because page was closed",
+        )
+    )
+
+
 def _run_with_rate_limit_retries(
     action,
     should_cancel: Callable[[], bool],
     label: str,
     on_rate_limit: Optional[Callable[[int, int, int, Exception, str], None]] = None,
+    before_retry: Optional[Callable[[int, int, int, Exception, str], None]] = None,
 ):
     """Retry rare rate-limit failures with bounded, cancelable backoff."""
     for attempt in range(len(RATE_LIMIT_RETRY_DELAYS) + 1):
@@ -181,13 +227,30 @@ def _run_with_rate_limit_retries(
                 raise RateLimitError(
                     f"Rate limited after {len(RATE_LIMIT_RETRY_DELAYS)} cooldown attempts while {label}.",
                     status=exc.status,
+                    retry_after_seconds=exc.retry_after_seconds,
                 ) from exc
 
-            delay = RATE_LIMIT_RETRY_DELAYS[attempt]
+            delay = _rate_limit_delay_for_attempt(exc, attempt)
+            _mark_recent_rate_limit(delay)
             if on_rate_limit:
                 on_rate_limit(attempt + 1, len(RATE_LIMIT_RETRY_DELAYS), delay, exc, label)
             log_debug(f"[stream] Rate limited during {label}; retrying in {delay}s")
             sleep_with_cancel(delay, should_cancel)
+            if before_retry:
+                before_retry(attempt + 1, len(RATE_LIMIT_RETRY_DELAYS), delay, exc, label)
+            _sleep_request_jitter(should_cancel, force=True)
+        except Exception as exc:
+            if not _is_transient_navigation_error(exc):
+                raise
+
+            if attempt >= len(TRANSIENT_NAVIGATION_RETRY_DELAYS):
+                raise
+
+            delay = TRANSIENT_NAVIGATION_RETRY_DELAYS[attempt]
+            log_debug(f"[stream] Transient navigation error during {label}; rebuilding session and retrying in {delay}s")
+            sleep_with_cancel(delay, should_cancel)
+            if before_retry:
+                before_retry(attempt + 1, len(TRANSIENT_NAVIGATION_RETRY_DELAYS), delay, exc, label)
 
 
 def _response_status(response) -> Optional[int]:
@@ -200,7 +263,7 @@ def _response_status(response) -> Optional[int]:
 
 
 def _load_page_with_retries(
-    page,
+    page_or_getter,
     url: str,
     search_id: str,
     label: str,
@@ -208,12 +271,16 @@ def _load_page_with_retries(
     expect_product_links: bool = False,
     expect_listing: bool = False,
     on_rate_limit: Optional[Callable[[int, int, int, Exception, str], None]] = None,
+    before_retry: Optional[Callable[[int, int, int, Exception, str], None]] = None,
 ) -> None:
     """Navigate to a page with cancellation and rate-limit retries."""
     should_cancel = _cancel_check(search_id)
+    get_page = page_or_getter if callable(page_or_getter) else (lambda: page_or_getter)
 
     def action():
+        page = get_page()
         raise_if_cancelled(should_cancel)
+        _sleep_request_jitter(should_cancel)
         response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
         raise_if_cancelled(should_cancel)
         accept_cookies(page)
@@ -228,15 +295,23 @@ def _load_page_with_retries(
             response_status=_response_status(response),
             expect_product_links=expect_product_links,
             expect_listing=expect_listing,
+            retry_after_seconds=extract_retry_after_seconds(response),
         )
 
-    _run_with_rate_limit_retries(action, should_cancel, label, on_rate_limit=on_rate_limit)
+    _run_with_rate_limit_retries(
+        action,
+        should_cancel,
+        label,
+        on_rate_limit=on_rate_limit,
+        before_retry=before_retry,
+    )
 
 
 def _resolve_seller_sold_count(ctx, seller_cache: Dict[str, int], seller: str,
                                search_id: str = "",
                                groups: Any = "tops", gender: str = "male",
-                               on_rate_limit: Optional[Callable[[int, int, int, Exception, str], None]] = None) -> int:
+                               on_rate_limit: Optional[Callable[[int, int, int, Exception, str], None]] = None,
+                               reset_session: Optional[Callable[[], tuple[Any, Any]]] = None) -> int:
     """Load and cache seller sold counts from seller pages."""
     seller_key = (seller or "").strip().lstrip("@")
     if not seller_key:
@@ -246,15 +321,29 @@ def _resolve_seller_sold_count(ctx, seller_cache: Dict[str, int], seller: str,
         return seller_cache[seller_key]
 
     groups_value = _normalize_groups(groups)[0]
+    current_ctx = ctx
 
-    profile_page = ctx.new_page()
+    profile_page = current_ctx.new_page()
+
+    def rebuild_profile_page(attempt: int, total_attempts: int, delay: int, exc: Exception, label: str) -> None:
+        nonlocal current_ctx, profile_page
+        try:
+            profile_page.close()
+        except Exception:
+            pass
+
+        if reset_session:
+            current_ctx, _ = reset_session()
+        profile_page = current_ctx.new_page()
+
     try:
         _load_page_with_retries(
-            profile_page,
+            lambda: profile_page,
             build_seller_url(seller_key, groups=groups_value, gender=gender),
             search_id,
             "checking seller sold count",
             on_rate_limit=on_rate_limit,
+            before_retry=rebuild_profile_page,
         )
         sold_count = extract_seller_sold_count(profile_page) or 0
     except SearchCancelled:
@@ -415,6 +504,26 @@ async def search_stream(request: Request):
             with sync_playwright() as pw:
                 browser, ctx = create_browser_context(pw, headless=headless, slowmo=slowmo)
                 page = ctx.new_page()
+
+                def reset_session() -> tuple[Any, Any]:
+                    nonlocal browser, ctx, page
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+
+                    browser, ctx = create_browser_context(pw, headless=headless, slowmo=slowmo)
+                    page = ctx.new_page()
+                    log_debug("[stream] Rebuilt Playwright browser session after rate limit")
+                    return ctx, page
                 
                 try:
                     try:
@@ -425,6 +534,7 @@ async def search_stream(request: Request):
                                 max_items, max_links, max_scrolls, search_id,
                                 category, size_range,
                                 emit_event=emit_stream_event,
+                                reset_session=reset_session,
                             )
                         else:
                             yield from _browse_all(
@@ -433,6 +543,7 @@ async def search_stream(request: Request):
                                 max_items, max_links, max_scrolls, search_id,
                                 category, size_range,
                                 emit_event=emit_stream_event,
+                                reset_session=reset_session,
                             )
                     except SearchCancelled:
                         yield _sse({"type": "cancelled", "searchId": search_id or None})
@@ -517,13 +628,15 @@ async def search_stream(request: Request):
 def _search_seller(ctx, page, seller, groups, gender,
                    target_p2p, target_length, p2p_tol, length_tol,
                    max_items, max_links, max_scrolls, search_id,
-                   category="tops", size_range=None, emit_event: Optional[Callable[[Dict[str, Any]], None]] = None):
+                   category="tops", size_range=None, emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+                   reset_session: Optional[Callable[[], tuple[Any, Any]]] = None):
     """Search a specific seller's listings."""
     should_cancel = _cancel_check(search_id)
     normalized_groups = _normalize_groups(groups)
     processed = 0
     matches = 0
     total = 0
+    age_window_hit = False
 
     def notify_rate_limit(attempt: int, total_attempts: int, delay: int, exc: Exception, label: str) -> None:
         if not emit_event:
@@ -545,11 +658,28 @@ def _search_seller(ctx, page, seller, groups, gender,
             "searchId": search_id or None,
         })
 
+    def rebuild_seller_page(attempt: int, total_attempts: int, delay: int, exc: Exception, label: str) -> None:
+        nonlocal ctx, page, current_seller_page_url
+        if reset_session:
+            ctx, page = reset_session()
+        current_seller_page_url = None
+
+    def emit_done(stop_reason: str = "completed") -> bytes:
+        return _sse({
+            "type": "done",
+            "processed": processed,
+            "total": total,
+            "matches": matches,
+            "stopReason": stop_reason,
+            "searchId": search_id or None,
+        })
+
     yield _sse({"type": "progress", "phase": "landing", "processed": 0, "total": None, "matches": 0, "searchId": search_id or None})
 
     seller_sold_count = 0
     seen_urls = set()
     grouped_links = []
+    current_seller_page_url = None
 
     for group in normalized_groups:
         raise_if_cancelled(should_cancel)
@@ -557,13 +687,15 @@ def _search_seller(ctx, page, seller, groups, gender,
         log_debug(f"[stream] navigating: {search_url}")
 
         _load_page_with_retries(
-            page,
+            lambda: page,
             search_url,
             search_id,
             "opening seller page",
             expect_product_links=True,
             on_rate_limit=notify_rate_limit,
+            before_retry=rebuild_seller_page,
         )
+        current_seller_page_url = search_url
 
         if seller_sold_count <= 0:
             seller_sold_count = extract_seller_sold_count(page) or 0
@@ -574,18 +706,37 @@ def _search_seller(ctx, page, seller, groups, gender,
         if remaining_capacity <= 0:
             break
 
-        links = _run_with_rate_limit_retries(
-            lambda current_page=page, current_capacity=remaining_capacity: collect_listing_links(
-                current_page,
+        def collect_group_links(current_capacity=remaining_capacity, current_url=search_url):
+            nonlocal current_seller_page_url
+            if current_seller_page_url != current_url:
+                _load_page_with_retries(
+                    lambda: page,
+                    current_url,
+                    search_id,
+                    "opening seller page",
+                    expect_product_links=True,
+                    on_rate_limit=notify_rate_limit,
+                    before_retry=rebuild_seller_page,
+                )
+                current_seller_page_url = current_url
+
+            _sleep_request_jitter(should_cancel)
+            remove_sold_sections(page)
+            return collect_listing_links(
+                page,
                 max_scrolls=max_scrolls,
                 per_scroll_wait_ms=1200,
                 max_links=current_capacity,
                 should_cancel=should_cancel,
-                aggressive_end_scroll=True,
-            ),
+                aggressive_end_scroll=False,
+            )
+
+        links = _run_with_rate_limit_retries(
+            collect_group_links,
             should_cancel,
             "collecting listings",
             on_rate_limit=notify_rate_limit,
+            before_retry=rebuild_seller_page,
         )
         unique_links = [url for url in links if url not in seen_urls]
         seen_urls.update(unique_links)
@@ -599,17 +750,24 @@ def _search_seller(ctx, page, seller, groups, gender,
     for group, links in grouped_links:
         for idx, url in enumerate(links):
             raise_if_cancelled(should_cancel)
+
+            def open_listing(current_url=url):
+                _sleep_request_jitter(should_cancel)
+                return parse_listing(page, current_url, should_cancel=should_cancel)
+
             item = _run_with_rate_limit_retries(
-                lambda current_url=url: parse_listing(page, current_url, should_cancel=should_cancel),
+                open_listing,
                 should_cancel,
                 "opening listing page",
                 on_rate_limit=notify_rate_limit,
+                before_retry=rebuild_seller_page,
             )
             processed += 1
 
             if item:
                 if _listing_exceeds_age_window(item):
                     age_days = float(item.get("ageDays"))
+                    age_window_hit = True
                     total -= max(len(links) - idx - 1, 0)
                     log_debug(
                         f"[stream] stopping @{seller} group={group} at {age_days:.1f}d "
@@ -637,17 +795,18 @@ def _search_seller(ctx, page, seller, groups, gender,
                     matches += 1
 
                     if matches >= max_items:
-                        yield _sse({"type": "done", "searchId": search_id or None})
+                        yield emit_done("match_limit")
                         return
 
             yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
 
-    yield _sse({"type": "done", "searchId": search_id or None})
+    yield emit_done("age_window" if age_window_hit else "completed")
 
 
 def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, length_tol,
                 max_items, max_links, max_scrolls, search_id,
-                category="tops", size_range=None, emit_event: Optional[Callable[[Dict[str, Any]], None]] = None):
+                category="tops", size_range=None, emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+                reset_session: Optional[Callable[[], tuple[Any, Any]]] = None):
     """Browse all listings on the category page."""
     should_cancel = _cancel_check(search_id)
     normalized_groups = _normalize_groups(groups)
@@ -656,6 +815,7 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
     processed = 0
     matches = 0
     seen_urls = set()
+    age_window_hit = False
 
     def notify_rate_limit(attempt: int, total_attempts: int, delay: int, exc: Exception, label: str) -> None:
         if not emit_event:
@@ -680,6 +840,29 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
     yield _sse({"type": "progress", "phase": "browsing", "processed": 0, "total": 0, "matches": 0, "searchId": search_id or None})
     seller_stats_cache: Dict[str, int] = {}
     item_page = ctx.new_page()
+    current_browse_page_url = None
+
+    def rebuild_browse_session(attempt: int, total_attempts: int, delay: int, exc: Exception, label: str) -> None:
+        nonlocal ctx, page, item_page, current_browse_page_url
+        try:
+            item_page.close()
+        except Exception:
+            pass
+        if reset_session:
+            ctx, page = reset_session()
+        item_page = ctx.new_page()
+        current_browse_page_url = None
+
+    def emit_done(stop_reason: str = "completed") -> bytes:
+        return _sse({
+            "type": "done",
+            "processed": processed,
+            "total": len(seen_urls),
+            "matches": matches,
+            "stopReason": stop_reason,
+            "searchId": search_id or None,
+        })
+
     try:
         for group in normalized_groups:
             if processed >= max_parsed_links or matches >= target_matches:
@@ -689,13 +872,15 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
             log_debug(f"[stream] browsing: {browse_url}")
 
             _load_page_with_retries(
-                page,
+                lambda: page,
                 browse_url,
                 search_id,
                 "opening browse page",
                 expect_product_links=True,
                 on_rate_limit=notify_rate_limit,
+                before_retry=rebuild_browse_session,
             )
+            current_browse_page_url = browse_url
             page.wait_for_timeout(500)
 
             stalled_batches = 0
@@ -708,18 +893,36 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                 if remaining_capacity <= 0:
                     break
 
-                links = _run_with_rate_limit_retries(
-                    lambda current_page=page, current_capacity=remaining_capacity: collect_listing_links(
-                        current_page,
+                def collect_browse_links(current_capacity=remaining_capacity, current_url=browse_url):
+                    nonlocal current_browse_page_url
+                    if current_browse_page_url != current_url:
+                        _load_page_with_retries(
+                            lambda: page,
+                            current_url,
+                            search_id,
+                            "opening browse page",
+                            expect_product_links=True,
+                            on_rate_limit=notify_rate_limit,
+                            before_retry=rebuild_browse_session,
+                        )
+                        current_browse_page_url = current_url
+
+                    _sleep_request_jitter(should_cancel)
+                    return collect_listing_links(
+                        page,
                         max_scrolls=max_scrolls,
                         per_scroll_wait_ms=1200,
                         max_links=current_capacity,
                         should_cancel=should_cancel,
                         aggressive_end_scroll=True,
-                    ),
+                    )
+
+                links = _run_with_rate_limit_retries(
+                    collect_browse_links,
                     should_cancel,
                     "collecting listings",
                     on_rate_limit=notify_rate_limit,
+                    before_retry=rebuild_browse_session,
                 )
                 unique_new = [url for url in links if url not in seen_urls]
 
@@ -740,11 +943,16 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                     if processed >= max_parsed_links or matches >= target_matches:
                         break
 
+                    def open_listing(current_url=url):
+                        _sleep_request_jitter(should_cancel)
+                        return parse_listing(item_page, current_url, should_cancel=should_cancel)
+
                     item = _run_with_rate_limit_retries(
-                        lambda current_url=url: parse_listing(item_page, current_url, should_cancel=should_cancel),
+                        open_listing,
                         should_cancel,
                         "opening listing page",
                         on_rate_limit=notify_rate_limit,
+                        before_retry=rebuild_browse_session,
                     )
 
                     processed += 1
@@ -753,6 +961,7 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                         if _listing_exceeds_age_window(item):
                             age_days = float(item.get("ageDays"))
                             stop_group_for_age = True
+                            age_window_hit = True
                             log_debug(
                                 f"[stream] stopping browse group={group} at {age_days:.1f}d "
                                 f"(>{MAX_LISTING_AGE_DAYS}d window)"
@@ -779,6 +988,7 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                                 groups=group,
                                 gender=gender,
                                 on_rate_limit=notify_rate_limit,
+                                reset_session=reset_session,
                             )
                             match["soldCount"] = sold_count
 
@@ -789,7 +999,7 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                                 matches += 1
 
                                 if matches >= target_matches:
-                                    yield _sse({"type": "done", "searchId": search_id or None})
+                                    yield emit_done("match_limit")
                                     return
 
                     yield _sse({"type": "progress", "processed": processed, "total": len(seen_urls), "matches": matches, "searchId": search_id or None})
@@ -797,9 +1007,12 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                 if stop_group_for_age:
                     break
     finally:
-        item_page.close()
+        try:
+            item_page.close()
+        except Exception:
+            pass
     
-    yield _sse({"type": "done", "searchId": search_id or None})
+    yield emit_done("age_window" if age_window_hit else "completed")
 
 
 @app.post("/api/search/cancel")

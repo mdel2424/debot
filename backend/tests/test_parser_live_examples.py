@@ -85,6 +85,18 @@ class ParserLiveExamplesTest(unittest.TestCase):
                 ),
                 "expected": (23.0, 27.5),
             },
+            {
+                "name": "genius tee with collar down measurement",
+                "description": (
+                    "2000’s are you a genius tee\n"
+                    "Cool graphic great condition\n"
+                    "Measurements\n"
+                    "Pit to pit 21”\n"
+                    "Collar down 28”\n"
+                    "#y2k #2000s #gr"
+                ),
+                "expected": (21.0, 28.0),
+            },
         ]
 
         for case in cases:

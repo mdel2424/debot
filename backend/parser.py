@@ -11,7 +11,10 @@ class MeasurementParser:
     NUM = r'(?P<val>\d+(?:\.\d+)?(?:\s+\d\/\d)?)'
     UNIT = r'(?P<unit>\s*(?:cm|mm|in|inch|inches|["″"]))?'
     P2P_LABELS = r'(?:p2p|pit\s*[- ]?to\s*[- ]?pit|pit[- ]?to[- ]?pit|pit\s*to\s*pit|chest|width|across\s*chest)'
-    LENGTH_LABELS = r'(?:length|top\s*to\s*bottom|back\s*length|hps\s*to\s*hem)'
+    LENGTH_LABELS = (
+        r'(?:length|top\s*to\s*bottom|back\s*length|hps\s*to\s*hem|'
+        r'collar\s*(?:[- ]?down|to\s*(?:bottom|hem)))'
+    )
     
     RE_P2P = re.compile(rf'\b{P2P_LABELS}\b[^0-9]{{0,10}}{NUM}{UNIT}', re.I)
     RE_LENGTH = re.compile(rf'\b{LENGTH_LABELS}\b[^0-9]{{0,10}}{NUM}{UNIT}', re.I)

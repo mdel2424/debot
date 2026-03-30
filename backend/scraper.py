@@ -4,6 +4,7 @@ import re
 import time
 import json
 import datetime as dt
+from email.utils import parsedate_to_datetime
 from typing import Optional, List, Dict, Any, Callable
 from urllib.parse import urljoin, urlparse, urlencode
 
@@ -24,7 +25,9 @@ CURRENCY_SYMBOLS = {
 }
 SCROLL_STEPS_PER_BATCH = 4
 SCROLL_STEP_RATIO = 0.7
-MAX_STALLED_SCROLL_STEPS = 2
+MAX_STALLED_SCROLL_STEPS = 3
+EARLY_SCROLL_STALL_BUFFER = 2
+EARLY_SCROLL_LINK_THRESHOLD = 24
 BROWSE_END_SCROLL_WAIT_MS = 2500
 LOGIN_MODAL_MAX_ATTEMPTS = 6
 LOGIN_MODAL_WAIT_MS = 250
@@ -66,9 +69,15 @@ class SearchCancelled(Exception):
 class RateLimitError(Exception):
     """Raised when Depop is rate limiting or temporarily blocking requests."""
 
-    def __init__(self, message: str, status: Optional[int] = None):
+    def __init__(
+        self,
+        message: str,
+        status: Optional[int] = None,
+        retry_after_seconds: Optional[int] = None,
+    ):
         super().__init__(message)
         self.status = status
+        self.retry_after_seconds = retry_after_seconds
         self.code = "rate_limited"
 
 
@@ -141,6 +150,47 @@ def _response_status(response: Any) -> Optional[int]:
         return None
 
 
+def _parse_retry_after_seconds(value: Optional[str]) -> Optional[int]:
+    """Parse a Retry-After header into whole seconds when possible."""
+    if not value:
+        return None
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    try:
+        seconds = int(raw)
+        return max(seconds, 0)
+    except Exception:
+        pass
+
+    try:
+        retry_at = parsedate_to_datetime(raw)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=dt.timezone.utc)
+        else:
+            retry_at = retry_at.astimezone(dt.timezone.utc)
+        delta = retry_at - dt.datetime.now(dt.timezone.utc)
+        return max(int(delta.total_seconds()), 0)
+    except Exception:
+        return None
+
+
+def extract_retry_after_seconds(response: Any) -> Optional[int]:
+    """Extract Retry-After seconds from a Playwright response when present."""
+    if response is None:
+        return None
+
+    header_value = None
+    try:
+        header_value = response.header_value("retry-after")
+    except Exception:
+        header_value = None
+
+    return _parse_retry_after_seconds(header_value)
+
+
 def _page_has_selector(page: Page, selector: str) -> bool:
     """Best-effort check for whether a selector exists on the page."""
     try:
@@ -154,6 +204,7 @@ def check_page_for_rate_limit(
     response_status: Optional[int] = None,
     expect_product_links: bool = False,
     expect_listing: bool = False,
+    retry_after_seconds: Optional[int] = None,
 ) -> None:
     """Inspect the current page and raise when it looks rate limited."""
     text_parts: List[str] = []
@@ -190,7 +241,11 @@ def check_page_for_rate_limit(
         expected_content_missing=expected_content_missing,
     )
     if message:
-        raise RateLimitError(message, status=response_status)
+        raise RateLimitError(
+            message,
+            status=response_status,
+            retry_after_seconds=retry_after_seconds,
+        )
 
 
 def parse_iso_datetime(ts: str) -> Optional[dt.datetime]:
@@ -517,14 +572,18 @@ def dismiss_login_modal(page: Page) -> None:
 
 
 def remove_sold_sections(page: Page) -> None:
-    """Remove sold items section from page."""
+    """Mark sold item sections so link collection can skip them safely."""
     try:
         page.evaluate("""() => {
             const headings = Array.from(document.querySelectorAll("h1, h2, h3, h4, h5, h6, p, span, div"));
-            for (const h of headings) {
-                if ((h.textContent || "").trim().toLowerCase() === "sold items") {
-                    const section = h.closest("section") || h.parentElement;
-                    if (section) section.remove();
+            for (const heading of headings) {
+                if ((heading.textContent || "").trim().toLowerCase() === "sold items") {
+                    const root =
+                        heading.closest("section, article, ul, ol") ||
+                        heading.parentElement;
+                    if (root) {
+                        root.setAttribute("data-debot-sold-root", "true");
+                    }
                 }
             }
         }""")
@@ -549,20 +608,19 @@ def collect_listing_links(
     
     selectors = ['a[href^="/products/"]']
 
+    def stall_limit() -> int:
+        if len(seen) < EARLY_SCROLL_LINK_THRESHOLD:
+            return MAX_STALLED_SCROLL_STEPS + EARLY_SCROLL_STALL_BUFFER
+        return MAX_STALLED_SCROLL_STEPS
+
     def collect_visible_links() -> None:
         for sel in selectors:
             try:
                 hrefs = page.eval_on_selector_all(sel, """
                     els => els
                         .filter(e => {
-                            const section = e.closest('section');
-                            if (section) {
-                                const headingEls = Array.from(
-                                    section.querySelectorAll('h1, h2, h3, h4, h5, h6, p, span, div')
-                                ).slice(0, 30);
-                                if (headingEls.some(el => ((el.textContent || '').trim().toLowerCase() === 'sold items'))) {
-                                    return false;
-                                }
+                            if (e.closest('[data-debot-sold-root="true"]')) {
+                                return false;
                             }
                             const listItem = e.closest('li');
                             if (listItem) {
@@ -604,7 +662,7 @@ def collect_listing_links(
                 stalled_batches = 0
             last_count = len(seen)
 
-            if batch == total_batches - 1 or stalled_batches >= MAX_STALLED_SCROLL_STEPS:
+            if batch == total_batches - 1 or stalled_batches >= stall_limit():
                 break
 
             try:
@@ -634,7 +692,7 @@ def collect_listing_links(
                 stalled_steps = 0
             last_count = len(seen)
 
-            if step == total_steps - 1 or stalled_steps >= MAX_STALLED_SCROLL_STEPS:
+            if step == total_steps - 1 or stalled_steps >= stall_limit():
                 break
 
             try:
@@ -678,6 +736,7 @@ def parse_listing(
             page,
             response_status=_response_status(response),
             expect_listing=True,
+            retry_after_seconds=extract_retry_after_seconds(response),
         )
         product_json_ld = _pick_product_json_ld(page)
         page_html = ""

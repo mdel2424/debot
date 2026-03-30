@@ -105,6 +105,7 @@ export async function streamSearch({
                   matches: evt.matches,
                   phase: evt.phase || 'parsing',
                   message: evt.message || '',
+                  stopReason: evt.stopReason || null,
                   retryAttempt: evt.retryAttempt || null,
                   retryTotalAttempts: evt.retryTotalAttempts || null,
                   retryDelaySeconds: evt.retryDelaySeconds || null,
@@ -112,14 +113,19 @@ export async function streamSearch({
                 });
                 break;
               case 'meta':
-    onMeta?.({
-      total: evt.links,
-      seller: evt.seller
-    });
-    break;
+                onMeta?.({
+                  total: evt.links,
+                  seller: evt.seller,
+                });
+                break;
               case 'cancelled':
               case 'done':
-                onDone?.();
+                onDone?.({
+                  processed: evt.processed,
+                  total: evt.total,
+                  matches: evt.matches,
+                  stopReason: evt.stopReason || null,
+                });
                 return;
               case 'error':
                 onError?.({
@@ -140,12 +146,12 @@ export async function streamSearch({
       if (!isAborted) throw readError;
     }
     
-    onDone?.();
+    onDone?.(null);
     
   } catch (err) {
     if (err.name === 'AbortError' || err.message?.includes('aborted')) {
       console.log('[SSE] Stream was cancelled by user');
-      onDone?.();
+      onDone?.(null);
     } else {
       console.error('[SSE] Stream failed:', err);
       onError?.({

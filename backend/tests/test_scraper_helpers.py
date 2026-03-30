@@ -226,6 +226,25 @@ class ScraperHelpersTest(unittest.TestCase):
         self.assertTrue(page.scroll_amounts)
         self.assertTrue(all(amount == 700 for amount in page.scroll_amounts))
 
+    def test_collect_listing_links_waits_through_initial_plateau_before_stopping(self):
+        page = FakeCollectPage([
+            ["/products/a/"],
+            ["/products/a/"],
+            ["/products/a/"],
+            ["/products/a/", "/products/b/", "/products/c/"],
+        ])
+
+        links = collect_listing_links(page, max_scrolls=1, per_scroll_wait_ms=25)
+
+        self.assertEqual(
+            links,
+            [
+                "https://www.depop.com/products/a/",
+                "https://www.depop.com/products/b/",
+                "https://www.depop.com/products/c/",
+            ],
+        )
+
     def test_collect_listing_links_uses_aggressive_end_scroll_for_browse_pages(self):
         page = FakeCollectPage([
             [f"/products/item-{i}/" for i in range(1, 49)],

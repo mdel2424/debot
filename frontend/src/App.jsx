@@ -16,6 +16,8 @@ const FOLLOWING_STORAGE_KEY = 'debot.followingAccounts.v1';
 const ACTIVE_PAGE_STORAGE_KEY = 'debot.categoryPage.v1';
 const PAGE_FILTERS_STORAGE_KEY = 'debot.categoryFilters.v1';
 const PAGE_FILTERS_VERSION_STORAGE_KEY = 'debot.categoryFilters.defaults.v1';
+const LOW_PARSE_RETRY_RATIO = 0.9;
+const MAX_LOW_PARSE_RETRIES = 1;
 
 const createProgressState = (overrides = {}) => ({
   processed: 0,
@@ -23,6 +25,7 @@ const createProgressState = (overrides = {}) => ({
   matches: 0,
   phase: 'idle',
   message: '',
+  stopReason: null,
   retryAttempt: null,
   retryTotalAttempts: null,
   retryDelaySeconds: null,
@@ -533,6 +536,29 @@ function App() {
 
   const searchKeyFor = (pageId, sellerUsername) => `${pageId}::${sellerUsername}`;
 
+  const shouldRetryLowParse = (task, summary) => {
+    if (!task || task.source !== 'batch') {
+      return false;
+    }
+
+    if ((task.lowParseRetryCount || 0) >= MAX_LOW_PARSE_RETRIES) {
+      return false;
+    }
+
+    const stopReason = String(summary?.stopReason || '').trim();
+    if (stopReason === 'age_window' || stopReason === 'match_limit') {
+      return false;
+    }
+
+    const processed = Number(summary?.processed);
+    const total = Number(summary?.total);
+    if (!Number.isFinite(processed) || !Number.isFinite(total) || total <= 0) {
+      return false;
+    }
+
+    return processed / total < LOW_PARSE_RETRY_RATIO;
+  };
+
   const cloneQueueTask = (task) => {
     if (!task) {
       return null;
@@ -614,6 +640,34 @@ function App() {
       results: [],
       progress: message ? createProgressState({ phase: 'idle', message }) : null,
     });
+  };
+
+  const queueLowParseRetry = (task, summary) => {
+    const processed = Number(summary?.processed) || 0;
+    const total = Number(summary?.total) || 0;
+    const retryTask = {
+      ...task,
+      resetResults: false,
+      lowParseRetryCount: (task.lowParseRetryCount || 0) + 1,
+    };
+
+    if (!searchQueueRef.current.some((queuedTask) => queuedTask.key === retryTask.key)) {
+      searchQueueRef.current = [...searchQueueRef.current, retryTask];
+    }
+
+    updateSellerRow(task.pageId, task.sellerUsername, {
+      loading: false,
+      controller: null,
+      searchId: '',
+      processed: false,
+      error: null,
+      errorCode: null,
+      progress: createProgressState({
+        phase: 'queued',
+        message: `Retrying after an incomplete scan (${processed}/${total} parsed).`,
+      }),
+    });
+    syncQueueState();
   };
 
   const removeQueuedTasks = (predicate, options = {}) => {
@@ -765,14 +819,7 @@ function App() {
     }
 
     syncQueueState();
-    if (!activeQueueTaskRef.current && searchQueueRef.current.length > 0) {
-      const pendingTasks = [...searchQueueRef.current];
-      searchQueueRef.current = [];
-      syncQueueState();
-      pendingTasks.forEach((task) => {
-        void executeSellerSearch(task).then((outcome) => handleSearchCompletion(task, outcome));
-      });
-    }
+    resumePendingTasks();
   };
 
   const cancelSellerAcrossPages = async (sellerUsername) => {
@@ -823,7 +870,11 @@ function App() {
   };
 
   const resumePendingTasks = () => {
-    if (activeQueueTaskRef.current || searchQueueRef.current.length === 0) {
+    if (
+      activeQueueTaskRef.current ||
+      searchRegistryRef.current.size > 0 ||
+      searchQueueRef.current.length === 0
+    ) {
       syncQueueState();
       return;
     }
@@ -918,6 +969,7 @@ function App() {
     }
 
     syncQueueState();
+    resumePendingTasks();
   };
 
   const executeSellerSearch = async (task) => {
@@ -993,25 +1045,47 @@ function App() {
           outcome = { status: 'paused', code: null };
         }
       },
-      onDone: () => {
+      onDone: (summary) => {
         const existingProgress = getSellerRow(pageId, sellerUsername)?.progress;
+        const doneProgress = existingProgress
+          ? {
+            ...existingProgress,
+            processed: Number.isFinite(Number(summary?.processed))
+              ? Number(summary.processed)
+              : existingProgress.processed,
+            total: Number.isFinite(Number(summary?.total))
+              ? Number(summary.total)
+              : existingProgress.total,
+            matches: Number.isFinite(Number(summary?.matches))
+              ? Number(summary.matches)
+              : existingProgress.matches,
+            phase: 'done',
+            stopReason: summary?.stopReason || null,
+            retryAttempt: null,
+            retryTotalAttempts: null,
+            retryDelaySeconds: null,
+            retryAvailableAt: null,
+          }
+          : null;
+        const shouldRetry = shouldRetryLowParse(task, summary);
         const didFinish = finishSellerSearch(pageId, sellerUsername, searchId, {
           loading: false,
-          processed: true,
-          progress: existingProgress
-            ? {
-              ...existingProgress,
-              phase: 'done',
-              retryAttempt: null,
-              retryTotalAttempts: null,
-              retryDelaySeconds: null,
-              retryAvailableAt: null,
-            }
-            : null,
+          processed: !shouldRetry,
+          progress: shouldRetry
+            ? createProgressState({
+              phase: 'queued',
+              message: `Retrying after an incomplete scan (${summary?.processed ?? 0}/${summary?.total ?? 0} parsed).`,
+            })
+            : doneProgress,
         });
         if (didFinish) {
           finalized = true;
-          outcome = { status: 'done', code: null };
+          if (shouldRetry) {
+            queueLowParseRetry(task, summary);
+            outcome = { status: 'requeued', code: null };
+          } else {
+            outcome = { status: 'done', code: null };
+          }
         } else {
           outcome = { status: 'paused', code: null };
         }
@@ -1039,6 +1113,7 @@ function App() {
       batchId: options.batchId || nextBatchId(options.source === 'batch' ? 'batch' : 'manual'),
       source: options.source || 'manual',
       resetResults: options.resetResults !== false,
+      lowParseRetryCount: options.lowParseRetryCount || 0,
     };
 
     if (activeQueueTaskRef.current) {

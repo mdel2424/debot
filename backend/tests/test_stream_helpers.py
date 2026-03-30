@@ -54,6 +54,11 @@ class FakeContext:
     f"Stream helper tests require backend dependencies: {DEPENDENCY_IMPORT_ERROR}",
 )
 class StreamHelpersTest(unittest.TestCase):
+    def setUp(self):
+        self.jitter_patcher = patch("main._sleep_request_jitter")
+        self.jitter_patcher.start()
+        self.addCleanup(self.jitter_patcher.stop)
+
     @staticmethod
     def _decode_events(events):
         return [json.loads(chunk.decode("utf-8").split("data: ", 1)[1]) for chunk in events]
@@ -89,15 +94,70 @@ class StreamHelpersTest(unittest.TestCase):
                 )
 
         self.assertEqual(len(attempts), 4)
-        self.assertEqual(delays, [15, 30, 60])
+        self.assertEqual(delays, [60, 180, 600])
         self.assertEqual(
             retry_events,
-            [(1, 3, 15, "listing page"), (2, 3, 30, "listing page"), (3, 3, 60, "listing page")],
+            [(1, 3, 60, "listing page"), (2, 3, 180, "listing page"), (3, 3, 600, "listing page")],
         )
         self.assertEqual(
             str(ctx.exception),
             "Rate limited after 3 cooldown attempts while listing page.",
         )
+
+    def test_run_with_rate_limit_retries_honors_retry_after_and_rebuilds_session(self):
+        attempts = []
+        delays = []
+        rebuilds = []
+
+        def action():
+            attempts.append("try")
+            if len(attempts) == 1:
+                raise RateLimitError(
+                    "Depop returned HTTP 429 Too Many Requests.",
+                    retry_after_seconds=240,
+                )
+            return "ok"
+
+        with patch("builtins.print"), patch("main.sleep_with_cancel", side_effect=lambda delay, should_cancel=None: delays.append(delay)):
+            result = _run_with_rate_limit_retries(
+                action,
+                lambda: False,
+                "listing page",
+                before_retry=lambda attempt, total_attempts, delay, exc, label: rebuilds.append(
+                    (attempt, total_attempts, delay, label)
+                ),
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(delays, [240])
+        self.assertEqual(rebuilds, [(1, 3, 240, "listing page")])
+
+    def test_run_with_rate_limit_retries_recovers_transient_navigation_abort(self):
+        attempts = []
+        delays = []
+        rebuilds = []
+
+        def action():
+            attempts.append("try")
+            if len(attempts) == 1:
+                raise RuntimeError(
+                    'Page.goto: NS_BINDING_ABORTED; maybe frame was detached?'
+                )
+            return "ok"
+
+        with patch("builtins.print"), patch("main.sleep_with_cancel", side_effect=lambda delay, should_cancel=None: delays.append(delay)):
+            result = _run_with_rate_limit_retries(
+                action,
+                lambda: False,
+                "seller page",
+                before_retry=lambda attempt, total_attempts, delay, exc, label: rebuilds.append(
+                    (attempt, total_attempts, delay, label)
+                ),
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(delays, [1])
+        self.assertEqual(rebuilds, [(1, 3, 1, "seller page")])
 
     def test_rate_limit_error_payload_is_encoded_as_sse_error(self):
         payload = _error_payload_for_exception(
@@ -319,7 +379,8 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(progress_events[-1]['processed'], 3)
         self.assertEqual(progress_events[-1]['total'], 3)
         self.assertEqual(load_mock.call_count, 2)
-        self.assertTrue(all(call.kwargs.get('aggressive_end_scroll') for call in collect_mock.call_args_list))
+        self.assertTrue(all(call.kwargs.get('aggressive_end_scroll') is False for call in collect_mock.call_args_list))
+        self.assertEqual(decoded[-1]['stopReason'], 'completed')
 
     def test_search_seller_collect_listing_rate_limit_emits_cooldown_and_recovers(self):
         ctx = FakeContext()
@@ -367,11 +428,12 @@ class StreamHelpersTest(unittest.TestCase):
 
         self.assertEqual(rate_limited_event['retryAttempt'], 1)
         self.assertEqual(rate_limited_event['retryTotalAttempts'], 3)
-        self.assertEqual(rate_limited_event['retryDelaySeconds'], 15)
+        self.assertEqual(rate_limited_event['retryDelaySeconds'], 60)
         self.assertEqual(rate_limited_event['message'], 'Paused while collecting listings.')
         self.assertEqual(len(match_events), 1)
         self.assertEqual(match_events[0]['item']['url'], 'tops-1')
         self.assertEqual(decoded[-1]['type'], 'done')
+        self.assertEqual(decoded[-1]['stopReason'], 'completed')
 
     def test_search_seller_keeps_scanning_items_inside_age_window(self):
         ctx = FakeContext()
@@ -427,16 +489,16 @@ class StreamHelpersTest(unittest.TestCase):
     def test_search_seller_stops_current_group_once_listing_exceeds_age_window(self):
         ctx = FakeContext()
         page = FakePage()
-        parse_results = [
-            {'seller': 'onthemarkco', 'url': 'recent-top', 'ageDays': 12.0},
-            {'seller': 'onthemarkco', 'url': 'stale-top', 'ageDays': float(MAX_LISTING_AGE_DAYS) + 1},
-            {'seller': 'onthemarkco', 'url': 'fresh-coat', 'ageDays': 4.0},
-        ]
+        parse_results = {
+            'recent-top': {'seller': 'onthemarkco', 'url': 'recent-top', 'ageDays': 12.0},
+            'stale-top': {'seller': 'onthemarkco', 'url': 'stale-top', 'ageDays': float(MAX_LISTING_AGE_DAYS) + 1},
+            'fresh-coat': {'seller': 'onthemarkco', 'url': 'fresh-coat', 'ageDays': 4.0},
+        }
         parse_calls = []
 
         def fake_parse(current_page, url, should_cancel=None):
             parse_calls.append(url)
-            return parse_results[len(parse_calls) - 1]
+            return parse_results[url]
 
         with (
             patch('builtins.print'),
@@ -480,6 +542,7 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual([evt['item']['url'] for evt in match_events], ['recent-top', 'fresh-coat'])
         self.assertEqual(progress_events[-1]['processed'], 3)
         self.assertEqual(progress_events[-1]['total'], 3)
+        self.assertEqual(decoded[-1]['stopReason'], 'age_window')
 
     def test_browse_all_collect_listing_rate_limit_emits_cooldown_and_recovers(self):
         ctx = FakeContext()
@@ -521,11 +584,12 @@ class StreamHelpersTest(unittest.TestCase):
         match_events = [evt for evt in decoded if evt['type'] == 'match']
 
         self.assertEqual(rate_limited_event['retryAttempt'], 1)
-        self.assertEqual(rate_limited_event['retryDelaySeconds'], 15)
+        self.assertEqual(rate_limited_event['retryDelaySeconds'], 60)
         self.assertEqual(rate_limited_event['message'], 'Paused while collecting listings.')
         self.assertEqual(len(match_events), 1)
         self.assertEqual(match_events[0]['item']['soldCount'], 99)
         self.assertEqual(decoded[-1]['type'], 'done')
+        self.assertEqual(decoded[-1]['stopReason'], 'match_limit')
 
     def test_browse_all_aggregates_multiple_groups_and_stops_stale_group(self):
         ctx = FakeContext()
@@ -578,6 +642,7 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(parse_calls, ['top-1', 'stale-top', 'coat-1'])
         self.assertEqual([evt['item']['url'] for evt in match_events], ['top-1', 'coat-1'])
         self.assertEqual(decoded[-1]['type'], 'done')
+        self.assertEqual(decoded[-1]['stopReason'], 'match_limit')
 
     def test_process_item_matches_bottoms_by_size_range(self):
         item = {
