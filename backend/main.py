@@ -472,8 +472,19 @@ def _process_item(item: Dict[str, Any], target_p2p: float, target_length: float,
     if category in MEASUREMENT_CATEGORIES:
         text = item.get("description", "")
         w, L = parser.extract_tops(text)
+        matched_any = False
 
-        if parser.within(w, target_p2p, p2p_tol) and parser.within(L, target_length, length_tol):
+        if w is not None:
+            matched_any = True
+            if not parser.within(w, target_p2p, p2p_tol):
+                return None
+
+        if L is not None:
+            matched_any = True
+            if not parser.within(L, target_length, length_tol):
+                return None
+
+        if matched_any:
             return _build_match_payload(item, p2p=w, length=L)
         return None
 
@@ -484,19 +495,27 @@ def _process_item(item: Dict[str, Any], target_p2p: float, target_length: float,
         description = item.get("description", "")
         if bottoms_measurements:
             values = parser.extract_bottoms(description)
+            if values.get("waist") is None:
+                size_waist = _extract_bottoms_size(item.get("sizeLabel") or "")
+                if size_waist is not None:
+                    values["waist"] = size_waist
             inseam_rise = None
             if values.get("inseam") is not None and values.get("rise") is not None:
                 inseam_rise = float(values["inseam"]) + float(values["rise"])
+            matched_any = False
             for key, bounds in bottoms_measurements.items():
                 current_value = inseam_rise if key == "inseamRise" else values.get(key)
                 if current_value is None:
-                    return None
+                    continue
+                matched_any = True
                 lower = bounds.get("min")
                 upper = bounds.get("max")
                 if lower is not None and current_value < float(lower):
                     return None
                 if upper is not None and current_value > float(upper):
                     return None
+            if not matched_any:
+                return None
             return _build_match_payload(
                 item,
                 waist=values.get("waist"),

@@ -20,7 +20,7 @@ class MeasurementParser:
     WAIST_LABELS = r'(?:waist|waistband|across\s*waist)'
     INSEAM_LABELS = r'(?:inseam)'
     RISE_LABELS = r'(?:front\s*rise|rise)'
-    LEG_OPENING_LABELS = r'(?:leg\s*opening|hem\s*opening|ankle\s*opening|leg\s*hem)'
+    LEG_OPENING_LABELS = r'(?:leg\s*opening|bottom\s*hem|bottom\s*opening|hem\s*opening|ankle\s*opening|leg\s*hem|leg)'
     
     RE_P2P = re.compile(rf'\b{P2P_LABELS}\b[^0-9]{{0,10}}{NUM}{UNIT}', re.I)
     RE_LENGTH = re.compile(rf'\b{LENGTH_LABELS}\b[^0-9]{{0,10}}{NUM}{UNIT}', re.I)
@@ -43,6 +43,14 @@ class MeasurementParser:
         r'\b',
         re.I,
     )
+    RE_BOTTOMS_WL_PAIR = re.compile(
+        r'\bw\s*(?P<waist>\d+(?:\.\d+)?)\b'
+        r'[^0-9\n]{0,12}'
+        r'l\s*(?P<inseam>\d+(?:\.\d+)?)\b',
+        re.I,
+    )
+    RE_BOTTOMS_SIZE_HINT = re.compile(r'\bsize[:\s]+(?P<waist>\d+(?:\.\d+)?)\b', re.I)
+    RE_BOTTOMS_FITS_WAIST = re.compile(r'\bfits\s+a\s+(?P<waist>\d+(?:\.\d+)?)\s*waist\b', re.I)
 
     def to_inches(self, num_str: str, unit_str: str = "") -> float:
         """Convert a measurement string to inches."""
@@ -100,6 +108,49 @@ class MeasurementParser:
 
         return first, second
 
+    def _extract_bottoms_waist_hint(self, text: str) -> Optional[float]:
+        """Best-effort waist hint extraction for flat-measured bottoms."""
+        for raw_line in text.splitlines():
+            line = raw_line.strip().lower()
+            if not line:
+                continue
+
+            for pattern in (
+                self.RE_BOTTOMS_WL_PAIR,
+                self.RE_BOTTOMS_PAIR,
+                self.RE_BOTTOMS_FITS_WAIST,
+                self.RE_BOTTOMS_SIZE_HINT,
+            ):
+                match = pattern.search(line)
+                if not match:
+                    continue
+                try:
+                    return float(match.group("waist"))
+                except Exception:
+                    continue
+
+        return None
+
+    def _normalize_bottoms_waist(self, waist: Optional[float], text: str) -> Optional[float]:
+        """Convert laid-flat waist measurements to full-waist values when strongly indicated."""
+        if waist is None:
+            return None
+
+        if waist > 22:
+            return waist
+
+        doubled = waist * 2
+        waist_hint = self._extract_bottoms_waist_hint(text)
+        if waist_hint is not None and abs(doubled - waist_hint) <= 1.5:
+            return doubled
+
+        return doubled if 24 <= doubled <= 50 else waist
+
+    def _split_measurement_segments(self, line: str) -> list[str]:
+        """Split dense inline measurement lines into smaller fragments."""
+        segments = [segment.strip(" ()[]") for segment in re.split(r"[,;&|]+", line) if segment.strip()]
+        return segments or [line]
+
     def extract_tops(self, text: str) -> Tuple[Optional[float], Optional[float]]:
         """Extract P2P and length measurements from text."""
         t = (text or "").lower().replace("\u201d", '"').replace("\u2033", '"')
@@ -112,25 +163,29 @@ class MeasurementParser:
             if not line:
                 continue
 
-            if p2p is None:
-                p2p = self._extract_labeled_value_from_line(line, self.P2P_LABELS)
-            if length is None:
-                length = self._extract_labeled_value_from_line(line, self.LENGTH_LABELS)
+            for segment in self._split_measurement_segments(line):
+                if p2p is None:
+                    p2p = self._extract_labeled_value_from_line(segment, self.P2P_LABELS)
+                if length is None:
+                    length = self._extract_labeled_value_from_line(segment, self.LENGTH_LABELS)
 
-            if p2p is None or length is None:
-                pair = self._extract_pair_from_line(
-                    line,
-                    self.RE_PAIR_X,
-                    skip_if_contains=("tagged",),
-                )
-                if pair:
-                    pair_p2p, pair_length = pair
-                    if pair_length < pair_p2p:
-                        pair_p2p, pair_length = pair_length, pair_p2p
-                    if p2p is None:
-                        p2p = pair_p2p
-                    if length is None:
-                        length = pair_length
+                if p2p is None or length is None:
+                    pair = self._extract_pair_from_line(
+                        segment,
+                        self.RE_PAIR_X,
+                        skip_if_contains=("tagged",),
+                    )
+                    if pair:
+                        pair_p2p, pair_length = pair
+                        if pair_length < pair_p2p:
+                            pair_p2p, pair_length = pair_length, pair_p2p
+                        if p2p is None:
+                            p2p = pair_p2p
+                        if length is None:
+                            length = pair_length
+
+                if p2p is not None and length is not None:
+                    break
 
             if p2p is not None and length is not None:
                 break
@@ -142,11 +197,12 @@ class MeasurementParser:
         t = (text or "").lower().replace("\u201d", '"').replace("\u2033", '"')
 
         measurements = {
-            "waist": [],
-            "inseam": [],
-            "rise": [],
-            "legOpening": [],
+            "waist": None,
+            "inseam": None,
+            "rise": None,
+            "legOpening": None,
         }
+        priorities = {key: -1 for key in measurements}
         label_map = {
             "waist": self.WAIST_LABELS,
             "inseam": self.INSEAM_LABELS,
@@ -154,35 +210,61 @@ class MeasurementParser:
             "legOpening": self.LEG_OPENING_LABELS,
         }
 
+        def assign_value(key: str, value: Optional[float], priority: int) -> None:
+            if value is None:
+                return
+            if priority >= priorities[key]:
+                measurements[key] = value
+                priorities[key] = priority
+
+        def pair_priority(line: str) -> int:
+            lowered = line.lower()
+            if any(token in lowered for token in ("measurement", "measured", "waist", "inseam")):
+                return 3
+            if any(token in lowered for token in ("tagged", "size", "fits")):
+                return 1
+            return 2
+
         for line in t.splitlines():
             normalized_line = line.strip()
             if not normalized_line:
                 continue
 
-            for key, label_pattern in label_map.items():
-                if measurements[key]:
-                    continue
-                value = self._extract_labeled_value_from_line(normalized_line, label_pattern)
-                if value is not None:
-                    measurements[key].append(value)
+            for segment in self._split_measurement_segments(normalized_line):
+                for key, label_pattern in label_map.items():
+                    value = self._extract_labeled_value_from_line(segment, label_pattern)
+                    assign_value(key, value, 3)
 
-            pair = self._extract_pair_from_line(
-                normalized_line,
-                self.RE_BOTTOMS_PAIR,
-                skip_if_contains=("tagged",),
-            )
-            if pair:
-                waist_value, inseam_value = pair
-                if not measurements["waist"]:
-                    measurements["waist"].append(waist_value)
-                if not measurements["inseam"]:
-                    measurements["inseam"].append(inseam_value)
+                pair = self._extract_pair_from_line(
+                    segment,
+                    self.RE_BOTTOMS_PAIR,
+                    skip_if_contains=(),
+                )
+                if pair:
+                    waist_value, inseam_value = pair
+                    priority = pair_priority(segment)
+                    assign_value("waist", waist_value, priority)
+                    assign_value("inseam", inseam_value, priority)
+
+                wl_pair = self._extract_pair_from_line(
+                    segment,
+                    self.RE_BOTTOMS_WL_PAIR,
+                    skip_if_contains=(),
+                )
+                if wl_pair:
+                    waist_value, inseam_value = wl_pair
+                    priority = pair_priority(segment)
+                    assign_value("waist", waist_value, priority)
+                    assign_value("inseam", inseam_value, priority)
+
+        waist_value = measurements["waist"]
+        waist_value = self._normalize_bottoms_waist(waist_value, t)
 
         return {
-            "waist": measurements["waist"][0] if measurements["waist"] else None,
-            "inseam": measurements["inseam"][0] if measurements["inseam"] else None,
-            "rise": measurements["rise"][0] if measurements["rise"] else None,
-            "legOpening": measurements["legOpening"][0] if measurements["legOpening"] else None,
+            "waist": waist_value,
+            "inseam": measurements["inseam"],
+            "rise": measurements["rise"],
+            "legOpening": measurements["legOpening"],
         }
 
     def within(self, val: Optional[float], target: Optional[float], tol: float) -> bool:

@@ -709,6 +709,64 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(match["inseamRise"], 42.5)
         self.assertEqual(match["legOpening"], 9.5)
 
+    def test_process_item_matches_bottoms_when_only_some_measurements_are_present(self):
+        item = {
+            "url": "https://www.depop.com/products/example-bottoms-partial/",
+            "image": "https://example.com/image.jpg",
+            "price": "$55.00",
+            "description": (
+                "Vintage denim\n"
+                "Waist 34\n"
+                "Inseam 31\n"
+            ),
+            "seller": "seller-partial",
+        }
+
+        match = _process_item(
+            item,
+            None,
+            None,
+            0.5,
+            1.25,
+            "bottoms",
+            None,
+            {
+                "waist": {"min": 32.0, "max": 36.0},
+                "inseamRise": {"min": 42.0, "max": 44.0},
+                "legOpening": {"min": 9.5, "max": 10.5},
+            },
+        )
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match["waist"], 34.0)
+        self.assertEqual(match["inseam"], 31.0)
+        self.assertIsNone(match["rise"])
+        self.assertIsNone(match["legOpening"])
+
+    def test_process_item_matches_tops_when_one_measurement_is_missing(self):
+        item = {
+            "url": "https://www.depop.com/products/example-tops-partial/",
+            "image": "https://example.com/image.jpg",
+            "price": "$40.00",
+            "description": "Vintage tee\nPit to pit 21.5",
+            "seller": "seller-top-partial",
+        }
+
+        match = _process_item(
+            item,
+            21.5,
+            27.25,
+            0.5,
+            1.0,
+            "tops",
+            None,
+            None,
+        )
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match["p2p"], 21.5)
+        self.assertIsNone(match["length"])
+
     def test_process_item_matches_footwear_by_size_range(self):
         item = {
             "url": "https://www.depop.com/products/example-shoes/",

@@ -203,6 +203,105 @@ class ParserLiveExamplesTest(unittest.TestCase):
             },
         )
 
+    def test_bottom_examples_parse_expected_measurements(self):
+        cases = [
+            {
+                "name": "sears jeans with w l pair and explicit pair",
+                "description": (
+                    "Vintage 70s Sears flare denim jeans. Made in USA in great condition, minor staining. W34 L28.5\n"
+                    "34 x 28.5\n"
+                    "Size: W34 L28.5"
+                ),
+                "expected": {"waist": 34.0, "inseam": 28.5},
+            },
+            {
+                "name": "navy sailor pants labeled",
+                "description": (
+                    "Waist 28\n"
+                    "Inseam 27"
+                ),
+                "expected": {"waist": 28.0, "inseam": 27.0},
+            },
+            {
+                "name": "ed hardy laid flat waist",
+                "description": (
+                    "Size 32\n"
+                    "Measurements\n"
+                    "Waist 16.5\n"
+                    "Inseam 31.5\n"
+                    "Leg opening 7.5\n"
+                    "Rise 10"
+                ),
+                "expected": {"waist": 33.0, "inseam": 31.5, "rise": 10.0, "legOpening": 7.5},
+            },
+            {
+                "name": "carhartt inline size pair plus labels",
+                "description": (
+                    "Vintage Carhartt Denim Relaxed fit Denim Jeans Dark Washed Size 30 x 30.5in\n"
+                    "Waist: 30in\n"
+                    "Inseam: 30.5in"
+                ),
+                "expected": {"waist": 30.0, "inseam": 30.5},
+            },
+            {
+                "name": "levis black denim bottom hem and flat waist",
+                "description": (
+                    "Levi's Black Denim Jeans Relaxed Fit 38x32\n"
+                    "Measurements:\n"
+                    "Waist: 18.5\n"
+                    "Front Rise: 12\n"
+                    "Inseam: 31\n"
+                    "Bottom Hem: 9"
+                ),
+                "expected": {"waist": 37.0, "inseam": 31.0, "rise": 12.0, "legOpening": 9.0},
+            },
+            {
+                "name": "one line bottoms labels",
+                "description": (
+                    "Vintage 90s Hemmed Levis Blue Wash Denim Red Tab Jeans\n"
+                    "Waist 32 Inseam 25 Outseam 35 Hip 40 Rise 11 Leg 8"
+                ),
+                "expected": {"waist": 32.0, "inseam": 25.0, "rise": 11.0, "legOpening": 8.0},
+            },
+            {
+                "name": "measured pair overrides tagged pair",
+                "description": (
+                    "Vintage Levis 550 blue jeans\n"
+                    "Tagged 40x32\n"
+                    "Measurements 38x27"
+                ),
+                "expected": {"waist": 38.0, "inseam": 27.0},
+            },
+            {
+                "name": "gap measured w l and flat waist",
+                "description": (
+                    "Vintage GAP Lightwash Blue Straight Leg Fit Denim Jeans - 31x29\n"
+                    "Tagged 31x30\n"
+                    "Measured W31 L29\n"
+                    "15.5 waist\n"
+                    "29 inseam\n"
+                    "11.5 rise\n"
+                    "8.75 leg opening"
+                ),
+                "expected": {"waist": 31.0, "inseam": 29.0, "rise": 11.5, "legOpening": 8.75},
+            },
+            {
+                "name": "inline parenthetical measurements",
+                "description": (
+                    "Cool faded baggy Sean John vintage Y2K jeans with relaxed fit\n"
+                    "Size 32 Measurements (34 Waist, 30.5 Inseam, 12.5 Rise & 9.5 Leg opening)"
+                ),
+                "expected": {"waist": 34.0, "inseam": 30.5, "rise": 12.5, "legOpening": 9.5},
+            },
+        ]
+
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                measurements = parser.extract_bottoms(case["description"])
+                for key, expected_value in case["expected"].items():
+                    self.assertIsNotNone(measurements.get(key))
+                    self.assertAlmostEqual(measurements[key], expected_value)
+
 
 if __name__ == "__main__":
     unittest.main()
