@@ -97,6 +97,33 @@ class ParserLiveExamplesTest(unittest.TestCase):
                 ),
                 "expected": (21.0, 28.0),
             },
+            {
+                "name": "tops with number before labels",
+                "description": (
+                    "single stitch tee\n"
+                    "21 pit to pit\n"
+                    "28 length\n"
+                    "great fade"
+                ),
+                "expected": (21.0, 28.0),
+            },
+            {
+                "name": "tops with shoulder to hem label",
+                "description": (
+                    "vintage crewneck\n"
+                    "23 chest\n"
+                    "27.5 shoulder to hem\n"
+                ),
+                "expected": (23.0, 27.5),
+            },
+            {
+                "name": "tops with x pair after measurements label",
+                "description": (
+                    "measurements 22 x 28\n"
+                    "fits boxy"
+                ),
+                "expected": (22.0, 28.0),
+            },
         ]
 
         for case in cases:
@@ -128,6 +155,51 @@ class ParserLiveExamplesTest(unittest.TestCase):
                 "inseam": 31.0,
                 "rise": 12.0,
                 "legOpening": 9.5,
+            },
+        )
+
+    def test_bottom_measurements_parse_number_before_label(self):
+        description = (
+            "y2k light blue bluenotes baggy wide leg jeans\n"
+            "tagged 32/32\n"
+            "33 waist\n"
+            "31 inseam\n"
+            "11.5 rise\n"
+            "9.5 leg opening\n"
+            "rips as shown"
+        )
+
+        measurements = parser.extract_bottoms(description)
+
+        self.assertEqual(
+            measurements,
+            {
+                "waist": 33.0,
+                "inseam": 31.0,
+                "rise": 11.5,
+                "legOpening": 9.5,
+            },
+        )
+
+    def test_bottom_measurements_parse_label_after_value_without_cross_line_bleed(self):
+        description = (
+            "washed denim\n"
+            "34 waist\n"
+            "30.5 inseam\n"
+            "12 rise\n"
+            "10 leg opening\n"
+            "tagged 32/32\n"
+        )
+
+        measurements = parser.extract_bottoms(description)
+
+        self.assertEqual(
+            measurements,
+            {
+                "waist": 34.0,
+                "inseam": 30.5,
+                "rise": 12.0,
+                "legOpening": 10.0,
             },
         )
 

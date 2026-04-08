@@ -10,9 +10,11 @@ class MeasurementParser:
     
     NUM = r'(?P<val>\d+(?:\.\d+)?(?:\s+\d\/\d)?)'
     UNIT = r'(?P<unit>\s*(?:cm|mm|in|inch|inches|["″"]))?'
+    LINE_LABEL_GAP = 40
     P2P_LABELS = r'(?:p2p|pit\s*[- ]?to\s*[- ]?pit|pit[- ]?to[- ]?pit|pit\s*to\s*pit|chest|width|across\s*chest)'
     LENGTH_LABELS = (
         r'(?:length|top\s*to\s*bottom|back\s*length|hps\s*to\s*hem|'
+        r'neck\s*to\s*hem|shoulder\s*to\s*hem|'
         r'collar\s*(?:[- ]?down|to\s*(?:bottom|hem)))'
     )
     WAIST_LABELS = r'(?:waist|waistband|across\s*waist)'
@@ -58,47 +60,81 @@ class MeasurementParser:
             return value / 2.54
         return value
 
+    def _extract_labeled_value_from_line(self, line: str, label_pattern: str) -> Optional[float]:
+        """Extract a labeled measurement from a single line, supporting either label order."""
+        patterns = (
+            re.compile(rf'\b{label_pattern}\b[^0-9\n]{{0,{self.LINE_LABEL_GAP}}}{self.NUM}{self.UNIT}', re.I),
+            re.compile(rf'{self.NUM}{self.UNIT}[^a-z0-9\n]{{0,{self.LINE_LABEL_GAP}}}\b{label_pattern}\b', re.I),
+        )
+        for pattern in patterns:
+            match = pattern.search(line)
+            if not match:
+                continue
+            try:
+                return self.to_inches(match.group("val"), match.group("unit") or "")
+            except Exception:
+                continue
+        return None
+
+    def _extract_pair_from_line(
+        self,
+        line: str,
+        pair_regex: re.Pattern,
+        *,
+        skip_if_contains: tuple[str, ...] = (),
+    ) -> Optional[Tuple[float, float]]:
+        """Extract a WxL-style pair from a single line with optional guard words."""
+        lowered = line.lower()
+        if any(token in lowered for token in skip_if_contains):
+            return None
+
+        match = pair_regex.search(line)
+        if not match:
+            return None
+
+        try:
+            first = self.to_inches(match.group(1), match.group(2) or "")
+            second = self.to_inches(match.group(3), match.group(4) or "")
+        except Exception:
+            return None
+
+        return first, second
+
     def extract_tops(self, text: str) -> Tuple[Optional[float], Optional[float]]:
         """Extract P2P and length measurements from text."""
         t = (text or "").lower().replace("\u201d", '"').replace("\u2033", '"')
-        
-        p2p_vals = [self.to_inches(m.group("val"), m.group("unit") or "") for m in self.RE_P2P.finditer(t)]
-        len_vals = [self.to_inches(m.group("val"), m.group("unit") or "") for m in self.RE_LENGTH.finditer(t)]
-        
-        # Check for WxL patterns
-        for m in self.RE_PAIR_X.finditer(t):
-            w = self.to_inches(m.group("w"), m.group("u1") or "")
-            l = self.to_inches(m.group("l"), m.group("u2") or "")
-            if l < w:
-                w, l = l, w
-            p2p_vals.append(w)
-            len_vals.append(l)
-        
-        p2p = p2p_vals[0] if p2p_vals else None
-        length = len_vals[0] if len_vals else None
-        
-        # Fallback: line-by-line search
-        if p2p is None or length is None:
-            sp = re.compile(rf'\b{self.P2P_LABELS}\b.*?{self.NUM}{self.UNIT}', re.I)
-            sl = re.compile(rf'\b{self.LENGTH_LABELS}\b.*?{self.NUM}{self.UNIT}', re.I)
-            for line in t.splitlines():
-                if p2p is None:
-                    m = sp.search(line)
-                    if m:
-                        try:
-                            p2p = self.to_inches(m.group("val"), m.group("unit") or "")
-                        except Exception:
-                            pass
-                if length is None:
-                    m = sl.search(line)
-                    if m:
-                        try:
-                            length = self.to_inches(m.group("val"), m.group("unit") or "")
-                        except Exception:
-                            pass
-                if p2p is not None and length is not None:
-                    break
-        
+
+        p2p = None
+        length = None
+
+        for raw_line in t.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if p2p is None:
+                p2p = self._extract_labeled_value_from_line(line, self.P2P_LABELS)
+            if length is None:
+                length = self._extract_labeled_value_from_line(line, self.LENGTH_LABELS)
+
+            if p2p is None or length is None:
+                pair = self._extract_pair_from_line(
+                    line,
+                    self.RE_PAIR_X,
+                    skip_if_contains=("tagged",),
+                )
+                if pair:
+                    pair_p2p, pair_length = pair
+                    if pair_length < pair_p2p:
+                        pair_p2p, pair_length = pair_length, pair_p2p
+                    if p2p is None:
+                        p2p = pair_p2p
+                    if length is None:
+                        length = pair_length
+
+            if p2p is not None and length is not None:
+                break
+
         return p2p, length
 
     def extract_bottoms(self, text: str) -> dict[str, Optional[float]]:
@@ -106,38 +142,41 @@ class MeasurementParser:
         t = (text or "").lower().replace("\u201d", '"').replace("\u2033", '"')
 
         measurements = {
-            "waist": [self.to_inches(m.group("val"), m.group("unit") or "") for m in self.RE_WAIST.finditer(t)],
-            "inseam": [self.to_inches(m.group("val"), m.group("unit") or "") for m in self.RE_INSEAM.finditer(t)],
-            "rise": [self.to_inches(m.group("val"), m.group("unit") or "") for m in self.RE_RISE.finditer(t)],
-            "legOpening": [
-                self.to_inches(m.group("val"), m.group("unit") or "")
-                for m in self.RE_LEG_OPENING.finditer(t)
-            ],
+            "waist": [],
+            "inseam": [],
+            "rise": [],
+            "legOpening": [],
+        }
+        label_map = {
+            "waist": self.WAIST_LABELS,
+            "inseam": self.INSEAM_LABELS,
+            "rise": self.RISE_LABELS,
+            "legOpening": self.LEG_OPENING_LABELS,
         }
 
-        for m in self.RE_BOTTOMS_PAIR.finditer(t):
-            measurements["waist"].append(self.to_inches(m.group("waist"), m.group("u1") or ""))
-            measurements["inseam"].append(self.to_inches(m.group("inseam"), m.group("u2") or ""))
+        for line in t.splitlines():
+            normalized_line = line.strip()
+            if not normalized_line:
+                continue
 
-        if any(not values for values in measurements.values()):
-            fallback_patterns = {
-                "waist": re.compile(rf'\b{self.WAIST_LABELS}\b.*?{self.NUM}{self.UNIT}', re.I),
-                "inseam": re.compile(rf'\b{self.INSEAM_LABELS}\b.*?{self.NUM}{self.UNIT}', re.I),
-                "rise": re.compile(rf'\b{self.RISE_LABELS}\b.*?{self.NUM}{self.UNIT}', re.I),
-                "legOpening": re.compile(rf'\b{self.LEG_OPENING_LABELS}\b.*?{self.NUM}{self.UNIT}', re.I),
-            }
+            for key, label_pattern in label_map.items():
+                if measurements[key]:
+                    continue
+                value = self._extract_labeled_value_from_line(normalized_line, label_pattern)
+                if value is not None:
+                    measurements[key].append(value)
 
-            for line in t.splitlines():
-                for key, pattern in fallback_patterns.items():
-                    if measurements[key]:
-                        continue
-                    match = pattern.search(line)
-                    if not match:
-                        continue
-                    try:
-                        measurements[key].append(self.to_inches(match.group("val"), match.group("unit") or ""))
-                    except Exception:
-                        pass
+            pair = self._extract_pair_from_line(
+                normalized_line,
+                self.RE_BOTTOMS_PAIR,
+                skip_if_contains=("tagged",),
+            )
+            if pair:
+                waist_value, inseam_value = pair
+                if not measurements["waist"]:
+                    measurements["waist"].append(waist_value)
+                if not measurements["inseam"]:
+                    measurements["inseam"].append(inseam_value)
 
         return {
             "waist": measurements["waist"][0] if measurements["waist"] else None,
