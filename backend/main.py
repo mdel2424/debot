@@ -142,6 +142,42 @@ def _normalize_size_range(size_range_value: Any) -> Dict[str, Any] | None:
     }
 
 
+def _normalize_bottoms_measurements(bottoms_measurements_value: Any) -> Dict[str, Dict[str, float]] | None:
+    """Normalize optional bottoms measurement bounds from request payloads."""
+    if not isinstance(bottoms_measurements_value, dict):
+        return None
+
+    def _coerce_number(value: Any) -> float | None:
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    normalized: Dict[str, Dict[str, float]] = {}
+    for key in ("waist", "inseamRise", "legOpening"):
+        raw_bounds = bottoms_measurements_value.get(key)
+        if not isinstance(raw_bounds, dict):
+            continue
+
+        min_value = _coerce_number(raw_bounds.get("min"))
+        max_value = _coerce_number(raw_bounds.get("max"))
+        if min_value is None and max_value is None:
+            continue
+        if min_value is None:
+            min_value = max_value
+        if max_value is None:
+            max_value = min_value
+        if min_value is None or max_value is None:
+            continue
+
+        normalized[key] = {
+            "min": min(min_value, max_value),
+            "max": max(min_value, max_value),
+        }
+
+    return normalized or None
+
+
 def _error_payload_for_exception(exc: Exception, search_id: str) -> Dict[str, Any]:
     """Normalize stream errors into a consistent SSE payload."""
     payload: Dict[str, Any] = {
@@ -404,7 +440,10 @@ def _extract_footwear_size(size_label: str) -> Optional[float]:
 
 
 def _build_match_payload(item: Dict[str, Any], p2p: Optional[float] = None,
-                         length: Optional[float] = None) -> Dict[str, Any]:
+                         length: Optional[float] = None, waist: Optional[float] = None,
+                         inseam: Optional[float] = None, rise: Optional[float] = None,
+                         inseam_rise: Optional[float] = None,
+                         leg_opening: Optional[float] = None) -> Dict[str, Any]:
     """Format a parsed listing into the stream match payload."""
     return {
         "url": item.get("url"),
@@ -412,6 +451,11 @@ def _build_match_payload(item: Dict[str, Any], p2p: Optional[float] = None,
         "price": item.get("price"),
         "p2p": p2p,
         "length": length,
+        "waist": waist,
+        "inseam": inseam,
+        "rise": rise,
+        "inseamRise": inseam_rise,
+        "legOpening": leg_opening,
         "ageDays": item.get("ageDays"),
         "listedAt": item.get("listedAt"),
         "seller": item.get("seller"),
@@ -422,7 +466,8 @@ def _build_match_payload(item: Dict[str, Any], p2p: Optional[float] = None,
 
 def _process_item(item: Dict[str, Any], target_p2p: float, target_length: float,
                   p2p_tol: float, length_tol: float, category: str = "tops",
-                  size_range: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+                  size_range: Dict[str, Any] | None = None,
+                  bottoms_measurements: Dict[str, Dict[str, float]] | None = None) -> Dict[str, Any] | None:
     """Check if item matches the active category filter and return a formatted result."""
     if category in MEASUREMENT_CATEGORIES:
         text = item.get("description", "")
@@ -436,6 +481,31 @@ def _process_item(item: Dict[str, Any], target_p2p: float, target_length: float,
         return _build_match_payload(item)
 
     if category == "bottoms":
+        description = item.get("description", "")
+        if bottoms_measurements:
+            values = parser.extract_bottoms(description)
+            inseam_rise = None
+            if values.get("inseam") is not None and values.get("rise") is not None:
+                inseam_rise = float(values["inseam"]) + float(values["rise"])
+            for key, bounds in bottoms_measurements.items():
+                current_value = inseam_rise if key == "inseamRise" else values.get(key)
+                if current_value is None:
+                    return None
+                lower = bounds.get("min")
+                upper = bounds.get("max")
+                if lower is not None and current_value < float(lower):
+                    return None
+                if upper is not None and current_value > float(upper):
+                    return None
+            return _build_match_payload(
+                item,
+                waist=values.get("waist"),
+                inseam=values.get("inseam"),
+                rise=values.get("rise"),
+                inseam_rise=inseam_rise,
+                leg_opening=values.get("legOpening"),
+            )
+
         size_value = _extract_bottoms_size(item.get("sizeLabel") or "")
     elif category == "footwear":
         size_value = _extract_footwear_size(item.get("sizeLabel") or "")
@@ -475,6 +545,7 @@ async def search_stream(request: Request):
     p2p_tol = float(payload.get("p2pTolerance") or DEFAULT_P2P_TOL)
     length_tol = float(payload.get("lengthTolerance") or DEFAULT_LENGTH_TOL)
     size_range = _normalize_size_range(payload.get("sizeRange"))
+    bottoms_measurements = _normalize_bottoms_measurements(payload.get("bottomsMeasurements"))
     
     seller = (payload.get("seller") or "").strip()
     max_items = int(payload.get("maxItems") or 40)
@@ -532,7 +603,7 @@ async def search_stream(request: Request):
                                 ctx, page, seller, groups, gender,
                                 target_p2p, target_length, p2p_tol, length_tol,
                                 max_items, max_links, max_scrolls, search_id,
-                                category, size_range,
+                                category, size_range, bottoms_measurements,
                                 emit_event=emit_stream_event,
                                 reset_session=reset_session,
                             )
@@ -541,7 +612,7 @@ async def search_stream(request: Request):
                                 ctx, page, groups, gender,
                                 target_p2p, target_length, p2p_tol, length_tol,
                                 max_items, max_links, max_scrolls, search_id,
-                                category, size_range,
+                                category, size_range, bottoms_measurements,
                                 emit_event=emit_stream_event,
                                 reset_session=reset_session,
                             )
@@ -628,7 +699,8 @@ async def search_stream(request: Request):
 def _search_seller(ctx, page, seller, groups, gender,
                    target_p2p, target_length, p2p_tol, length_tol,
                    max_items, max_links, max_scrolls, search_id,
-                   category="tops", size_range=None, emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+                   category="tops", size_range=None, bottoms_measurements=None,
+                   emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
                    reset_session: Optional[Callable[[], tuple[Any, Any]]] = None):
     """Search a specific seller's listings."""
     should_cancel = _cancel_check(search_id)
@@ -784,6 +856,7 @@ def _search_seller(ctx, page, seller, groups, gender,
                     length_tol,
                     category,
                     size_range,
+                    bottoms_measurements,
                 )
                 if match:
                     match["soldCount"] = seller_sold_count
@@ -805,7 +878,8 @@ def _search_seller(ctx, page, seller, groups, gender,
 
 def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, length_tol,
                 max_items, max_links, max_scrolls, search_id,
-                category="tops", size_range=None, emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+                category="tops", size_range=None, bottoms_measurements=None,
+                emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
                 reset_session: Optional[Callable[[], tuple[Any, Any]]] = None):
     """Browse all listings on the category page."""
     should_cancel = _cancel_check(search_id)
@@ -977,6 +1051,7 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                             length_tol,
                             category,
                             size_range,
+                            bottoms_measurements,
                         )
                         if match:
                             seller_name = (match.get("seller") or "").strip()

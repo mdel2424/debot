@@ -5,22 +5,6 @@ const MEASUREMENT_DEFAULTS = Object.freeze({
   secondTolerance: '1',
 });
 
-const BOTTOMS_SIZE_OPTIONS = [
-  '28',
-  '29',
-  '30',
-  '31',
-  '32',
-  '33',
-  '34',
-  '35',
-  '36',
-  '37',
-  '38',
-  '39',
-  '40',
-];
-
 const FOOTWEAR_SIZE_OPTIONS = [
   '7',
   '7.5',
@@ -53,16 +37,17 @@ export const CATEGORY_PAGES = [
     label: 'Bottoms',
     shortLabel: 'B',
     group: 'bottoms',
-    mode: 'sizeRange',
+    mode: 'bottomMeasurements',
     headline: 'Bottoms Search',
-    description: 'Filter seller listings by Depop bottoms sizing, using your saved waist range.',
+    description: 'Search seller listings by waist, inseam plus rise, and leg-opening ranges from your closet fit.',
     defaults: {
-      min: '30',
-      max: '34',
+      waistMin: '32',
+      waistMax: '36',
+      inseamRiseMin: '42',
+      inseamRiseMax: '44',
+      legOpeningMin: '9.5',
+      legOpeningMax: '10.5',
     },
-    sizeOptions: BOTTOMS_SIZE_OPTIONS,
-    sizeUnitLabel: 'Waist',
-    sizeSystem: 'WAIST',
   },
   {
     id: 'footwear',

@@ -271,6 +271,16 @@ body,
   text-transform: uppercase;
 }
 
+.filter-range-pair {
+  display: flex;
+  gap: 0.55rem;
+}
+
+.filter-range-pair .input-dark {
+  flex: 1 1 0;
+  min-width: 92px;
+}
+
 .input-dark {
   appearance: none;
   background: var(--color-panel-elevated);
@@ -964,7 +974,8 @@ body,
 
   .following-inputs .input-dark,
   .following-inputs .search-btn,
-  .following-inputs .filter-label {
+  .following-inputs .filter-label,
+  .filter-range-pair {
     width: 100%;
   }
 

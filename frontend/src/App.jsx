@@ -252,6 +252,17 @@ const normalizePageFilters = (pageId, rawFilters = null) => {
     };
   }
 
+  if (page.mode === 'bottomMeasurements') {
+    return {
+      waistMin: normalizeMeasurementValue(source.waistMin, defaults.waistMin),
+      waistMax: normalizeMeasurementValue(source.waistMax, defaults.waistMax),
+      inseamRiseMin: normalizeMeasurementValue(source.inseamRiseMin, defaults.inseamRiseMin),
+      inseamRiseMax: normalizeMeasurementValue(source.inseamRiseMax, defaults.inseamRiseMax),
+      legOpeningMin: normalizeMeasurementValue(source.legOpeningMin, defaults.legOpeningMin),
+      legOpeningMax: normalizeMeasurementValue(source.legOpeningMax, defaults.legOpeningMax),
+    };
+  }
+
   return defaults;
 };
 
@@ -347,6 +358,16 @@ const parseMeasurementNumber = (value, fallback) => {
   return Number.isNaN(parsed) ? fallback : parsed;
 };
 
+const formatResultMeasurement = (value, label) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+
+  const display = Number.isInteger(numeric) ? String(numeric) : numeric.toFixed(1);
+  return `${display}" ${label}`;
+};
+
 const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
   const payload = {
     category: page.id,
@@ -374,6 +395,31 @@ const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
       min: Math.min(minSize, maxSize),
       max: Math.max(minSize, maxSize),
       system: page.sizeSystem || null,
+    };
+  } else if (page.mode === 'bottomMeasurements') {
+    const normalizeMinMax = (minValue, maxValue, fallbackMin, fallbackMax) => {
+      const min = parseMeasurementNumber(minValue, parseMeasurementNumber(fallbackMin, null));
+      const max = parseMeasurementNumber(maxValue, parseMeasurementNumber(fallbackMax, null));
+      return {
+        min: Math.min(min, max),
+        max: Math.max(min, max),
+      };
+    };
+
+    payload.bottomsMeasurements = {
+      waist: normalizeMinMax(filters.waistMin, filters.waistMax, page.defaults.waistMin, page.defaults.waistMax),
+      inseamRise: normalizeMinMax(
+        filters.inseamRiseMin,
+        filters.inseamRiseMax,
+        page.defaults.inseamRiseMin,
+        page.defaults.inseamRiseMax,
+      ),
+      legOpening: normalizeMinMax(
+        filters.legOpeningMin,
+        filters.legOpeningMax,
+        page.defaults.legOpeningMin,
+        page.defaults.legOpeningMax,
+      ),
     };
   }
 
@@ -1250,6 +1296,64 @@ function App() {
       );
     }
 
+    if (activePage.mode === 'bottomMeasurements') {
+      return (
+        <>
+          <label className="filter-label">
+            <span>Waist</span>
+            <div className="filter-range-pair">
+              <input
+                className="input-dark input-small"
+                placeholder="Min"
+                value={currentFilters.waistMin}
+                onChange={(event) => handlePageFilterChange(activePage.id, 'waistMin', event.target.value)}
+              />
+              <input
+                className="input-dark input-small"
+                placeholder="Max"
+                value={currentFilters.waistMax}
+                onChange={(event) => handlePageFilterChange(activePage.id, 'waistMax', event.target.value)}
+              />
+            </div>
+          </label>
+          <label className="filter-label">
+            <span>Inseam + Rise</span>
+            <div className="filter-range-pair">
+              <input
+                className="input-dark input-small"
+                placeholder="Min"
+                value={currentFilters.inseamRiseMin}
+                onChange={(event) => handlePageFilterChange(activePage.id, 'inseamRiseMin', event.target.value)}
+              />
+              <input
+                className="input-dark input-small"
+                placeholder="Max"
+                value={currentFilters.inseamRiseMax}
+                onChange={(event) => handlePageFilterChange(activePage.id, 'inseamRiseMax', event.target.value)}
+              />
+            </div>
+          </label>
+          <label className="filter-label">
+            <span>Leg Opening</span>
+            <div className="filter-range-pair">
+              <input
+                className="input-dark input-small"
+                placeholder="Min"
+                value={currentFilters.legOpeningMin}
+                onChange={(event) => handlePageFilterChange(activePage.id, 'legOpeningMin', event.target.value)}
+              />
+              <input
+                className="input-dark input-small"
+                placeholder="Max"
+                value={currentFilters.legOpeningMax}
+                onChange={(event) => handlePageFilterChange(activePage.id, 'legOpeningMax', event.target.value)}
+              />
+            </div>
+          </label>
+        </>
+      );
+    }
+
     return (
       <span className="workspace-pill muted">
         No size filter
@@ -1533,6 +1637,26 @@ function App() {
 
                         if (result.sizeLabel) {
                           metaParts.push(`Size ${result.sizeLabel}`);
+                        }
+                        const waistLabel = formatResultMeasurement(result.waist, 'waist');
+                        if (waistLabel) {
+                          metaParts.push(waistLabel);
+                        }
+                        const inseamLabel = formatResultMeasurement(result.inseam, 'inseam');
+                        if (inseamLabel) {
+                          metaParts.push(inseamLabel);
+                        }
+                        const inseamRiseLabel = formatResultMeasurement(result.inseamRise, 'inseam + rise');
+                        if (inseamRiseLabel) {
+                          metaParts.push(inseamRiseLabel);
+                        }
+                        const riseLabel = formatResultMeasurement(result.rise, 'rise');
+                        if (riseLabel) {
+                          metaParts.push(riseLabel);
+                        }
+                        const legOpeningLabel = formatResultMeasurement(result.legOpening, 'leg opening');
+                        if (legOpeningLabel) {
+                          metaParts.push(legOpeningLabel);
                         }
                         if (
                           result.p2p !== undefined &&

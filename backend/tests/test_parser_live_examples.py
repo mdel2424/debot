@@ -108,6 +108,29 @@ class ParserLiveExamplesTest(unittest.TestCase):
                 self.assertAlmostEqual(p2p, expected_p2p)
                 self.assertAlmostEqual(length, expected_length)
 
+    def test_bottom_measurements_parse_expected_measurements(self):
+        description = (
+            "Vintage carpenter pants\n"
+            "Great fade and fit\n"
+            "Waist 34\"\n"
+            "Inseam 31\"\n"
+            "Rise 12\"\n"
+            "Leg opening 9.5\"\n"
+            "#workwear"
+        )
+
+        measurements = parser.extract_bottoms(description)
+
+        self.assertEqual(
+            measurements,
+            {
+                "waist": 34.0,
+                "inseam": 31.0,
+                "rise": 12.0,
+                "legOpening": 9.5,
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

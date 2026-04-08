@@ -671,6 +671,44 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertIsNone(match["p2p"])
         self.assertIsNone(match["length"])
 
+    def test_process_item_matches_bottoms_by_measurement_range(self):
+        item = {
+            "url": "https://www.depop.com/products/example-bottoms-measurements/",
+            "image": "https://example.com/image.jpg",
+            "price": "$72.00",
+            "description": (
+                "Black denim\n"
+                "Waist 34\"\n"
+                "Inseam 30.5\"\n"
+                "Rise 12\"\n"
+                "Leg opening 9.5\"\n"
+            ),
+            "seller": "seller-bottoms",
+            "ageDays": 4.0,
+        }
+
+        match = _process_item(
+            item,
+            None,
+            None,
+            0.5,
+            1.25,
+            "bottoms",
+            None,
+            {
+                "waist": {"min": 32.0, "max": 36.0},
+                "inseamRise": {"min": 42.0, "max": 44.0},
+                "legOpening": {"min": 9.5, "max": 10.5},
+            },
+        )
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match["waist"], 34.0)
+        self.assertEqual(match["inseam"], 30.5)
+        self.assertEqual(match["rise"], 12.0)
+        self.assertEqual(match["inseamRise"], 42.5)
+        self.assertEqual(match["legOpening"], 9.5)
+
     def test_process_item_matches_footwear_by_size_range(self):
         item = {
             "url": "https://www.depop.com/products/example-shoes/",

@@ -1,4 +1,4 @@
-"""Measurement parsing utilities for extracting P2P and length from listing descriptions."""
+"""Measurement parsing utilities for extracting listing measurements."""
 
 import re
 from fractions import Fraction
@@ -15,15 +15,31 @@ class MeasurementParser:
         r'(?:length|top\s*to\s*bottom|back\s*length|hps\s*to\s*hem|'
         r'collar\s*(?:[- ]?down|to\s*(?:bottom|hem)))'
     )
+    WAIST_LABELS = r'(?:waist|waistband|across\s*waist)'
+    INSEAM_LABELS = r'(?:inseam)'
+    RISE_LABELS = r'(?:front\s*rise|rise)'
+    LEG_OPENING_LABELS = r'(?:leg\s*opening|hem\s*opening|ankle\s*opening|leg\s*hem)'
     
     RE_P2P = re.compile(rf'\b{P2P_LABELS}\b[^0-9]{{0,10}}{NUM}{UNIT}', re.I)
     RE_LENGTH = re.compile(rf'\b{LENGTH_LABELS}\b[^0-9]{{0,10}}{NUM}{UNIT}', re.I)
+    RE_WAIST = re.compile(rf'\b{WAIST_LABELS}\b[^0-9]{{0,10}}{NUM}{UNIT}', re.I)
+    RE_INSEAM = re.compile(rf'\b{INSEAM_LABELS}\b[^0-9]{{0,10}}{NUM}{UNIT}', re.I)
+    RE_RISE = re.compile(rf'\b{RISE_LABELS}\b[^0-9]{{0,10}}{NUM}{UNIT}', re.I)
+    RE_LEG_OPENING = re.compile(rf'\b{LEG_OPENING_LABELS}\b[^0-9]{{0,10}}{NUM}{UNIT}', re.I)
     RE_PAIR_X = re.compile(
         r'\b'
         r'(?P<w>\d+(?:\.\d+)?)(?P<u1>\s*(?:cm|mm|in|inch|inches|["″"]))?'
         r'\s*[x×]\s*'
         r'(?P<l>\d+(?:\.\d+)?)(?P<u2>\s*(?:cm|mm|in|inch|inches|["″"]))?'
         r'\b', re.I
+    )
+    RE_BOTTOMS_PAIR = re.compile(
+        r'\b'
+        r'(?P<waist>\d+(?:\.\d+)?)(?P<u1>\s*(?:cm|mm|in|inch|inches|["″"]))?'
+        r'\s*[x×]\s*'
+        r'(?P<inseam>\d+(?:\.\d+)?)(?P<u2>\s*(?:cm|mm|in|inch|inches|["″"]))?'
+        r'\b',
+        re.I,
     )
 
     def to_inches(self, num_str: str, unit_str: str = "") -> float:
@@ -84,6 +100,51 @@ class MeasurementParser:
                     break
         
         return p2p, length
+
+    def extract_bottoms(self, text: str) -> dict[str, Optional[float]]:
+        """Extract waist, inseam, rise, and leg opening from text."""
+        t = (text or "").lower().replace("\u201d", '"').replace("\u2033", '"')
+
+        measurements = {
+            "waist": [self.to_inches(m.group("val"), m.group("unit") or "") for m in self.RE_WAIST.finditer(t)],
+            "inseam": [self.to_inches(m.group("val"), m.group("unit") or "") for m in self.RE_INSEAM.finditer(t)],
+            "rise": [self.to_inches(m.group("val"), m.group("unit") or "") for m in self.RE_RISE.finditer(t)],
+            "legOpening": [
+                self.to_inches(m.group("val"), m.group("unit") or "")
+                for m in self.RE_LEG_OPENING.finditer(t)
+            ],
+        }
+
+        for m in self.RE_BOTTOMS_PAIR.finditer(t):
+            measurements["waist"].append(self.to_inches(m.group("waist"), m.group("u1") or ""))
+            measurements["inseam"].append(self.to_inches(m.group("inseam"), m.group("u2") or ""))
+
+        if any(not values for values in measurements.values()):
+            fallback_patterns = {
+                "waist": re.compile(rf'\b{self.WAIST_LABELS}\b.*?{self.NUM}{self.UNIT}', re.I),
+                "inseam": re.compile(rf'\b{self.INSEAM_LABELS}\b.*?{self.NUM}{self.UNIT}', re.I),
+                "rise": re.compile(rf'\b{self.RISE_LABELS}\b.*?{self.NUM}{self.UNIT}', re.I),
+                "legOpening": re.compile(rf'\b{self.LEG_OPENING_LABELS}\b.*?{self.NUM}{self.UNIT}', re.I),
+            }
+
+            for line in t.splitlines():
+                for key, pattern in fallback_patterns.items():
+                    if measurements[key]:
+                        continue
+                    match = pattern.search(line)
+                    if not match:
+                        continue
+                    try:
+                        measurements[key].append(self.to_inches(match.group("val"), match.group("unit") or ""))
+                    except Exception:
+                        pass
+
+        return {
+            "waist": measurements["waist"][0] if measurements["waist"] else None,
+            "inseam": measurements["inseam"][0] if measurements["inseam"] else None,
+            "rise": measurements["rise"][0] if measurements["rise"] else None,
+            "legOpening": measurements["legOpening"][0] if measurements["legOpening"] else None,
+        }
 
     def within(self, val: Optional[float], target: Optional[float], tol: float) -> bool:
         """Check if a value is within tolerance of target."""
