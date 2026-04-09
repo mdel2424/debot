@@ -360,7 +360,7 @@ const parseMeasurementNumber = (value, fallback) => {
 
 const formatResultMeasurement = (value, label) => {
   const numeric = Number(value);
-  if (!Number.isFinite(numeric)) {
+  if (!Number.isFinite(numeric) || numeric <= 0) {
     return null;
   }
 
@@ -1638,25 +1638,27 @@ function App() {
                         if (result.sizeLabel) {
                           metaParts.push(`Size ${result.sizeLabel}`);
                         }
-                        const waistLabel = formatResultMeasurement(result.waist, 'waist');
-                        if (waistLabel) {
-                          metaParts.push(waistLabel);
-                        }
-                        const inseamLabel = formatResultMeasurement(result.inseam, 'inseam');
-                        if (inseamLabel) {
-                          metaParts.push(inseamLabel);
-                        }
-                        const inseamRiseLabel = formatResultMeasurement(result.inseamRise, 'inseam + rise');
-                        if (inseamRiseLabel) {
-                          metaParts.push(inseamRiseLabel);
-                        }
-                        const riseLabel = formatResultMeasurement(result.rise, 'rise');
-                        if (riseLabel) {
-                          metaParts.push(riseLabel);
-                        }
-                        const legOpeningLabel = formatResultMeasurement(result.legOpening, 'leg opening');
-                        if (legOpeningLabel) {
-                          metaParts.push(legOpeningLabel);
+                        if (activePage.id === 'bottoms') {
+                          const waistLabel = formatResultMeasurement(result.waist, 'waist');
+                          if (waistLabel) {
+                            metaParts.push(waistLabel);
+                          }
+                          const inseamLabel = formatResultMeasurement(result.inseam, 'inseam');
+                          if (inseamLabel) {
+                            metaParts.push(inseamLabel);
+                          }
+                          const inseamRiseLabel = formatResultMeasurement(result.inseamRise, 'inseam + rise');
+                          if (inseamRiseLabel) {
+                            metaParts.push(inseamRiseLabel);
+                          }
+                          const riseLabel = formatResultMeasurement(result.rise, 'rise');
+                          if (riseLabel) {
+                            metaParts.push(riseLabel);
+                          }
+                          const legOpeningLabel = formatResultMeasurement(result.legOpening, 'leg opening');
+                          if (legOpeningLabel) {
+                            metaParts.push(legOpeningLabel);
+                          }
                         }
                         if (
                           result.p2p !== undefined &&

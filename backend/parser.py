@@ -136,15 +136,10 @@ class MeasurementParser:
         if waist is None:
             return None
 
-        if waist > 22:
+        if waist >= 20:
             return waist
 
-        doubled = waist * 2
-        waist_hint = self._extract_bottoms_waist_hint(text)
-        if waist_hint is not None and abs(doubled - waist_hint) <= 1.5:
-            return doubled
-
-        return doubled if 24 <= doubled <= 50 else waist
+        return waist * 2
 
     def _split_measurement_segments(self, line: str) -> list[str]:
         """Split dense inline measurement lines into smaller fragments."""

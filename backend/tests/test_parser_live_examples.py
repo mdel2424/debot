@@ -203,6 +203,18 @@ class ParserLiveExamplesTest(unittest.TestCase):
             },
         )
 
+    def test_bottom_waist_under_twenty_always_doubles(self):
+        description = (
+            "washed denim\n"
+            "Waist 16\n"
+            "Inseam 30\n"
+        )
+
+        measurements = parser.extract_bottoms(description)
+
+        self.assertEqual(measurements["waist"], 32.0)
+        self.assertEqual(measurements["inseam"], 30.0)
+
     def test_bottom_examples_parse_expected_measurements(self):
         cases = [
             {
