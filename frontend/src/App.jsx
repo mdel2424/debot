@@ -18,6 +18,7 @@ const PAGE_FILTERS_STORAGE_KEY = 'debot.categoryFilters.v1';
 const PAGE_FILTERS_VERSION_STORAGE_KEY = 'debot.categoryFilters.defaults.v1';
 const LOW_PARSE_RETRY_RATIO = 0.9;
 const MAX_LOW_PARSE_RETRIES = 1;
+const LISTING_AGE_CUTOFF_DAYS = 80;
 
 const createProgressState = (overrides = {}) => ({
   processed: 0,
@@ -76,6 +77,9 @@ const getSellerStateLabel = (sellerRow) => {
   }
 
   if (sellerRow?.processed) {
+    if (sellerRow?.progress?.stopReason === 'age_window') {
+      return 'Age cutoff';
+    }
     return (sellerRow?.results?.length || 0) > 0 ? 'Matched' : 'Complete';
   }
 
@@ -124,6 +128,13 @@ const getSellerProgressDetails = (sellerRow, nowMs, queuePosition = null) => {
     return {
       primary: queuePosition ? `Queued • slot ${queuePosition}` : 'Queued',
       secondary: progress.message || 'Waiting for global cooldown to end.',
+    };
+  }
+
+  if (progress.phase === 'done' && progress.stopReason === 'age_window') {
+    return {
+      primary: `Stopped at ${LISTING_AGE_CUTOFF_DAYS}-day cutoff`,
+      secondary: '',
     };
   }
 
@@ -356,6 +367,22 @@ const buildSellerPageHref = (sellerUsername, page) => {
 const parseMeasurementNumber = (value, fallback) => {
   const parsed = parseFloat(value);
   return Number.isNaN(parsed) ? fallback : parsed;
+};
+
+const getResultAgeDays = (result) => {
+  const rawAge = result?.ageDays ?? result?.age_days ?? result?.daysOld;
+  const parsedAge = Number(rawAge);
+  if (Number.isFinite(parsedAge)) {
+    return parsedAge;
+  }
+
+  const rawListedAt = result?.listedAt ?? result?.listed_at ?? result?.createdAt ?? result?.created_at;
+  const listedAtMs = Date.parse(rawListedAt || '');
+  if (!Number.isFinite(listedAtMs)) {
+    return null;
+  }
+
+  return Math.max((Date.now() - listedAtMs) / 86400000, 0);
 };
 
 const formatResultMeasurement = (value, label) => {
@@ -675,6 +702,9 @@ function App() {
     return searchQueueRef.current.some((task) => task.key === searchKey);
   };
 
+  const hasActiveSellerSearch = () =>
+    Boolean(activeQueueTaskRef.current) || searchRegistryRef.current.size > 0;
+
   const resetQueuedSellerRow = (task, message = '') => {
     updateSellerRow(task.pageId, task.sellerUsername, {
       loading: false,
@@ -925,12 +955,10 @@ function App() {
       return;
     }
 
-    const pendingTasks = [...searchQueueRef.current];
-    searchQueueRef.current = [];
+    const [nextTask, ...remainingTasks] = searchQueueRef.current;
+    searchQueueRef.current = remainingTasks;
     syncQueueState();
-    pendingTasks.forEach((task) => {
-      void executeSellerSearch(task).then((outcome) => handleSearchCompletion(task, outcome));
-    });
+    void executeSellerSearch(nextTask).then((outcome) => handleSearchCompletion(nextTask, outcome));
   };
 
   const pauseSearchEntryForCooldown = (entry, message = 'Waiting for global cooldown to end.') => {
@@ -1162,7 +1190,10 @@ function App() {
       lowParseRetryCount: options.lowParseRetryCount || 0,
     };
 
-    if (activeQueueTaskRef.current) {
+    if (hasActiveSellerSearch()) {
+      const queueMessage = activeQueueTaskRef.current
+        ? 'Waiting for global cooldown to end.'
+        : 'Waiting for the active seller search to finish.';
       const queuedRowUpdate = {
         loading: false,
         processed: false,
@@ -1172,7 +1203,7 @@ function App() {
         searchId: '',
         progress: createProgressState({
           phase: 'queued',
-          message: 'Waiting for global cooldown to end.',
+          message: queueMessage,
         }),
       };
       if (task.resetResults) {
@@ -1678,11 +1709,9 @@ function App() {
                             `${result.length.toFixed ? result.length.toFixed(2) : result.length}" Len`
                           );
                         }
-                        if (
-                          typeof result.ageDays === 'number' &&
-                          !Number.isNaN(result.ageDays)
-                        ) {
-                          metaParts.push(`${Math.round(result.ageDays)}d old`);
+                        const ageDays = getResultAgeDays(result);
+                        if (ageDays !== null) {
+                          metaParts.push(`${Math.round(ageDays)}d old`);
                         }
 
                         return (

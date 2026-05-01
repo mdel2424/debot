@@ -3,6 +3,8 @@
 import re
 import time
 import json
+import os
+import threading
 import datetime as dt
 from email.utils import parsedate_to_datetime
 from typing import Optional, List, Dict, Any, Callable
@@ -13,7 +15,12 @@ from playwright.sync_api import sync_playwright, Page, BrowserContext
 # Constants
 PRICE_RX = re.compile(r"([$£€]\s?\d[\d,]*(?:\.\d{2})?)")
 RELTIME_RX = re.compile(r"\b(\d+)\s*(minute|hour|day|week|month)s?\s*ago\b", re.I)
-CREATED_AT_RX = re.compile(r'(?:\\\"|")created_at(?:\\\"|"):(?:\\\"|")([^"\\]+)(?:\\\"|")')
+CREATED_AT_RX = re.compile(
+    r'(?:\\\"|")'
+    r'(?:created_at|createdAt|datePublished|dateCreated|published_at|publishedAt)'
+    r'(?:\\\"|")\s*:\s*(?:\\\"|")([^"\\]+)(?:\\\"|")',
+    re.I,
+)
 SOLD_COUNT_RX = re.compile(r"(\d[\d,]*)\s*sold\b", re.I)
 BROWSE_URL = "https://www.depop.com/ca/category/mens/tops/?sort=newlyListed"
 SIZE_LINE_RX = re.compile(r"^\s*size(?:\s*[:\-])?\s+(.+?)\s*$", re.I)
@@ -58,8 +65,38 @@ RATE_LIMIT_CHALLENGE_SIGNALS = (
     "security check",
     "please enable cookies",
 )
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+BLOCKED_URL_SIGNALS = (
+    "google-analytics.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "facebook.com/tr",
+    "connect.facebook.net",
+    "hotjar.com",
+    "segment.io",
+    "segment.com",
+    "amplitude.com",
+    "mixpanel.com",
+    "fullstory.com",
+    "datadoghq.com",
+    "newrelic.com",
+)
 CancelCheck = Optional[Callable[[], bool]]
 _PENDING_LOG_COUNTS: Dict[str, int] = {"login_modal_escape": 0}
+_NAVIGATION_LOCK = threading.Lock()
+_LAST_NAVIGATION_STARTED_AT = 0.0
+
+
+def _read_float_env(name: str, default: float) -> float:
+    """Read a non-negative float environment value with a safe fallback."""
+    try:
+        value = float(os.environ.get(name, default))
+        return value if value >= 0 else default
+    except Exception:
+        return default
+
+
+MIN_NAV_INTERVAL_SECONDS = _read_float_env("DEBOT_MIN_NAV_INTERVAL_SECONDS", 3.0)
 
 
 class SearchCancelled(Exception):
@@ -119,6 +156,55 @@ def sleep_with_cancel(
         time.sleep(chunk)
         remaining -= chunk
     raise_if_cancelled(should_cancel)
+
+
+def guarded_goto(page: Page, url: str, *, wait_until: str = "domcontentloaded", timeout: int = 60_000):
+    """Serialize Playwright navigations and space their start times."""
+    global _LAST_NAVIGATION_STARTED_AT
+
+    with _NAVIGATION_LOCK:
+        interval = max(float(MIN_NAV_INTERVAL_SECONDS or 0), 0.0)
+        now = time.monotonic()
+        delay = interval - (now - _LAST_NAVIGATION_STARTED_AT)
+        if delay > 0:
+            time.sleep(delay)
+        _LAST_NAVIGATION_STARTED_AT = time.monotonic()
+
+    return page.goto(url, wait_until=wait_until, timeout=timeout)
+
+
+def should_block_request(request: Any) -> bool:
+    """Return whether a Playwright request should be aborted to keep pages light."""
+    try:
+        resource_type = str(getattr(request, "resource_type", "") or "").lower()
+        if resource_type in BLOCKED_RESOURCE_TYPES:
+            return True
+    except Exception:
+        pass
+
+    try:
+        url = str(getattr(request, "url", "") or "").lower()
+    except Exception:
+        url = ""
+
+    return any(signal in url for signal in BLOCKED_URL_SIGNALS)
+
+
+def install_resource_blocking(ctx: BrowserContext) -> None:
+    """Install a best-effort route that blocks heavy assets and trackers."""
+    def handle_route(route):
+        try:
+            if should_block_request(route.request):
+                route.abort()
+                return
+            route.continue_()
+        except Exception:
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
+    ctx.route("**/*", handle_route)
 
 
 def extract_rate_limit_message(
@@ -273,13 +359,19 @@ def age_days_from(ts_val: dt.datetime) -> float:
 def parse_relative_time(text: str) -> Optional[dt.datetime]:
     """Convert relative phrases like '3 hours ago' to UTC datetime."""
     try:
-        m = RELTIME_RX.search(text or "")
+        clean = text or ""
+        now = dt.datetime.now(dt.timezone.utc)
+        if re.search(r"\b(?:listed|posted|published)\s+today\b", clean, re.I):
+            return now
+        if re.search(r"\b(?:listed|posted|published)\s+yesterday\b", clean, re.I):
+            return now - dt.timedelta(days=1)
+
+        m = RELTIME_RX.search(clean)
         if not m:
             return None
         qty = int(m.group(1))
         unit = m.group(2).lower()
-        now = dt.datetime.now(dt.timezone.utc)
-        
+
         deltas = {
             "minute": dt.timedelta(minutes=qty),
             "hour": dt.timedelta(hours=qty),
@@ -312,6 +404,19 @@ def extract_created_at_from_html(html: str) -> Optional[str]:
     """Extract a created_at timestamp from page hydration HTML."""
     m = CREATED_AT_RX.search(html or "")
     return m.group(1) if m else None
+
+
+def extract_created_at_from_json_ld(payload: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Extract common publish timestamp keys from product JSON-LD."""
+    if not isinstance(payload, dict):
+        return None
+
+    for key in ("datePublished", "dateCreated", "createdAt", "created_at", "publishedAt", "published_at"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+
+    return None
 
 
 def extract_seller_username_from_href(href: Optional[str]) -> Optional[str]:
@@ -723,7 +828,7 @@ def parse_listing(
     """Parse a single listing page and extract item details."""
     try:
         raise_if_cancelled(should_cancel)
-        response = page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        response = guarded_goto(page, url, wait_until="domcontentloaded", timeout=60_000)
         raise_if_cancelled(should_cancel)
         accept_cookies(page)
         try:
@@ -863,6 +968,19 @@ def parse_listing(
         except Exception:
             pass
 
+        if age_days is None:
+            rel_dt = parse_relative_time(body_text)
+            if rel_dt:
+                age_days = age_days_from(rel_dt)
+                listed_at_iso = rel_dt.isoformat()
+
+        if listed_at_iso is None:
+            created_at = extract_created_at_from_json_ld(product_json_ld)
+            parsed_dt = parse_iso_datetime(created_at or "")
+            if parsed_dt:
+                listed_at_iso = parsed_dt.isoformat()
+                age_days = age_days_from(parsed_dt)
+
         if listed_at_iso is None:
             if not page_html:
                 page_html = page.content()
@@ -871,6 +989,12 @@ def parse_listing(
             if parsed_dt:
                 listed_at_iso = parsed_dt.isoformat()
                 age_days = age_days_from(parsed_dt)
+
+        if age_days is None and page_html:
+            rel_dt = parse_relative_time(page_html)
+            if rel_dt:
+                age_days = age_days_from(rel_dt)
+                listed_at_iso = rel_dt.isoformat()
 
         if not any([desc, price_text, image_url, seller_name]):
             check_page_for_rate_limit(
@@ -911,6 +1035,10 @@ def create_browser_context(pw, headless: bool = True, slowmo: int = 0) -> tuple:
         locale="en-US",
         timezone_id="America/New_York",
     )
+    try:
+        install_resource_blocking(ctx)
+    except Exception as exc:
+        log_debug(f"[browser] Failed to install resource blocking: {exc}")
     return browser, ctx
 
 
@@ -922,7 +1050,7 @@ def get_following_list(page: Page, username: str) -> List[str]:
     profile_url = f"https://www.depop.com/{username.strip().lstrip('@').strip('/')}/"
     log_debug(f"[following] Navigating to {profile_url}")
     
-    page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
+    guarded_goto(page, profile_url, wait_until="domcontentloaded", timeout=60000)
     accept_cookies(page)
     page.wait_for_load_state("networkidle", timeout=60000)
     

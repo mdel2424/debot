@@ -31,6 +31,7 @@ from scraper import (
     extract_retry_after_seconds,
     create_browser_context,
     get_following_list,
+    guarded_goto,
     log_debug,
     RateLimitError,
     SearchCancelled,
@@ -62,7 +63,7 @@ DEFAULT_LENGTH_TOL = 1.25
 RATE_LIMIT_RETRY_DELAYS = (60, 180, 600)
 TRANSIENT_NAVIGATION_RETRY_DELAYS = (1, 2, 4)
 BROWSE_ALL_STALLED_BATCHES = 3
-MAX_LISTING_AGE_DAYS = 90
+MAX_LISTING_AGE_DAYS = 80
 RECENT_RATE_LIMIT_PACING_WINDOW_SECONDS = 180
 RECENT_RATE_LIMIT_JITTER_RANGE_SECONDS = (1.25, 3.0)
 MEASUREMENT_CATEGORIES = {"tops", "coats-jackets"}
@@ -317,7 +318,7 @@ def _load_page_with_retries(
         page = get_page()
         raise_if_cancelled(should_cancel)
         _sleep_request_jitter(should_cancel)
-        response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        response = guarded_goto(page, url, wait_until="domcontentloaded", timeout=60000)
         raise_if_cancelled(should_cancel)
         accept_cookies(page)
         try:
@@ -859,7 +860,6 @@ def _search_seller(ctx, page, seller, groups, gender,
                 if _listing_exceeds_age_window(item):
                     age_days = float(item.get("ageDays"))
                     age_window_hit = True
-                    total -= max(len(links) - idx - 1, 0)
                     log_debug(
                         f"[stream] stopping @{seller} group={group} at {age_days:.1f}d "
                         f"(>{MAX_LISTING_AGE_DAYS}d window)"

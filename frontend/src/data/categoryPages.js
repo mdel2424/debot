@@ -1,7 +1,7 @@
 const MEASUREMENT_DEFAULTS = Object.freeze({
-  first: '21.5',
-  second: '27.25',
-  firstTolerance: '0.5',
+  first: '21',
+  second: '27',
+  firstTolerance: '0.75',
   secondTolerance: '1',
 });
 
