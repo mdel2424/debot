@@ -11,6 +11,7 @@ if str(BACKEND_DIR) not in sys.path:
 DEPENDENCY_IMPORT_ERROR = None
 
 try:
+    import main  # noqa: E402
     from main import (  # noqa: E402
         _browse_all,
         _error_payload_for_exception,
@@ -49,15 +50,42 @@ class FakeContext:
         return page
 
 
+class FakeParallelParser:
+    def __init__(self):
+        self.batches = []
+        self.closed = False
+
+    def map_ordered(self, links):
+        self.batches.append(list(links))
+        for url in links:
+            yield url, {"seller": "parallel-seller", "url": url}
+
+    def close(self):
+        self.closed = True
+
+
 @unittest.skipIf(
     DEPENDENCY_IMPORT_ERROR is not None,
     f"Stream helper tests require backend dependencies: {DEPENDENCY_IMPORT_ERROR}",
 )
 class StreamHelpersTest(unittest.TestCase):
     def setUp(self):
+        with main.RATE_LIMIT_STATE_LOCK:
+            self._previous_rate_limit_state = (main.RATE_LIMIT_BLOCKED_UNTIL_TS, main.RECENT_RATE_LIMIT_UNTIL_TS)
+            main.RATE_LIMIT_BLOCKED_UNTIL_TS = 0.0
+            main.RECENT_RATE_LIMIT_UNTIL_TS = 0.0
+        self.addCleanup(self._restore_rate_limit_state)
+
         self.jitter_patcher = patch("main._sleep_request_jitter")
-        self.jitter_patcher.start()
+        self.request_jitter_mock = self.jitter_patcher.start()
         self.addCleanup(self.jitter_patcher.stop)
+        self.nav_pacing_patcher = patch("main.mark_navigation_pacing")
+        self.mark_navigation_pacing_mock = self.nav_pacing_patcher.start()
+        self.addCleanup(self.nav_pacing_patcher.stop)
+
+    def _restore_rate_limit_state(self):
+        with main.RATE_LIMIT_STATE_LOCK:
+            main.RATE_LIMIT_BLOCKED_UNTIL_TS, main.RECENT_RATE_LIMIT_UNTIL_TS = self._previous_rate_limit_state
 
     @staticmethod
     def _decode_events(events):
@@ -171,6 +199,77 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(event["type"], "error")
         self.assertEqual(event["code"], "rate_limited")
         self.assertEqual(event["searchId"], "search-123")
+
+    def test_recent_rate_limit_enables_temporary_navigation_pacing(self):
+        with patch("main.time.time", return_value=1_000.0):
+            main._mark_recent_rate_limit(60)
+
+        self.assertEqual(main.RATE_LIMIT_BLOCKED_UNTIL_TS, 1_060.0)
+        self.assertEqual(main.RECENT_RATE_LIMIT_UNTIL_TS, 1_120.0)
+        self.mark_navigation_pacing_mock.assert_called_once_with(120.0)
+
+    def test_rate_limit_cooldown_waits_for_shared_block_window(self):
+        should_cancel = lambda: False
+        with main.RATE_LIMIT_STATE_LOCK:
+            main.RATE_LIMIT_BLOCKED_UNTIL_TS = 1_060.0
+
+        with (
+            patch("main.time.time", side_effect=[1_000.0, 1_060.0]),
+            patch("main.sleep_with_cancel") as sleep_mock,
+        ):
+            main._wait_for_rate_limit_cooldown(should_cancel)
+
+        sleep_mock.assert_called_once_with(60.0, should_cancel)
+
+    def test_listing_workers_fall_back_to_one_during_rate_limit_recovery(self):
+        with main.RATE_LIMIT_STATE_LOCK:
+            main.RECENT_RATE_LIMIT_UNTIL_TS = 1_060.0
+
+        with patch("main.time.time", return_value=1_000.0):
+            self.assertEqual(main._listing_parse_worker_count(4), 1)
+        with patch("main.time.time", return_value=1_061.0):
+            self.assertEqual(main._listing_parse_worker_count(4), 4)
+
+    def test_cached_listing_bypasses_network_cooldown(self):
+        should_cancel = lambda: False
+        cached_item = {"url": "cached"}
+
+        with (
+            patch("main.get_cached_listing", return_value=cached_item),
+            patch("main.parse_listing") as parse_mock,
+        ):
+            result = main._parse_listing_with_request_pacing(
+                object(),
+                "cached",
+                should_cancel,
+            )
+
+        self.assertIs(result, cached_item)
+        self.request_jitter_mock.assert_not_called()
+        parse_mock.assert_not_called()
+
+    def test_uncached_listing_uses_request_pacing(self):
+        should_cancel = lambda: False
+        parsed_item = {"url": "uncached"}
+        page = object()
+
+        with (
+            patch("main.get_cached_listing", return_value=None),
+            patch("main.parse_listing", return_value=parsed_item) as parse_mock,
+        ):
+            result = main._parse_listing_with_request_pacing(
+                page,
+                "uncached",
+                should_cancel,
+            )
+
+        self.assertIs(result, parsed_item)
+        self.request_jitter_mock.assert_called_once_with(should_cancel)
+        parse_mock.assert_called_once_with(
+            page,
+            "uncached",
+            should_cancel=should_cancel,
+        )
 
     def test_browse_all_reuses_single_item_page(self):
         ctx = FakeContext()
@@ -379,8 +478,54 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(progress_events[-1]['processed'], 3)
         self.assertEqual(progress_events[-1]['total'], 3)
         self.assertEqual(load_mock.call_count, 2)
-        self.assertTrue(all(call.kwargs.get('aggressive_end_scroll') is False for call in collect_mock.call_args_list))
+        self.assertTrue(all(call.kwargs.get('aggressive_end_scroll') is True for call in collect_mock.call_args_list))
         self.assertEqual(decoded[-1]['stopReason'], 'completed')
+
+    def test_search_seller_uses_parallel_parser_when_requested(self):
+        ctx = FakeContext()
+        page = FakePage()
+        parser_pool = FakeParallelParser()
+
+        with (
+            patch("builtins.print"),
+            patch("main._load_page_with_retries"),
+            patch("main.extract_seller_sold_count", return_value=88),
+            patch("main.remove_sold_sections"),
+            patch("main.collect_listing_links", return_value=["one", "two", "three"]),
+            patch("main._start_parallel_listing_parser", return_value=parser_pool) as start_pool,
+            patch("main.parse_listing") as parse_mock,
+            patch("main._process_item", side_effect=lambda item, *args: dict(item)),
+        ):
+            events = list(
+                _search_seller(
+                    ctx,
+                    page,
+                    "parallel-seller",
+                    ["tops"],
+                    "male",
+                    21.5,
+                    27.25,
+                    0.5,
+                    1,
+                    max_items=10,
+                    max_links=3,
+                    max_scrolls=1,
+                    search_id="parallel-search",
+                    parse_workers=3,
+                )
+            )
+
+        decoded = self._decode_events(events)
+        match_urls = [
+            event["item"]["url"]
+            for event in decoded
+            if event["type"] == "match"
+        ]
+        self.assertEqual(match_urls, ["one", "two", "three"])
+        self.assertEqual(parser_pool.batches, [["one", "two", "three"]])
+        self.assertTrue(parser_pool.closed)
+        start_pool.assert_called_once()
+        parse_mock.assert_not_called()
 
     def test_search_seller_collect_listing_rate_limit_emits_cooldown_and_recovers(self):
         ctx = FakeContext()

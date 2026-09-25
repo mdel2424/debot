@@ -91,6 +91,19 @@ class LiveDepopSmokeTest(unittest.TestCase):
         self.assertTrue(item.get("price"))
         self.assertTrue(item.get("seller"))
 
+    def test_live_seller_page_collects_beyond_initial_24_with_one_requested_scroll(self):
+        self._prepare_page(build_seller_url("heavyvintage"))
+
+        links = collect_listing_links(
+            self.page,
+            max_scrolls=1,
+            per_scroll_wait_ms=1200,
+            max_links=72,
+            aggressive_end_scroll=True,
+        )
+
+        self.assertEqual(len(links), 72)
+
     def test_live_seller_page_exposes_sold_count(self):
         self._prepare_page(build_seller_url("heavyvintage"))
 

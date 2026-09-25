@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ if str(BACKEND_DIR) not in sys.path:
 DEPENDENCY_IMPORT_ERROR = None
 
 try:
+    import scraper  # noqa: E402
     from scraper import (  # noqa: E402
         LOGIN_MODAL_MAX_ATTEMPTS,
         LOGIN_MODAL_WAIT_MS,
@@ -18,13 +20,16 @@ try:
         SearchCancelled,
         collect_listing_links,
         dismiss_login_modal,
+        extract_captured_shop_product_hrefs,
         extract_created_at_from_html,
         extract_rate_limit_message,
         extract_seller_sold_count_from_text,
         extract_seller_username_from_href,
         extract_size_label_from_text,
         flush_debug_logs,
+        install_shop_products_capture,
         log_debug,
+        normalize_product_listing_href,
         parse_listing,
     )
 except Exception as exc:  # pragma: no cover - protects VS Code discovery on wrong interpreter
@@ -76,6 +81,7 @@ class FakeCollectPage:
         self.url = "https://www.depop.com/ca/category/mens/tops/"
         self._href_sequences = href_sequences
         self._eval_calls = 0
+        self.captured_shop_pages = []
         self.scroll_amounts = []
         self.scroll_to_bottom_calls = 0
         self.waits = []
@@ -87,6 +93,8 @@ class FakeCollectPage:
         return list(self._href_sequences[idx])
 
     def evaluate(self, script, arg=None):
+        if "__debotShopProductPages" in script:
+            return list(self.captured_shop_pages)
         if "window.innerHeight" in script:
             return 1000
         if "window.scrollBy" in script:
@@ -105,13 +113,72 @@ class FakeCollectPage:
         return "Active listings"
 
     def locator(self, selector):
-        count = 1 if selector == 'a[href^="/products/"]' else 0
+        count = 1 if selector == 'a[href*="/products/"]' else 0
         return FakeLocator(count=count)
+
+
+class FakeCapturePage:
+    def __init__(self):
+        self.url = "https://www.depop.com/heavyvintage/"
+        self.handlers = {}
+        self.init_scripts = []
+
+    def on(self, event, handler):
+        self.handlers[event] = handler
+
+    def add_init_script(self, script):
+        self.init_scripts.append(script)
+
+    def evaluate(self, script, arg=None):
+        return []
+
+
+class FakeProductApiResponse:
+    def __init__(self, url, status, text):
+        self.url = url
+        self.status = status
+        self._text = text
+
+    def text(self):
+        return self._text
 
 
 class FakeResponse:
     def __init__(self, status):
         self.status = status
+
+
+class FakeGotoPage:
+    def __init__(self):
+        self.gotos = []
+
+    def goto(self, url, wait_until=None, timeout=None):
+        self.gotos.append((url, wait_until, timeout))
+        return FakeResponse(200)
+
+
+class FakeFastListingPage:
+    def __init__(self):
+        self.wait_functions = []
+        self.gotos = []
+
+    def goto(self, url, wait_until=None, timeout=None):
+        self.gotos.append((url, wait_until, timeout))
+        return FakeResponse(200)
+
+    def wait_for_function(self, expression, timeout=None):
+        self.wait_functions.append((expression, timeout))
+
+    def evaluate(self, expression):
+        return {
+            "description": "Vintage tee\nPit to pit 21\nLength 28",
+            "price": "$22.00",
+            "image": "https://media-photos.depop.com/example/P0.jpg",
+            "seller": "seller_one",
+            "bodyText": "Condition\nGood\nSize M",
+            "datetime": "2026-03-20T21:16:13.033766Z",
+            "timeText": "",
+        }
 
 
 class FakeRateLimitedListingPage:
@@ -159,6 +226,10 @@ class FakeNoModalPage:
     f"Scraper helper tests require backend dependencies: {DEPENDENCY_IMPORT_ERROR}",
 )
 class ScraperHelpersTest(unittest.TestCase):
+    def setUp(self):
+        scraper._clear_listing_cache()
+        self.addCleanup(scraper._clear_listing_cache)
+
     def test_extract_created_at_from_hydration_html(self):
         html = (
             '<script>self.__next_f.push([1,"...'
@@ -176,6 +247,25 @@ class ScraperHelpersTest(unittest.TestCase):
             "hycen88",
         )
         self.assertIsNone(extract_seller_username_from_href("/products/h1cen88-dime-mtl-sun-faded-teal-crewneck-f51d/"))
+
+    def test_normalize_product_listing_href_accepts_current_product_variants(self):
+        origin = "https://www.depop.com"
+
+        self.assertEqual(
+            normalize_product_listing_href("/products/item-one/", origin),
+            "https://www.depop.com/products/item-one/",
+        )
+        self.assertEqual(
+            normalize_product_listing_href("/ca/products/item-two/", origin),
+            "https://www.depop.com/ca/products/item-two/",
+        )
+        self.assertEqual(
+            normalize_product_listing_href("https://www.depop.com/products/item-three/", origin),
+            "https://www.depop.com/products/item-three/",
+        )
+        self.assertIsNone(normalize_product_listing_href("/seller/?productId=123", origin))
+        self.assertIsNone(normalize_product_listing_href("/products/create/", origin))
+        self.assertIsNone(normalize_product_listing_href("https://example.com/products/item/", origin))
 
     def test_extract_seller_sold_count_from_text(self):
         self.assertEqual(extract_seller_sold_count_from_text("249 sold · Active today"), 249)
@@ -267,6 +357,106 @@ class ScraperHelpersTest(unittest.TestCase):
         self.assertEqual(page.scroll_to_bottom_calls, 3)
         self.assertEqual(page.waits, [2500, 2500, 2500])
 
+    def test_aggressive_collection_does_not_treat_one_scroll_as_a_24_link_cap(self):
+        page = FakeCollectPage([
+            [f"/products/item-{i}/" for i in range(1, 25)],
+            [f"/products/item-{i}/" for i in range(1, 49)],
+            [f"/products/item-{i}/" for i in range(1, 73)],
+        ])
+
+        links = collect_listing_links(
+            page,
+            max_scrolls=1,
+            per_scroll_wait_ms=25,
+            max_links=72,
+            aggressive_end_scroll=True,
+        )
+
+        self.assertEqual(len(links), 72)
+        self.assertEqual(page.keyboard.presses, ["End", "End"])
+
+    def test_browser_context_hides_webdriver_before_depop_scripts_run(self):
+        pw = mock.Mock()
+        browser = pw.firefox.launch.return_value
+        ctx = browser.new_context.return_value
+
+        with mock.patch.object(scraper, "install_resource_blocking"):
+            result = scraper.create_browser_context(pw, headless=True, slowmo=0)
+
+        self.assertEqual(result, (browser, ctx))
+        kwargs = browser.new_context.call_args.kwargs
+        self.assertNotIn("user_agent", kwargs)
+        ctx.add_init_script.assert_called_once_with(scraper.BROWSER_INIT_SCRIPT)
+        self.assertIn("webdriver", ctx.add_init_script.call_args.args[0])
+
+    def test_extract_captured_shop_product_hrefs_uses_seller_api_products(self):
+        page = FakeCollectPage([[]])
+        page.captured_shop_pages = [
+            {
+                "status": 200,
+                "text": json.dumps({
+                    "products": [
+                        {"slug": "api-active-one", "sold": False, "status": "ONSALE"},
+                        {"slug": "api-sold", "sold": True, "status": "SOLD"},
+                        {"slug": "api-removed", "status": "REMOVED"},
+                        {"slug": "api-active-two"},
+                    ]
+                }),
+            },
+            {"status": 429, "text": json.dumps({"products": [{"slug": "blocked"}]})},
+        ]
+
+        self.assertEqual(
+            extract_captured_shop_product_hrefs(page),
+            ["/products/api-active-one/", "/products/api-active-two/"],
+        )
+
+    def test_collect_listing_links_merges_captured_api_products_with_dom_links(self):
+        page = FakeCollectPage([["/products/dom-one/"]])
+        page.captured_shop_pages = [
+            {
+                "status": 200,
+                "text": json.dumps({
+                    "products": [
+                        {"slug": "api-one", "sold": False},
+                        {"slug": "api-two", "sold": False},
+                    ]
+                }),
+            }
+        ]
+
+        links = collect_listing_links(page, max_scrolls=0, per_scroll_wait_ms=25)
+
+        self.assertEqual(
+            links,
+            [
+                "https://www.depop.com/products/api-one/",
+                "https://www.depop.com/products/api-two/",
+                "https://www.depop.com/products/dom-one/",
+            ],
+        )
+
+    def test_install_shop_products_capture_records_playwright_response_bodies(self):
+        page = FakeCapturePage()
+        api_response = FakeProductApiResponse(
+            "https://webapi.depop.com/presentation/api/v1/shops/123/products/?limit=24",
+            200,
+            json.dumps({"products": [{"slug": "response-captured", "sold": False}]}),
+        )
+
+        try:
+            install_shop_products_capture(page)
+            page.handlers["response"](api_response)
+
+            self.assertEqual(
+                extract_captured_shop_product_hrefs(page),
+                ["/products/response-captured/"],
+            )
+            self.assertEqual(len(page.init_scripts), 1)
+        finally:
+            scraper._CAPTURED_SHOP_PRODUCT_PAGES.pop(id(page), None)
+            scraper._SHOP_PRODUCTS_CAPTURE_INSTALLED_PAGE_IDS.discard(id(page))
+
     def test_collect_listing_links_raises_when_cancelled(self):
         page = FakeCollectPage([["/products/a/"]] * 6)
         checks = {"count": 0}
@@ -281,6 +471,87 @@ class ScraperHelpersTest(unittest.TestCase):
     def test_parse_listing_raises_rate_limit_error(self):
         with self.assertRaises(RateLimitError):
             parse_listing(FakeRateLimitedListingPage(), "https://www.depop.com/products/example/")
+
+    def test_parse_listing_uses_fast_dom_path_without_cookie_or_modal_waits(self):
+        page = FakeFastListingPage()
+
+        with (
+            mock.patch("scraper.accept_cookies") as accept_mock,
+            mock.patch("scraper.dismiss_login_modal") as dismiss_mock,
+        ):
+            item = parse_listing(page, "https://www.depop.com/products/example-fast/")
+
+        accept_mock.assert_not_called()
+        dismiss_mock.assert_not_called()
+        self.assertEqual(page.wait_functions[0][1], scraper.FAST_LISTING_READY_TIMEOUT_MS)
+        self.assertEqual(item["description"], "Vintage tee\nPit to pit 21\nLength 28")
+        self.assertEqual(item["price"], "$22.00")
+        self.assertEqual(item["seller"], "seller_one")
+        self.assertEqual(item["sizeLabel"], "M")
+        self.assertIsNotNone(item["ageDays"])
+
+    def test_parse_listing_reuses_recent_cached_result_without_navigation(self):
+        url = "https://www.depop.com/products/example-cached/"
+
+        with (
+            mock.patch.object(scraper, "LISTING_CACHE_TTL_SECONDS", 300.0),
+            mock.patch.object(scraper, "LISTING_CACHE_MAX_ITEMS", 10),
+        ):
+            item = parse_listing(FakeFastListingPage(), url)
+            item["seller"] = "mutated-after-parse"
+
+            with mock.patch("scraper.guarded_goto") as goto_mock:
+                cached_item = parse_listing(mock.Mock(), url)
+
+        goto_mock.assert_not_called()
+        self.assertEqual(cached_item["url"], url)
+        self.assertEqual(cached_item["seller"], "seller_one")
+        self.assertIsNot(cached_item, item)
+
+    def test_guarded_goto_has_no_default_navigation_delay(self):
+        page = FakeGotoPage()
+
+        with (
+            mock.patch.object(scraper, "MIN_NAV_INTERVAL_SECONDS", 0.0),
+            mock.patch.object(scraper, "RATE_LIMIT_NAV_INTERVAL_SECONDS", 1.0),
+            mock.patch.object(scraper, "_LAST_NAVIGATION_STARTED_AT", 0.0),
+            mock.patch.object(scraper, "_NAVIGATION_PACING_UNTIL_TS", 0.0),
+            mock.patch("scraper.sleep_with_cancel") as sleep_mock,
+        ):
+            scraper.guarded_goto(page, "https://www.depop.com/products/one/")
+            scraper.guarded_goto(page, "https://www.depop.com/products/two/")
+
+        sleep_mock.assert_not_called()
+        self.assertEqual(
+            page.gotos,
+            [
+                ("https://www.depop.com/products/one/", "domcontentloaded", 60_000),
+                ("https://www.depop.com/products/two/", "domcontentloaded", 60_000),
+            ],
+        )
+
+    def test_guarded_goto_uses_temporary_rate_limit_navigation_pacing(self):
+        page = FakeGotoPage()
+        cancel_check = lambda: False
+
+        with (
+            mock.patch.object(scraper, "MIN_NAV_INTERVAL_SECONDS", 0.0),
+            mock.patch.object(scraper, "RATE_LIMIT_NAV_INTERVAL_SECONDS", 1.0),
+            mock.patch.object(scraper, "_LAST_NAVIGATION_STARTED_AT", 100.0),
+            mock.patch.object(scraper, "_NAVIGATION_PACING_UNTIL_TS", 200.0),
+            mock.patch("scraper.time.monotonic", return_value=100.25),
+            mock.patch("scraper.sleep_with_cancel") as sleep_mock,
+        ):
+            scraper.guarded_goto(
+                page,
+                "https://www.depop.com/products/paced/",
+                should_cancel=cancel_check,
+            )
+
+        sleep_mock.assert_called_once()
+        delay, should_cancel = sleep_mock.call_args.args
+        self.assertAlmostEqual(delay, 0.75)
+        self.assertIs(should_cancel, cancel_check)
 
     def test_dismiss_login_modal_exits_quickly_when_absent(self):
         page = FakeNoModalPage()

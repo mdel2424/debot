@@ -4,11 +4,13 @@ import sys
 import asyncio
 import datetime as dt
 import json
+import os
 import queue
 import random
 import re
 import threading
 import time
+import uuid
 from typing import Dict, Any, Optional, Callable
 
 from fastapi import FastAPI, Request, Body
@@ -17,6 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from playwright.sync_api import sync_playwright
 
 from parser import parser
+from listing_pool import ParallelListingParser
+from search_jobs import SearchJob, SearchJobRegistry
 from scraper import (
     build_seller_url,
     build_browse_url,
@@ -24,6 +28,7 @@ from scraper import (
     check_page_for_rate_limit,
     dismiss_login_modal,
     flush_debug_logs,
+    get_cached_listing,
     remove_sold_sections,
     collect_listing_links,
     parse_listing,
@@ -32,6 +37,8 @@ from scraper import (
     create_browser_context,
     get_following_list,
     guarded_goto,
+    install_shop_products_capture,
+    mark_navigation_pacing,
     log_debug,
     RateLimitError,
     SearchCancelled,
@@ -56,8 +63,25 @@ app.add_middleware(
     allow_credentials=False,
 )
 
-# In-memory cancellation flags
+# In-memory cancellation flags and persistent search jobs
 CANCEL_FLAGS: Dict[str, bool] = {}
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        return max(int(os.environ.get(name, default)), 1)
+    except (TypeError, ValueError):
+        return default
+
+
+SEARCH_JOBS = SearchJobRegistry(
+    max_jobs=_positive_int_env("DEBOT_SEARCH_JOB_HISTORY", 500),
+)
+SEARCH_JOB_SLOTS = threading.Semaphore(
+    _positive_int_env("DEBOT_CONCURRENT_SEARCH_JOBS", 1),
+)
+SEARCH_STREAM_POLL_SECONDS = 0.05
+SEARCH_STREAM_HEARTBEAT_SECONDS = 15.0
 DEFAULT_P2P_TOL = 0.5
 DEFAULT_LENGTH_TOL = 1.25
 RATE_LIMIT_RETRY_DELAYS = (60, 180, 600)
@@ -69,6 +93,11 @@ RECENT_RATE_LIMIT_JITTER_RANGE_SECONDS = (1.25, 3.0)
 MEASUREMENT_CATEGORIES = {"tops", "coats-jackets"}
 SUPPORTED_CATEGORIES = MEASUREMENT_CATEGORIES | {"bottoms", "footwear", "accessories"}
 RECENT_RATE_LIMIT_UNTIL_TS = 0.0
+RATE_LIMIT_BLOCKED_UNTIL_TS = 0.0
+RATE_LIMIT_STATE_LOCK = threading.Lock()
+DEFAULT_LISTING_PARSE_WORKERS = 4
+MAX_LISTING_PARSE_WORKERS = 6
+LISTING_PARSE_PREFETCH_PER_WORKER = 1
 
 # SSE helpers
 SSE_PREAMBLE = (":" + (" " * 2048) + "\n").encode("utf-8")
@@ -79,6 +108,38 @@ def _sse(data: Dict[str, Any]) -> bytes:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
+async def _stream_search_job(request: Request, job: SearchJob):
+    """Replay a job and detach cleanly if this subscriber disconnects."""
+    yield SSE_PREAMBLE
+    next_event_index = 0
+    last_heartbeat = time.monotonic()
+
+    while True:
+        events, complete = job.read_from(next_event_index)
+        if events:
+            for event in events:
+                next_event_index += 1
+                yield event
+            last_heartbeat = time.monotonic()
+            continue
+
+        if complete:
+            return
+
+        try:
+            if await request.is_disconnected():
+                return
+        except Exception:
+            pass
+
+        now = time.monotonic()
+        if now - last_heartbeat >= SEARCH_STREAM_HEARTBEAT_SECONDS:
+            yield b": keep-alive\n\n"
+            last_heartbeat = now
+
+        await asyncio.sleep(SEARCH_STREAM_POLL_SECONDS)
+
+
 def _is_cancelled(search_id: str) -> bool:
     """Check if a search has been cancelled."""
     return bool(search_id and CANCEL_FLAGS.get(search_id))
@@ -87,6 +148,26 @@ def _is_cancelled(search_id: str) -> bool:
 def _cancel_check(search_id: str) -> Callable[[], bool]:
     """Build a callback that reflects the latest cancellation flag."""
     return lambda: _is_cancelled(search_id)
+
+
+def _listing_parse_worker_count(value: Any = None) -> int:
+    """Clamp listing parser concurrency to a conservative browser limit."""
+    raw_value = value
+    if raw_value in (None, ""):
+        raw_value = os.environ.get(
+            "DEBOT_PARSE_WORKERS",
+            DEFAULT_LISTING_PARSE_WORKERS,
+        )
+    try:
+        worker_count = max(1, min(int(raw_value), MAX_LISTING_PARSE_WORKERS))
+    except (TypeError, ValueError):
+        worker_count = DEFAULT_LISTING_PARSE_WORKERS
+
+    with RATE_LIMIT_STATE_LOCK:
+        recovering_from_rate_limit = time.time() < RECENT_RATE_LIMIT_UNTIL_TS
+    if recovering_from_rate_limit:
+        return 1
+    return worker_count
 
 
 def _normalize_groups(groups_value: Any) -> list[str]:
@@ -207,19 +288,63 @@ def _listing_exceeds_age_window(item: Dict[str, Any] | None, max_age_days: int =
 
 
 def _mark_recent_rate_limit(delay_seconds: int) -> None:
-    """Extend the pacing window after a detected rate limit."""
-    global RECENT_RATE_LIMIT_UNTIL_TS
-    pacing_until = time.time() + max(min(delay_seconds, RECENT_RATE_LIMIT_PACING_WINDOW_SECONDS), 0)
-    RECENT_RATE_LIMIT_UNTIL_TS = max(RECENT_RATE_LIMIT_UNTIL_TS, pacing_until)
+    """Pause all workers, then keep the parser conservative during recovery."""
+    global RATE_LIMIT_BLOCKED_UNTIL_TS, RECENT_RATE_LIMIT_UNTIL_TS
+
+    rate_limit_delay = max(float(delay_seconds or 0), 0.0)
+    pacing_window = max(min(rate_limit_delay, RECENT_RATE_LIMIT_PACING_WINDOW_SECONDS), 0)
+    now = time.time()
+    blocked_until = now + rate_limit_delay
+    recovery_until = blocked_until + pacing_window
+
+    with RATE_LIMIT_STATE_LOCK:
+        RATE_LIMIT_BLOCKED_UNTIL_TS = max(
+            RATE_LIMIT_BLOCKED_UNTIL_TS,
+            blocked_until,
+        )
+        RECENT_RATE_LIMIT_UNTIL_TS = max(
+            RECENT_RATE_LIMIT_UNTIL_TS,
+            recovery_until,
+        )
+
+    mark_navigation_pacing(rate_limit_delay + pacing_window)
+
+
+def _wait_for_rate_limit_cooldown(should_cancel: Callable[[], bool]) -> None:
+    """Wait until the process-wide rate-limit cooldown has elapsed."""
+    while True:
+        raise_if_cancelled(should_cancel)
+        with RATE_LIMIT_STATE_LOCK:
+            remaining = RATE_LIMIT_BLOCKED_UNTIL_TS - time.time()
+        if remaining <= 0:
+            return
+        sleep_with_cancel(remaining, should_cancel)
 
 
 def _sleep_request_jitter(should_cancel: Callable[[], bool], force: bool = False) -> None:
     """Slow follow-up requests slightly after a recent rate limit to reduce bursts."""
-    if not force and time.time() >= RECENT_RATE_LIMIT_UNTIL_TS:
+    _wait_for_rate_limit_cooldown(should_cancel)
+    with RATE_LIMIT_STATE_LOCK:
+        recovery_active = time.time() < RECENT_RATE_LIMIT_UNTIL_TS
+    if not force and not recovery_active:
         return
 
     delay_seconds = random.uniform(*RECENT_RATE_LIMIT_JITTER_RANGE_SECONDS)
     sleep_with_cancel(delay_seconds, should_cancel)
+
+
+def _parse_listing_with_request_pacing(
+    page,
+    url: str,
+    should_cancel: Callable[[], bool],
+) -> Optional[Dict[str, Any]]:
+    """Return cached data immediately and pace only real listing navigation."""
+    cached_item = get_cached_listing(url)
+    if cached_item is not None:
+        return cached_item
+
+    _sleep_request_jitter(should_cancel)
+    return parse_listing(page, url, should_cancel=should_cancel)
 
 
 def _rate_limit_delay_for_attempt(exc: RateLimitError, attempt_index: int) -> int:
@@ -318,7 +443,13 @@ def _load_page_with_retries(
         page = get_page()
         raise_if_cancelled(should_cancel)
         _sleep_request_jitter(should_cancel)
-        response = guarded_goto(page, url, wait_until="domcontentloaded", timeout=60000)
+        response = guarded_goto(
+            page,
+            url,
+            wait_until="domcontentloaded",
+            timeout=60000,
+            should_cancel=should_cancel,
+        )
         raise_if_cancelled(should_cancel)
         accept_cookies(page)
         try:
@@ -342,6 +473,66 @@ def _load_page_with_retries(
         on_rate_limit=on_rate_limit,
         before_retry=before_retry,
     )
+
+
+def _start_parallel_listing_parser(
+    ctx,
+    worker_count: int,
+    should_cancel: Callable[[], bool],
+    *,
+    headless: bool,
+    slowmo: int,
+    on_rate_limit: Optional[Callable[[int, int, int, Exception, str], None]] = None,
+) -> Optional[ParallelListingParser]:
+    """Start isolated Playwright workers, falling back to sequential parsing on startup errors."""
+    normalized_workers = _listing_parse_worker_count(worker_count)
+    if normalized_workers <= 1:
+        return None
+
+    try:
+        storage_state = ctx.storage_state()
+        if not isinstance(storage_state, dict):
+            storage_state = None
+    except Exception:
+        storage_state = None
+
+    def parse_job(page_getter, url, worker_should_cancel, rebuild_worker):
+        def open_listing():
+            return _parse_listing_with_request_pacing(
+                page_getter(),
+                url,
+                worker_should_cancel,
+            )
+
+        def before_retry(attempt, total_attempts, delay, exc, label):
+            del attempt, total_attempts, delay, exc, label
+            rebuild_worker()
+
+        return _run_with_rate_limit_retries(
+            open_listing,
+            worker_should_cancel,
+            "opening listing page",
+            on_rate_limit=on_rate_limit,
+            before_retry=before_retry,
+        )
+
+    parser_pool = ParallelListingParser(
+        normalized_workers,
+        parse_job,
+        should_cancel,
+        headless=headless,
+        slowmo=slowmo,
+        storage_state=storage_state,
+        prefetch_per_worker=LISTING_PARSE_PREFETCH_PER_WORKER,
+    )
+    try:
+        parser_pool.start()
+        log_debug(f"[stream] Started {normalized_workers} parallel listing parsers")
+        return parser_pool
+    except Exception as exc:
+        parser_pool.close()
+        log_debug(f"[stream] Parallel parser startup failed; using one page: {exc}")
+        return None
 
 
 def _resolve_seller_sold_count(ctx, seller_cache: Dict[str, int], seller: str,
@@ -545,20 +736,25 @@ def _process_item(item: Dict[str, Any], target_p2p: float, target_length: float,
     return _build_match_payload(item)
 
 
-@app.post("/api/search/stream")
-async def search_stream(request: Request):
-    """SSE streaming search endpoint."""
-    payload = await request.json()
+def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
+    """Start or retrieve a console-owned search job."""
+    payload = dict(payload or {})
+    search_id = str(payload.get("searchId") or uuid.uuid4().hex)
+    payload["searchId"] = search_id
+    job, job_created = SEARCH_JOBS.get_or_create(search_id, payload)
     log_debug(f"[stream] payload: {payload}")
-    
-    # Parse request
+
+    if job_created:
+        CANCEL_FLAGS[search_id] = False
+
     category = (payload.get("category") or "tops").lower()
     if category not in SUPPORTED_CATEGORIES:
-        async def empty_gen():
-            yield SSE_PREAMBLE
-            yield _sse({"type": "done"})
-        return StreamingResponse(empty_gen(), media_type="text/event-stream")
-    
+        if job_created:
+            job.publish(_sse({"type": "done", "searchId": search_id}))
+            job.finish()
+            CANCEL_FLAGS.pop(search_id, None)
+        return job
+
     ms = payload.get("measurements") or {}
     target_p2p = float(ms["first"]) if ms.get("first") is not None else None
     target_length = float(ms["second"]) if ms.get("second") is not None else None
@@ -566,32 +762,25 @@ async def search_stream(request: Request):
     length_tol = float(payload.get("lengthTolerance") or DEFAULT_LENGTH_TOL)
     size_range = _normalize_size_range(payload.get("sizeRange"))
     bottoms_measurements = _normalize_bottoms_measurements(payload.get("bottomsMeasurements"))
-    
+
     seller = (payload.get("seller") or "").strip()
     max_items = int(payload.get("maxItems") or 40)
     max_links = int(payload.get("maxLinks") or 1000)
     max_scrolls = int(payload.get("maxScrolls") or 8)
+    parse_workers = _listing_parse_worker_count(payload.get("parseWorkers"))
     headless = bool(payload.get("headless", True))
     slowmo = int(payload.get("slowmo") or 0)
     gender = payload.get("gender") or "male"
     groups = _normalize_groups(payload.get("groups") or "tops")
-    search_id = str(payload.get("searchId") or "")
-    
-    if search_id:
-        CANCEL_FLAGS[search_id] = False
 
-    result_queue = queue.Queue()
-    error_holder = [None]
-
-    def emit_stream_event(payload: Dict[str, Any]) -> None:
-        result_queue.put(("data", _sse(payload)))
+    def emit_stream_event(event_payload: Dict[str, Any]) -> None:
+        job.publish(_sse(event_payload))
 
     def run_search():
         """Synchronous search generator."""
         try:
-            yield SSE_PREAMBLE
             yield _sse({"type": "hello", "searchId": search_id or None, "ts": dt.datetime.utcnow().isoformat()})
-            
+
             with sync_playwright() as pw:
                 browser, ctx = create_browser_context(pw, headless=headless, slowmo=slowmo)
                 page = ctx.new_page()
@@ -615,7 +804,7 @@ async def search_stream(request: Request):
                     page = ctx.new_page()
                     log_debug("[stream] Rebuilt Playwright browser session after rate limit")
                     return ctx, page
-                
+
                 try:
                     try:
                         if seller:
@@ -626,6 +815,9 @@ async def search_stream(request: Request):
                                 category, size_range, bottoms_measurements,
                                 emit_event=emit_stream_event,
                                 reset_session=reset_session,
+                                parse_workers=parse_workers,
+                                headless=headless,
+                                slowmo=slowmo,
                             )
                         else:
                             yield from _browse_all(
@@ -635,13 +827,16 @@ async def search_stream(request: Request):
                                 category, size_range, bottoms_measurements,
                                 emit_event=emit_stream_event,
                                 reset_session=reset_session,
+                                parse_workers=parse_workers,
+                                headless=headless,
+                                slowmo=slowmo,
                             )
                     except SearchCancelled:
                         yield _sse({"type": "cancelled", "searchId": search_id or None})
                 finally:
                     ctx.close()
                     browser.close()
-                    
+
         except RateLimitError as e:
             log_debug(f"[stream] rate limited: {e}")
             yield _sse(_error_payload_for_exception(e, search_id))
@@ -655,57 +850,53 @@ async def search_stream(request: Request):
             if search_id and search_id in CANCEL_FLAGS:
                 del CANCEL_FLAGS[search_id]
 
-    async def async_wrapper():
-        """Run sync generator in thread and yield results async."""
-        def worker():
-            try:
-                for chunk in run_search():
-                    result_queue.put(("data", chunk))
-                result_queue.put(("done", None))
-            except Exception as e:
-                error_holder[0] = e
-                result_queue.put(("error", None))
-        
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-        
-        while True:
-            try:
-                if await request.is_disconnected():
-                    CANCEL_FLAGS[search_id] = True
-                    break
-            except Exception:
-                pass
-            
-            start = time.time()
-            while True:
-                try:
-                    msg_type, data = result_queue.get_nowait()
-                    break
-                except queue.Empty:
-                    if time.time() - start > 0.1:
-                        if not thread.is_alive():
-                            if error_holder[0]:
-                                raise error_holder[0]
-                            try:
-                                msg_type, data = result_queue.get_nowait()
-                                break
-                            except queue.Empty:
-                                return
-                        await asyncio.sleep(0.01)
-                        start = time.time()
-                    else:
-                        await asyncio.sleep(0.001)
-            
-            if msg_type == "done":
-                break
-            elif msg_type == "error" and error_holder[0]:
-                raise error_holder[0]
-            elif msg_type == "data":
-                yield data
+    def worker() -> None:
+        acquired_slot = SEARCH_JOB_SLOTS.acquire(blocking=False)
+        try:
+            if not acquired_slot:
+                job.publish(_sse({
+                    "type": "progress",
+                    "phase": "queued",
+                    "processed": 0,
+                    "total": 0,
+                    "matches": 0,
+                    "message": "Waiting for the backend search queue.",
+                    "searchId": search_id,
+                }))
+                SEARCH_JOB_SLOTS.acquire()
+                acquired_slot = True
 
+            if _is_cancelled(search_id):
+                job.publish(_sse({"type": "cancelled", "searchId": search_id}))
+            else:
+                for chunk in run_search():
+                    job.publish(chunk)
+        except Exception as exc:
+            log_debug(f"[stream] persistent job error: {exc}")
+            job.publish(_sse(_error_payload_for_exception(exc, search_id)))
+        finally:
+            if acquired_slot:
+                SEARCH_JOB_SLOTS.release()
+            CANCEL_FLAGS.pop(search_id, None)
+            job.finish()
+
+    if job_created:
+        threading.Thread(
+            target=worker,
+            name=f"debot-search-{search_id[:12]}",
+            daemon=True,
+        ).start()
+
+    return job
+
+
+@app.post("/api/search/stream")
+async def search_stream(request: Request):
+    """Attach to a persistent search, starting it when needed."""
+    payload = await request.json()
+    job = _ensure_search_job(payload)
     return StreamingResponse(
-        async_wrapper(),
+        _stream_search_job(request, job),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
@@ -716,12 +907,38 @@ async def search_stream(request: Request):
     )
 
 
+@app.post("/api/search/batch/start")
+async def start_search_batch(request: Request):
+    """Register a full search batch before the browser opens result streams."""
+    body = await request.json()
+    searches = body.get("searches") if isinstance(body, dict) else None
+    if not isinstance(searches, list):
+        return {"ok": False, "error": "searches must be a list"}
+
+    jobs = []
+    for payload in searches:
+        if not isinstance(payload, dict):
+            continue
+        job = _ensure_search_job(payload)
+        jobs.append({
+            "searchId": job.search_id,
+            "complete": job.complete,
+        })
+
+    return {
+        "ok": True,
+        "count": len(jobs),
+        "jobs": jobs,
+    }
+
+
 def _search_seller(ctx, page, seller, groups, gender,
                    target_p2p, target_length, p2p_tol, length_tol,
                    max_items, max_links, max_scrolls, search_id,
                    category="tops", size_range=None, bottoms_measurements=None,
                    emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
-                   reset_session: Optional[Callable[[], tuple[Any, Any]]] = None):
+                   reset_session: Optional[Callable[[], tuple[Any, Any]]] = None,
+                   parse_workers: int = 1, headless: bool = True, slowmo: int = 0):
     """Search a specific seller's listings."""
     should_cancel = _cancel_check(search_id)
     normalized_groups = _normalize_groups(groups)
@@ -729,6 +946,7 @@ def _search_seller(ctx, page, seller, groups, gender,
     matches = 0
     total = 0
     age_window_hit = False
+    install_shop_products_capture(page)
 
     def notify_rate_limit(attempt: int, total_attempts: int, delay: int, exc: Exception, label: str) -> None:
         if not emit_event:
@@ -754,6 +972,7 @@ def _search_seller(ctx, page, seller, groups, gender,
         nonlocal ctx, page, current_seller_page_url
         if reset_session:
             ctx, page = reset_session()
+        install_shop_products_capture(page)
         current_seller_page_url = None
 
     def emit_done(stop_reason: str = "completed") -> bytes:
@@ -820,7 +1039,7 @@ def _search_seller(ctx, page, seller, groups, gender,
                 per_scroll_wait_ms=1200,
                 max_links=current_capacity,
                 should_cancel=should_cancel,
-                aggressive_end_scroll=False,
+                aggressive_end_scroll=True,
             )
 
         links = _run_with_rate_limit_retries(
@@ -839,13 +1058,27 @@ def _search_seller(ctx, page, seller, groups, gender,
     
     yield _sse({"type": "meta", "links": total, "seller": seller, "searchId": search_id or None})
 
-    for group, links in grouped_links:
-        for idx, url in enumerate(links):
+    parser_pool = None
+    if total > 1:
+        parser_pool = _start_parallel_listing_parser(
+            ctx,
+            min(_listing_parse_worker_count(parse_workers), total),
+            should_cancel,
+            headless=headless,
+            slowmo=slowmo,
+            on_rate_limit=notify_rate_limit,
+        )
+
+    def parse_sequential(current_links):
+        for current_url in current_links:
             raise_if_cancelled(should_cancel)
 
-            def open_listing(current_url=url):
-                _sleep_request_jitter(should_cancel)
-                return parse_listing(page, current_url, should_cancel=should_cancel)
+            def open_listing(url=current_url):
+                return _parse_listing_with_request_pacing(
+                    page,
+                    url,
+                    should_cancel,
+                )
 
             item = _run_with_rate_limit_retries(
                 open_listing,
@@ -854,43 +1087,65 @@ def _search_seller(ctx, page, seller, groups, gender,
                 on_rate_limit=notify_rate_limit,
                 before_retry=rebuild_seller_page,
             )
-            processed += 1
+            yield current_url, item
 
-            if item:
-                if _listing_exceeds_age_window(item):
-                    age_days = float(item.get("ageDays"))
-                    age_window_hit = True
-                    log_debug(
-                        f"[stream] stopping @{seller} group={group} at {age_days:.1f}d "
-                        f"(>{MAX_LISTING_AGE_DAYS}d window)"
-                    )
+    try:
+        for group, links in grouped_links:
+            parsed_items = (
+                parser_pool.map_ordered(links)
+                if parser_pool is not None
+                else parse_sequential(links)
+            )
+            try:
+                for idx, (url, item) in enumerate(parsed_items):
+                    raise_if_cancelled(should_cancel)
+                    processed += 1
+
+                    if item:
+                        if _listing_exceeds_age_window(item):
+                            age_days = float(item.get("ageDays"))
+                            age_window_hit = True
+                            remaining_current_group = max(len(links) - idx - 1, 0)
+                            if remaining_current_group:
+                                total = max(total - remaining_current_group, processed)
+                            log_debug(
+                                f"[stream] stopping @{seller} group={group} at {age_days:.1f}d "
+                                f"(>{MAX_LISTING_AGE_DAYS}d window)"
+                            )
+                            yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
+                            break
+
+                        match = _process_item(
+                            item,
+                            target_p2p,
+                            target_length,
+                            p2p_tol,
+                            length_tol,
+                            category,
+                            size_range,
+                            bottoms_measurements,
+                        )
+                        if match:
+                            match["soldCount"] = seller_sold_count
+                            log_debug(
+                                f"[stream] MATCH seller=@{seller} url={match.get('url')} "
+                                f"p2p={match.get('p2p')} len={match.get('length')} size={match.get('sizeLabel')}"
+                            )
+                            yield _sse({"type": "match", "item": match, "searchId": search_id or None})
+                            matches += 1
+
+                            if matches >= max_items:
+                                yield emit_done("match_limit")
+                                return
+
                     yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
-                    break
-
-                match = _process_item(
-                    item,
-                    target_p2p,
-                    target_length,
-                    p2p_tol,
-                    length_tol,
-                    category,
-                    size_range,
-                    bottoms_measurements,
-                )
-                if match:
-                    match["soldCount"] = seller_sold_count
-                    log_debug(
-                        f"[stream] MATCH seller=@{seller} url={match.get('url')} "
-                        f"p2p={match.get('p2p')} len={match.get('length')} size={match.get('sizeLabel')}"
-                    )
-                    yield _sse({"type": "match", "item": match, "searchId": search_id or None})
-                    matches += 1
-
-                    if matches >= max_items:
-                        yield emit_done("match_limit")
-                        return
-
-            yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
+            finally:
+                close_iterator = getattr(parsed_items, "close", None)
+                if close_iterator:
+                    close_iterator()
+    finally:
+        if parser_pool is not None:
+            parser_pool.close()
 
     yield emit_done("age_window" if age_window_hit else "completed")
 
@@ -899,7 +1154,8 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                 max_items, max_links, max_scrolls, search_id,
                 category="tops", size_range=None, bottoms_measurements=None,
                 emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
-                reset_session: Optional[Callable[[], tuple[Any, Any]]] = None):
+                reset_session: Optional[Callable[[], tuple[Any, Any]]] = None,
+                parse_workers: int = 1, headless: bool = True, slowmo: int = 0):
     """Browse all listings on the category page."""
     should_cancel = _cancel_check(search_id)
     normalized_groups = _normalize_groups(groups)
@@ -933,6 +1189,7 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
     yield _sse({"type": "progress", "phase": "browsing", "processed": 0, "total": 0, "matches": 0, "searchId": search_id or None})
     seller_stats_cache: Dict[str, int] = {}
     item_page = ctx.new_page()
+    parser_pool = None
     current_browse_page_url = None
 
     def rebuild_browse_session(attempt: int, total_attempts: int, delay: int, exc: Exception, label: str) -> None:
@@ -955,6 +1212,26 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
             "stopReason": stop_reason,
             "searchId": search_id or None,
         })
+
+    def parse_browse_sequential(current_links):
+        for current_url in current_links:
+            raise_if_cancelled(should_cancel)
+
+            def open_listing(url=current_url):
+                return _parse_listing_with_request_pacing(
+                    item_page,
+                    url,
+                    should_cancel,
+                )
+
+            item = _run_with_rate_limit_retries(
+                open_listing,
+                should_cancel,
+                "opening listing page",
+                on_rate_limit=notify_rate_limit,
+                before_retry=rebuild_browse_session,
+            )
+            yield current_url, item
 
     try:
         for group in normalized_groups:
@@ -1030,82 +1307,103 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                 seen_urls.update(unique_new)
                 log_debug(f"[stream] Collected {len(unique_new)} new browse links for {group} ({len(seen_urls)} total)")
 
-                for url in unique_new:
-                    raise_if_cancelled(should_cancel)
+                parse_urls = unique_new[:max(max_parsed_links - processed, 0)]
+                if not parse_urls:
+                    break
 
-                    if processed >= max_parsed_links or matches >= target_matches:
-                        break
-
-                    def open_listing(current_url=url):
-                        _sleep_request_jitter(should_cancel)
-                        return parse_listing(item_page, current_url, should_cancel=should_cancel)
-
-                    item = _run_with_rate_limit_retries(
-                        open_listing,
+                if (
+                    parser_pool is None
+                    and _listing_parse_worker_count(parse_workers) > 1
+                ):
+                    parser_pool = _start_parallel_listing_parser(
+                        ctx,
+                        min(
+                            _listing_parse_worker_count(parse_workers),
+                            len(parse_urls),
+                        ),
                         should_cancel,
-                        "opening listing page",
+                        headless=headless,
+                        slowmo=slowmo,
                         on_rate_limit=notify_rate_limit,
-                        before_retry=rebuild_browse_session,
                     )
+                    if parser_pool is None:
+                        parse_workers = 1
 
-                    processed += 1
+                parsed_items = (
+                    parser_pool.map_ordered(parse_urls)
+                    if parser_pool is not None
+                    else parse_browse_sequential(parse_urls)
+                )
+                try:
+                    for url, item in parsed_items:
+                        raise_if_cancelled(should_cancel)
 
-                    if item:
-                        if _listing_exceeds_age_window(item):
-                            age_days = float(item.get("ageDays"))
-                            stop_group_for_age = True
-                            age_window_hit = True
-                            log_debug(
-                                f"[stream] stopping browse group={group} at {age_days:.1f}d "
-                                f"(>{MAX_LISTING_AGE_DAYS}d window)"
-                            )
-                            yield _sse({"type": "progress", "processed": processed, "total": len(seen_urls), "matches": matches, "searchId": search_id or None})
+                        if processed >= max_parsed_links or matches >= target_matches:
                             break
 
-                        match = _process_item(
-                            item,
-                            target_p2p,
-                            target_length,
-                            p2p_tol,
-                            length_tol,
-                            category,
-                            size_range,
-                            bottoms_measurements,
-                        )
-                        if match:
-                            seller_name = (match.get("seller") or "").strip()
-                            sold_count = _resolve_seller_sold_count(
-                                ctx,
-                                seller_stats_cache,
-                                seller_name,
-                                search_id=search_id,
-                                groups=group,
-                                gender=gender,
-                                on_rate_limit=notify_rate_limit,
-                                reset_session=reset_session,
+                        processed += 1
+
+                        if item:
+                            if _listing_exceeds_age_window(item):
+                                age_days = float(item.get("ageDays"))
+                                stop_group_for_age = True
+                                age_window_hit = True
+                                log_debug(
+                                    f"[stream] stopping browse group={group} at {age_days:.1f}d "
+                                    f"(>{MAX_LISTING_AGE_DAYS}d window)"
+                                )
+                                yield _sse({"type": "progress", "processed": processed, "total": len(seen_urls), "matches": matches, "searchId": search_id or None})
+                                break
+
+                            match = _process_item(
+                                item,
+                                target_p2p,
+                                target_length,
+                                p2p_tol,
+                                length_tol,
+                                category,
+                                size_range,
+                                bottoms_measurements,
                             )
-                            match["soldCount"] = sold_count
+                            if match:
+                                seller_name = (match.get("seller") or "").strip()
+                                sold_count = _resolve_seller_sold_count(
+                                    ctx,
+                                    seller_stats_cache,
+                                    seller_name,
+                                    search_id=search_id,
+                                    groups=group,
+                                    gender=gender,
+                                    on_rate_limit=notify_rate_limit,
+                                    reset_session=reset_session,
+                                )
+                                match["soldCount"] = sold_count
 
-                            # Check seller reputation in browse mode
-                            if sold_count > 50:
-                                log_debug(f"[stream] MATCH seller=@{seller_name} url={match.get('url')} sold={sold_count}")
-                                yield _sse({"type": "match", "item": match, "seller": seller_name, "searchId": search_id or None})
-                                matches += 1
+                                if sold_count > 50:
+                                    log_debug(f"[stream] MATCH seller=@{seller_name} url={match.get('url')} sold={sold_count}")
+                                    yield _sse({"type": "match", "item": match, "seller": seller_name, "searchId": search_id or None})
+                                    matches += 1
 
-                                if matches >= target_matches:
-                                    yield emit_done("match_limit")
-                                    return
+                                    if matches >= target_matches:
+                                        yield emit_done("match_limit")
+                                        return
 
-                    yield _sse({"type": "progress", "processed": processed, "total": len(seen_urls), "matches": matches, "searchId": search_id or None})
+                        yield _sse({"type": "progress", "processed": processed, "total": len(seen_urls), "matches": matches, "searchId": search_id or None})
+                finally:
+                    close_iterator = getattr(parsed_items, "close", None)
+                    if close_iterator:
+                        close_iterator()
 
                 if stop_group_for_age:
                     break
     finally:
+        if parser_pool is not None:
+            parser_pool.close()
         try:
             item_page.close()
         except Exception:
             pass
-    
+
     yield emit_done("age_window" if age_window_hit else "completed")
 
 
@@ -1143,8 +1441,8 @@ async def browse_following_stream(request: Request):
     max_items_per_seller = int(payload.get("maxItemsPerSeller") or 10)
     max_links_per_seller = int(payload.get("maxLinksPerSeller") or 100)
     max_scrolls = int(payload.get("maxScrolls") or 4)
-    max_threads = int(payload.get("maxThreads") or 5)  # Limit concurrent threads
-    headless = bool(payload.get("headless", False))
+    max_threads = _listing_parse_worker_count(payload.get("maxThreads") or 5)
+    headless = bool(payload.get("headless", True))
     slowmo = int(payload.get("slowmo") or 0)
     gender = payload.get("gender") or "male"
     groups = _normalize_groups(payload.get("groups") or "tops")[0]
@@ -1167,12 +1465,20 @@ async def browse_following_stream(request: Request):
                     # Get the following list first
                     yield _sse({"type": "progress", "phase": "getting_following", "message": f"Getting following list for @{username}", "searchId": search_id})
                     
+                    _sleep_request_jitter(_cancel_check(search_id))
                     following_list = get_following_list(page, username)
                     
                     if not following_list:
                         yield _sse({"type": "error", "message": f"Could not find any accounts that @{username} follows", "searchId": search_id})
                         yield _sse({"type": "done", "searchId": search_id})
                         return
+
+                    try:
+                        worker_storage_state = ctx.storage_state()
+                        if not isinstance(worker_storage_state, dict):
+                            worker_storage_state = None
+                    except Exception:
+                        worker_storage_state = None
                     
                     yield _sse({
                         "type": "following_list",
@@ -1182,8 +1488,7 @@ async def browse_following_stream(request: Request):
                     })
                     
                     # Now browse each account using threading
-                    from concurrent.futures import ThreadPoolExecutor, as_completed
-                    import threading
+                    from concurrent.futures import ThreadPoolExecutor
                     
                     results_queue = queue.Queue()
                     processed_sellers = [0]
@@ -1193,10 +1498,42 @@ async def browse_following_stream(request: Request):
                     
                     def search_seller_thread(seller_name: str, thread_id: int):
                         """Search a single seller in a separate thread."""
+                        del thread_id
+                        thread_pw = None
+                        thread_browser = None
+                        thread_ctx = None
+                        thread_page = None
+
+                        def close_worker_session():
+                            nonlocal thread_pw, thread_browser, thread_ctx, thread_page
+                            for resource in (thread_page, thread_ctx, thread_browser):
+                                if resource is None:
+                                    continue
+                                try:
+                                    resource.close()
+                                except Exception:
+                                    pass
+                            if thread_pw is not None:
+                                try:
+                                    thread_pw.stop()
+                                except Exception:
+                                    pass
+                            thread_pw = None
+                            thread_browser = None
+                            thread_ctx = None
+                            thread_page = None
+
                         try:
                             raise_if_cancelled(should_cancel)
-                            # Create a new page for this thread
-                            thread_page = ctx.new_page()
+                            thread_pw = sync_playwright().start()
+                            thread_browser, thread_ctx = create_browser_context(
+                                thread_pw,
+                                headless=headless,
+                                slowmo=slowmo,
+                                storage_state=worker_storage_state,
+                            )
+                            thread_page = thread_ctx.new_page()
+                            install_shop_products_capture(thread_page)
                             try:
                                 search_url = build_seller_url(seller_name, groups=groups, gender=gender)
                                 _load_page_with_retries(
@@ -1214,13 +1551,18 @@ async def browse_following_stream(request: Request):
                                     max_scrolls=max_scrolls,
                                     max_links=max_links_per_seller,
                                     should_cancel=should_cancel,
+                                    aggressive_end_scroll=True,
                                 )
                                 
                                 seller_matches = 0
                                 for url in links:
                                     raise_if_cancelled(should_cancel)
                                     item = _run_with_rate_limit_retries(
-                                        lambda current_url=url: parse_listing(thread_page, current_url, should_cancel=should_cancel),
+                                        lambda current_url=url: _parse_listing_with_request_pacing(
+                                            thread_page,
+                                            current_url,
+                                            should_cancel,
+                                        ),
                                         should_cancel,
                                         f"listing page {url}",
                                     )
@@ -1261,8 +1603,8 @@ async def browse_following_stream(request: Request):
                                     })
                                     
                             finally:
-                                thread_page.close()
-                                
+                                close_worker_session()
+
                         except SearchCancelled:
                             return
                         except Exception as e:
@@ -1277,6 +1619,9 @@ async def browse_following_stream(request: Request):
                                     "total": len(following_list),
                                     "searchId": search_id
                                 })
+                        finally:
+                            close_worker_session()
+
                     
                     # Start threading
                     with ThreadPoolExecutor(max_workers=max_threads) as executor:

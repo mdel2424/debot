@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { cancelSearch, makeSearchId, streamSearch } from './hooks/useStream';
+import {
+  cancelSearch,
+  makeSearchId,
+  startSearchBatch,
+  streamSearch,
+} from './hooks/useStream';
 import { DEFAULT_FOLLOWING_ACCOUNTS } from './data/defaultSellers';
 import {
   CATEGORY_FILTER_DEFAULTS_SIGNATURE,
@@ -16,6 +21,7 @@ const FOLLOWING_STORAGE_KEY = 'debot.followingAccounts.v1';
 const ACTIVE_PAGE_STORAGE_KEY = 'debot.categoryPage.v1';
 const PAGE_FILTERS_STORAGE_KEY = 'debot.categoryFilters.v1';
 const PAGE_FILTERS_VERSION_STORAGE_KEY = 'debot.categoryFilters.defaults.v1';
+const PAGE_WORKSPACES_STORAGE_KEY = 'debot.pageWorkspaces.v1';
 const LOW_PARSE_RETRY_RATIO = 0.9;
 const MAX_LOW_PARSE_RETRIES = 1;
 const LISTING_AGE_CUTOFF_DAYS = 80;
@@ -209,6 +215,7 @@ const createSellerRow = (account, existingRow = null) => ({
   searchId: existingRow?.searchId || '',
   controller: existingRow?.controller || null,
   progress: existingRow?.progress || null,
+  searchTask: existingRow?.searchTask || null,
 });
 
 const buildSellerRows = (accounts, existingRows = []) => {
@@ -227,6 +234,71 @@ const buildPageWorkspaces = (accounts, existingWorkspaces = {}) =>
       },
     ])
   );
+
+const readStoredPageWorkspaces = (accounts) => {
+  if (typeof window === 'undefined') {
+    return buildPageWorkspaces(accounts);
+  }
+
+  try {
+    const raw = window.localStorage.getItem(PAGE_WORKSPACES_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (!parsed || typeof parsed !== 'object') {
+      return buildPageWorkspaces(accounts);
+    }
+
+    const storedWorkspaces = Object.fromEntries(
+      CATEGORY_PAGES.map((page) => {
+        const rows = Array.isArray(parsed[page.id]?.sellerRows)
+          ? parsed[page.id].sellerRows
+          : [];
+        return [
+          page.id,
+          {
+            sellerRows: rows.map((row) => ({
+              ...row,
+              results: Array.isArray(row?.results) ? row.results : [],
+              loading: Boolean(row?.searchId) || Boolean(row?.loading),
+              processed: Boolean(row?.processed),
+              searchId: String(row?.searchId || ''),
+              controller: null,
+              searchTask: row?.searchTask && typeof row.searchTask === 'object'
+                ? row.searchTask
+                : null,
+            })),
+          },
+        ];
+      })
+    );
+
+    return buildPageWorkspaces(accounts, storedWorkspaces);
+  } catch (error) {
+    console.warn('[App] Failed to read saved search results:', error);
+    return buildPageWorkspaces(accounts);
+  }
+};
+
+const serializePageWorkspaces = (workspaces) => JSON.stringify(
+  Object.fromEntries(
+    CATEGORY_PAGES.map((page) => [
+      page.id,
+      {
+        sellerRows: (workspaces[page.id]?.sellerRows || []).map((row) => ({
+          seller: row.seller,
+          displayName: row.displayName,
+          results: row.results,
+          loading: row.loading,
+          processed: row.processed,
+          error: row.error,
+          errorCode: row.errorCode,
+          searchId: row.searchId,
+          progress: row.progress,
+          searchTask: row.searchTask,
+        })),
+      },
+    ])
+  )
+);
 
 const normalizeMeasurementValue = (value, fallback) => {
   const clean = String(value ?? '').trim();
@@ -404,6 +476,7 @@ const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
     maxItems: 40,
     maxLinks: 128,
     maxScrolls: 16,
+    parseWorkers: 4,
     searchId,
   };
 
@@ -453,11 +526,24 @@ const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
   return payload;
 };
 
+function ReconnectSearches({ onReconnect }) {
+  const startedRef = useRef(false);
+
+  useEffect(() => {
+    if (startedRef.current) {
+      return;
+    }
+    startedRef.current = true;
+    onReconnect();
+  }, [onReconnect]);
+
+  return null;
+}
+
 function App() {
   const initialSellerAccounts = readStoredSellerAccounts();
   const searchRegistryRef = useRef(new Map());
   const searchQueueRef = useRef([]);
-  const activeQueueTaskRef = useRef(null);
   const batchCounterRef = useRef(0);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [sellerManagerOpen, setSellerManagerOpen] = useState(false);
@@ -465,7 +551,7 @@ function App() {
   const [sellerAccounts, setSellerAccounts] = useState(initialSellerAccounts);
   const [pageFilters, setPageFilters] = useState(() => readStoredPageFilters());
   const [pageWorkspaces, setPageWorkspaces] = useState(() =>
-    buildPageWorkspaces(initialSellerAccounts)
+    readStoredPageWorkspaces(initialSellerAccounts)
   );
   const pageWorkspacesRef = useRef(pageWorkspaces);
   const [sellerForm, setSellerForm] = useState({
@@ -476,7 +562,6 @@ function App() {
   const [queueState, setQueueState] = useState({
     active: [],
     pending: [],
-    frozen: null,
   });
 
   const sellerAccountsSnapshot = JSON.stringify(sellerAccounts);
@@ -492,18 +577,8 @@ function App() {
   const queuePositionByKey = new Map(
     queueState.pending.map((task, index) => [task.key, index + 1])
   );
-  const frozenTask = queueState.frozen;
-  const frozenTaskRow = frozenTask
-    ? pageWorkspaces[frozenTask.pageId]?.sellerRows.find(
-      (row) => row.seller === frozenTask.sellerUsername
-    ) || null
-    : null;
-  const frozenTaskProgress = frozenTaskRow?.progress || null;
-
   let globalQueueStatus = null;
-  if (frozenTask && frozenTaskProgress?.phase === 'rate_limited') {
-    globalQueueStatus = `Global cooldown ${getRetryCountdownSeconds(frozenTaskProgress, nowMs)}s • retry ${frozenTaskProgress.retryAttempt || 1}/${frozenTaskProgress.retryTotalAttempts || 1}`;
-  } else if (queueState.active.length > 0 && queueState.pending.length > 0) {
+  if (queueState.active.length > 0 && queueState.pending.length > 0) {
     globalQueueStatus = `${queueState.active.length} active • ${queueState.pending.length} paused`;
   } else if (queueState.active.length > 0) {
     globalQueueStatus = `${queueState.active.length} active`;
@@ -514,6 +589,45 @@ function App() {
   useEffect(() => {
     pageWorkspacesRef.current = pageWorkspaces;
   }, [pageWorkspaces]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      try {
+        window.localStorage.setItem(
+          PAGE_WORKSPACES_STORAGE_KEY,
+          serializePageWorkspaces(pageWorkspaces)
+        );
+      } catch (error) {
+        console.warn('[App] Failed to persist search results:', error);
+      }
+    }, 150);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [pageWorkspaces]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+
+    const flushWorkspace = () => {
+      try {
+        window.localStorage.setItem(
+          PAGE_WORKSPACES_STORAGE_KEY,
+          serializePageWorkspaces(pageWorkspacesRef.current)
+        );
+      } catch (error) {
+        console.warn('[App] Failed to flush search results:', error);
+      }
+    };
+
+    window.addEventListener('pagehide', flushWorkspace);
+    return () => window.removeEventListener('pagehide', flushWorkspace);
+  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -647,7 +761,6 @@ function App() {
     setQueueState({
       active: Array.from(searchRegistryRef.current.values()).map((entry) => cloneQueueTask(entry.task)),
       pending: searchQueueRef.current.map(cloneQueueTask),
-      frozen: cloneQueueTask(activeQueueTaskRef.current),
     });
   };
 
@@ -695,21 +808,15 @@ function App() {
       return true;
     }
 
-    if (activeQueueTaskRef.current?.key === searchKey) {
-      return true;
-    }
-
     return searchQueueRef.current.some((task) => task.key === searchKey);
   };
-
-  const hasActiveSellerSearch = () =>
-    Boolean(activeQueueTaskRef.current) || searchRegistryRef.current.size > 0;
 
   const resetQueuedSellerRow = (task, message = '') => {
     updateSellerRow(task.pageId, task.sellerUsername, {
       loading: false,
       controller: null,
       searchId: '',
+      searchTask: null,
       processed: false,
       error: null,
       errorCode: null,
@@ -735,6 +842,7 @@ function App() {
       loading: false,
       controller: null,
       searchId: '',
+      searchTask: null,
       processed: false,
       error: null,
       errorCode: null,
@@ -776,6 +884,7 @@ function App() {
     updateSellerRow(pageId, sellerUsername, {
       controller: null,
       searchId: '',
+      searchTask: null,
       ...updates,
     });
     syncQueueState();
@@ -884,15 +993,12 @@ function App() {
       loading: false,
       controller: null,
       searchId: '',
+      searchTask: null,
       processed: false,
       error: null,
       errorCode: null,
       progress: null,
     });
-
-    if (activeQueueTaskRef.current?.key === searchKey) {
-      activeQueueTaskRef.current = null;
-    }
 
     syncQueueState();
     resumePendingTasks();
@@ -947,7 +1053,6 @@ function App() {
 
   const resumePendingTasks = () => {
     if (
-      activeQueueTaskRef.current ||
       searchRegistryRef.current.size > 0 ||
       searchQueueRef.current.length === 0
     ) {
@@ -961,92 +1066,17 @@ function App() {
     void executeSellerSearch(nextTask).then((outcome) => handleSearchCompletion(nextTask, outcome));
   };
 
-  const pauseSearchEntryForCooldown = (entry, message = 'Waiting for global cooldown to end.') => {
-    const pausedTask = {
-      ...entry.task,
-      resetResults: false,
-    };
-
-    if (!searchQueueRef.current.some((task) => task.key === pausedTask.key)) {
-      searchQueueRef.current = [...searchQueueRef.current, pausedTask];
-    }
-
-    searchRegistryRef.current.delete(pausedTask.key);
-    updateSellerRow(pausedTask.pageId, pausedTask.sellerUsername, {
-      loading: false,
-      controller: null,
-      searchId: '',
-      processed: false,
-      error: null,
-      errorCode: null,
-      progress: createProgressState({ phase: 'queued', message }),
-    });
-
-    void cancelSearch(entry.searchId);
-    try {
-      entry.controller?.abort();
-    } catch (error) {
-      console.warn('[Queue] Failed to abort paused search:', error);
-    }
-  };
-
-  const handleGlobalRateLimit = (task) => {
-    const searchKey = task.key;
-
-    if (activeQueueTaskRef.current?.key === searchKey) {
-      syncQueueState();
-      return;
-    }
-
-    if (activeQueueTaskRef.current && activeQueueTaskRef.current.key !== searchKey) {
-      const entry = searchRegistryRef.current.get(searchKey);
-      if (entry) {
-        pauseSearchEntryForCooldown(entry);
-      }
-      syncQueueState();
-      return;
-    }
-
-    activeQueueTaskRef.current = task;
-
-    Array.from(searchRegistryRef.current.entries()).forEach(([key, entry]) => {
-      if (key === searchKey) {
-        return;
-      }
-      pauseSearchEntryForCooldown(entry);
-    });
-
-    syncQueueState();
-  };
-
-  const handleSearchCompletion = (task, outcome) => {
-    if (outcome?.status === 'paused') {
-      syncQueueState();
-      return;
-    }
-
-    if (activeQueueTaskRef.current?.key === task.key) {
-      if (outcome?.status === 'error' && outcome.code === 'rate_limited') {
-        activeQueueTaskRef.current = null;
-        removeQueuedTasks(
-          () => true,
-          { message: 'Queue paused after cooldown failure.' },
-        );
-        syncQueueState();
-        return;
-      }
-
-      activeQueueTaskRef.current = null;
-      syncQueueState();
-      resumePendingTasks();
-      return;
-    }
-
+  const handleSearchCompletion = () => {
     syncQueueState();
     resumePendingTasks();
   };
 
-  const executeSellerSearch = async (task) => {
+  const executeSellerSearch = async (incomingTask) => {
+    const task = {
+      ...incomingTask,
+      searchId: incomingTask.searchId || makeSearchId(),
+      resetResults: incomingTask.resetResults !== false,
+    };
     const { pageId, sellerUsername, filters } = task;
     const searchKey = searchKeyFor(pageId, sellerUsername);
     if (searchRegistryRef.current.has(searchKey)) {
@@ -1055,7 +1085,7 @@ function App() {
 
     const page = CATEGORY_PAGE_MAP[pageId];
     const controller = new AbortController();
-    const searchId = makeSearchId();
+    const searchId = task.searchId;
     const payload = buildSearchPayload(page, filters, sellerUsername, searchId);
     let outcome = { status: 'done', code: null };
     let finalized = false;
@@ -1067,6 +1097,7 @@ function App() {
       errorCode: null,
       searchId,
       controller,
+      searchTask: cloneQueueTask(task),
       processed: false,
       progress: createProgressState({ phase: 'starting' }),
     };
@@ -1082,9 +1113,6 @@ function App() {
       onMatch: (evt) => addSellerResult(pageId, sellerUsername, evt.item),
       onProgress: (progress) => {
         updateSellerRow(pageId, sellerUsername, { progress });
-        if (progress.phase === 'rate_limited') {
-          handleGlobalRateLimit(task);
-        }
       },
       onMeta: (meta) => updateSellerRow(pageId, sellerUsername, {
         progress: createProgressState({
@@ -1183,6 +1211,7 @@ function App() {
       key,
       pageId,
       sellerUsername,
+      searchId: options.searchId || makeSearchId(),
       filters: normalizePageFilters(pageId, options.filters ?? pageFilters[pageId]),
       batchId: options.batchId || nextBatchId(options.source === 'batch' ? 'batch' : 'manual'),
       source: options.source || 'manual',
@@ -1190,34 +1219,37 @@ function App() {
       lowParseRetryCount: options.lowParseRetryCount || 0,
     };
 
-    if (hasActiveSellerSearch()) {
-      const queueMessage = activeQueueTaskRef.current
-        ? 'Waiting for global cooldown to end.'
-        : 'Waiting for the active seller search to finish.';
-      const queuedRowUpdate = {
-        loading: false,
-        processed: false,
-        error: null,
-        errorCode: null,
-        controller: null,
-        searchId: '',
-        progress: createProgressState({
-          phase: 'queued',
-          message: queueMessage,
-        }),
-      };
-      if (task.resetResults) {
-        queuedRowUpdate.results = [];
-      }
-
-      searchQueueRef.current = [...searchQueueRef.current, task];
-      updateSellerRow(pageId, sellerUsername, queuedRowUpdate);
-      syncQueueState();
-      return true;
-    }
-
     void executeSellerSearch(task).then((outcome) => handleSearchCompletion(task, outcome));
     return true;
+  };
+
+  const reconnectPersistedSearches = () => {
+    Object.entries(pageWorkspacesRef.current).forEach(([pageId, workspace]) => {
+      (workspace?.sellerRows || []).forEach((row) => {
+        if (!row.searchId) {
+          return;
+        }
+
+        const savedTask = row.searchTask || {};
+        const task = {
+          ...savedTask,
+          key: searchKeyFor(pageId, row.seller),
+          pageId,
+          sellerUsername: row.seller,
+          filters: normalizePageFilters(
+            pageId,
+            savedTask.filters ?? pageFilters[pageId]
+          ),
+          batchId: savedTask.batchId || `resume-${row.searchId}`,
+          source: savedTask.source || 'resume',
+          resetResults: false,
+          lowParseRetryCount: savedTask.lowParseRetryCount || 0,
+          searchId: row.searchId,
+        };
+
+        void executeSellerSearch(task).then(handleSearchCompletion);
+      });
+    });
   };
 
   const startSellerSearch = async (pageId, sellerUsername) => {
@@ -1226,19 +1258,41 @@ function App() {
 
   const startSearchAllForPage = async (pageId) => {
     const batchId = nextBatchId('batch');
-    const sellersToStart = pageWorkspaces[pageId].sellerRows
+    const page = CATEGORY_PAGE_MAP[pageId];
+    const filters = normalizePageFilters(pageId, pageFilters[pageId]);
+    const searchesToStart = pageWorkspaces[pageId].sellerRows
       .map((row) => row.seller)
-      .filter((sellerUsername) => !isSellerScheduled(pageId, sellerUsername));
+      .filter((sellerUsername) => !isSellerScheduled(pageId, sellerUsername))
+      .map((sellerUsername) => {
+        const searchId = makeSearchId();
+        return {
+          sellerUsername,
+          searchId,
+          payload: buildSearchPayload(
+            page,
+            filters,
+            sellerUsername,
+            searchId
+          ),
+        };
+      });
 
-    if (sellersToStart.length === 0) {
+    if (searchesToStart.length === 0) {
       return;
     }
 
-    sellersToStart.forEach((sellerUsername) => {
+    try {
+      await startSearchBatch(searchesToStart.map((entry) => entry.payload));
+    } catch (error) {
+      console.warn('[Search] Batch registration failed; streams will retry:', error);
+    }
+
+    searchesToStart.forEach(({ sellerUsername, searchId }) => {
       queueSellerSearch(pageId, sellerUsername, {
         source: 'batch',
         batchId,
-        filters: pageFilters[pageId],
+        filters,
+        searchId,
       });
     });
   };
@@ -1394,6 +1448,7 @@ function App() {
 
   return (
     <div className="app-dark-ui app-home-shell">
+      <ReconnectSearches onReconnect={reconnectPersistedSearches} />
       <div
         className={`seller-manager-backdrop ${sellerManagerOpen ? 'open' : ''}`}
         onClick={() => setSellerManagerOpen(false)}

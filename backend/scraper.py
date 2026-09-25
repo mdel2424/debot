@@ -1,11 +1,13 @@
 """Depop scraping utilities using Playwright."""
 
+import copy
 import re
 import time
 import json
 import os
 import threading
 import datetime as dt
+from collections import OrderedDict
 from email.utils import parsedate_to_datetime
 from typing import Optional, List, Dict, Any, Callable
 from urllib.parse import urljoin, urlparse, urlencode
@@ -35,18 +37,12 @@ SCROLL_STEP_RATIO = 0.7
 MAX_STALLED_SCROLL_STEPS = 3
 EARLY_SCROLL_STALL_BUFFER = 2
 EARLY_SCROLL_LINK_THRESHOLD = 24
+MAX_ADAPTIVE_END_SCROLL_BATCHES = 8
 BROWSE_END_SCROLL_WAIT_MS = 2500
 LOGIN_MODAL_MAX_ATTEMPTS = 6
 LOGIN_MODAL_WAIT_MS = 250
-LISTING_READY_TIMEOUT_MS = 1_500
-LISTING_READY_SELECTOR = (
-    "script[type='application/ld+json'], "
-    "p[aria-label='Price'], "
-    "time[datetime], "
-    "a[aria-label$=\"'s shop\"], "
-    "a:has-text('Visit shop'), "
-    "img[srcset], img[src]"
-)
+FAST_LISTING_READY_TIMEOUT_MS = 2_500
+SHOP_PRODUCTS_CAPTURE_MAX_PAGES = 200
 RATE_LIMIT_TEXT_SIGNALS = (
     "too many requests",
     "rate limited",
@@ -81,10 +77,24 @@ BLOCKED_URL_SIGNALS = (
     "datadoghq.com",
     "newrelic.com",
 )
+BROWSER_INIT_SCRIPT = r"""(() => {
+    try {
+        Object.defineProperty(Navigator.prototype, "webdriver", {
+            configurable: true,
+            get: () => undefined,
+        });
+    } catch (error) {}
+})()"""
 CancelCheck = Optional[Callable[[], bool]]
 _PENDING_LOG_COUNTS: Dict[str, int] = {"login_modal_escape": 0}
 _NAVIGATION_LOCK = threading.Lock()
 _LAST_NAVIGATION_STARTED_AT = 0.0
+_NAVIGATION_PACING_UNTIL_TS = 0.0
+_CAPTURED_SHOP_PRODUCT_PAGES: Dict[int, List[Dict[str, Any]]] = {}
+_SHOP_PRODUCTS_CAPTURE_INSTALLED_PAGE_IDS: set[int] = set()
+_CAPTURED_SHOP_PRODUCT_LOCK = threading.Lock()
+_LISTING_CACHE: OrderedDict[str, tuple[float, Dict[str, Any]]] = OrderedDict()
+_LISTING_CACHE_LOCK = threading.Lock()
 
 
 def _read_float_env(name: str, default: float) -> float:
@@ -96,7 +106,65 @@ def _read_float_env(name: str, default: float) -> float:
         return default
 
 
-MIN_NAV_INTERVAL_SECONDS = _read_float_env("DEBOT_MIN_NAV_INTERVAL_SECONDS", 3.0)
+def _read_int_env(name: str, default: int) -> int:
+    """Read a non-negative integer environment value with a safe fallback."""
+    try:
+        value = int(os.environ.get(name, default))
+        return value if value >= 0 else default
+    except Exception:
+        return default
+
+
+MIN_NAV_INTERVAL_SECONDS = _read_float_env("DEBOT_MIN_NAV_INTERVAL_SECONDS", 0.0)
+RATE_LIMIT_NAV_INTERVAL_SECONDS = _read_float_env("DEBOT_RATE_LIMIT_NAV_INTERVAL_SECONDS", 1.0)
+LISTING_CACHE_TTL_SECONDS = _read_float_env("DEBOT_LISTING_CACHE_TTL_SECONDS", 300.0)
+LISTING_CACHE_MAX_ITEMS = _read_int_env("DEBOT_LISTING_CACHE_MAX_ITEMS", 1000)
+
+
+def get_cached_listing(url: str) -> Optional[Dict[str, Any]]:
+    """Return a fresh copy of a recently parsed public listing."""
+    if LISTING_CACHE_TTL_SECONDS <= 0 or LISTING_CACHE_MAX_ITEMS <= 0:
+        return None
+
+    cache_key = str(url or "").strip()
+    if not cache_key:
+        return None
+
+    now = time.monotonic()
+    with _LISTING_CACHE_LOCK:
+        cached = _LISTING_CACHE.get(cache_key)
+        if cached is None:
+            return None
+
+        cached_at, item = cached
+        if now - cached_at > LISTING_CACHE_TTL_SECONDS:
+            _LISTING_CACHE.pop(cache_key, None)
+            return None
+
+        _LISTING_CACHE.move_to_end(cache_key)
+        return copy.deepcopy(item)
+
+
+def _cache_listing(item: Dict[str, Any]) -> None:
+    """Store a successful public listing parse in the bounded process cache."""
+    if LISTING_CACHE_TTL_SECONDS <= 0 or LISTING_CACHE_MAX_ITEMS <= 0:
+        return
+
+    cache_key = str(item.get("url") or "").strip()
+    if not cache_key:
+        return
+
+    with _LISTING_CACHE_LOCK:
+        _LISTING_CACHE[cache_key] = (time.monotonic(), copy.deepcopy(item))
+        _LISTING_CACHE.move_to_end(cache_key)
+        while len(_LISTING_CACHE) > LISTING_CACHE_MAX_ITEMS:
+            _LISTING_CACHE.popitem(last=False)
+
+
+def _clear_listing_cache() -> None:
+    """Clear cached listings for isolated tests."""
+    with _LISTING_CACHE_LOCK:
+        _LISTING_CACHE.clear()
 
 
 class SearchCancelled(Exception):
@@ -158,16 +226,45 @@ def sleep_with_cancel(
     raise_if_cancelled(should_cancel)
 
 
-def guarded_goto(page: Page, url: str, *, wait_until: str = "domcontentloaded", timeout: int = 60_000):
+def mark_navigation_pacing(duration_seconds: float) -> None:
+    """Temporarily enable slower navigation pacing after a rate-limit event."""
+    global _NAVIGATION_PACING_UNTIL_TS
+
+    duration = max(float(duration_seconds or 0), 0.0)
+    if duration <= 0:
+        return
+
+    _NAVIGATION_PACING_UNTIL_TS = max(
+        _NAVIGATION_PACING_UNTIL_TS,
+        time.monotonic() + duration,
+    )
+
+
+def _current_navigation_interval_seconds() -> float:
+    """Return the active minimum interval between navigation starts."""
+    interval = max(float(MIN_NAV_INTERVAL_SECONDS or 0), 0.0)
+    if time.monotonic() < _NAVIGATION_PACING_UNTIL_TS:
+        interval = max(interval, max(float(RATE_LIMIT_NAV_INTERVAL_SECONDS or 0), 0.0))
+    return interval
+
+
+def guarded_goto(
+    page: Page,
+    url: str,
+    *,
+    wait_until: str = "domcontentloaded",
+    timeout: int = 60_000,
+    should_cancel: CancelCheck = None,
+):
     """Serialize Playwright navigations and space their start times."""
     global _LAST_NAVIGATION_STARTED_AT
 
     with _NAVIGATION_LOCK:
-        interval = max(float(MIN_NAV_INTERVAL_SECONDS or 0), 0.0)
+        interval = _current_navigation_interval_seconds()
         now = time.monotonic()
         delay = interval - (now - _LAST_NAVIGATION_STARTED_AT)
         if delay > 0:
-            time.sleep(delay)
+            sleep_with_cancel(delay, should_cancel)
         _LAST_NAVIGATION_STARTED_AT = time.monotonic()
 
     return page.goto(url, wait_until=wait_until, timeout=timeout)
@@ -307,7 +404,7 @@ def check_page_for_rate_limit(
 
     expected_content_missing = False
     if expect_product_links:
-        expected_content_missing = not _page_has_selector(page, 'a[href^="/products/"]')
+        expected_content_missing = not _page_has_selector(page, 'a[href*="/products/"]')
     elif expect_listing:
         expected_content_missing = not any(
             _page_has_selector(page, selector)
@@ -696,6 +793,264 @@ def remove_sold_sections(page: Page) -> None:
         pass
 
 
+SHOP_PRODUCTS_CAPTURE_SCRIPT = r"""(() => {
+    if (window.__debotShopProductsCaptureInstalled) return;
+    window.__debotShopProductsCaptureInstalled = true;
+    window.__debotShopProductPages = Array.isArray(window.__debotShopProductPages)
+        ? window.__debotShopProductPages
+        : [];
+
+    const maxPages = 200;
+    const shouldCapture = (url) => {
+        const raw = String(url || "");
+        return raw.includes("/products/") && (
+            raw.includes("/api/v3/shop/") ||
+            raw.includes("/presentation/api/v1/shops/")
+        );
+    };
+    const record = (url, status, text) => {
+        if (!shouldCapture(url) || typeof text !== "string" || !text.trim()) return;
+        const pages = window.__debotShopProductPages;
+        const key = `${String(url)}|${String(text).slice(0, 120)}`;
+        if (pages.some((page) => page && page.key === key)) return;
+        pages.push({ key, url: String(url), status: Number(status) || 0, text });
+        if (pages.length > maxPages) {
+            pages.splice(0, pages.length - maxPages);
+        }
+    };
+
+    const originalFetch = window.fetch;
+    if (typeof originalFetch === "function") {
+        window.fetch = async function(...args) {
+            const response = await originalFetch.apply(this, args);
+            try {
+                const input = args[0];
+                const url = input && input.url ? input.url : input;
+                if (shouldCapture(url)) {
+                    response.clone().text().then((text) => {
+                        record(url, response.status, text);
+                    }).catch(() => {});
+                }
+            } catch (error) {}
+            return response;
+        };
+    }
+
+    const OriginalXHR = window.XMLHttpRequest;
+    if (OriginalXHR && OriginalXHR.prototype && !window.__debotShopProductsXHRPatched) {
+        window.__debotShopProductsXHRPatched = true;
+        const originalOpen = OriginalXHR.prototype.open;
+        const originalSend = OriginalXHR.prototype.send;
+        OriginalXHR.prototype.open = function(method, url, ...rest) {
+            this.__debotShopProductsUrl = url;
+            return originalOpen.call(this, method, url, ...rest);
+        };
+        OriginalXHR.prototype.send = function(...args) {
+            try {
+                this.addEventListener("load", function() {
+                    try {
+                        let responseBody = "";
+                        try {
+                            if (!this.responseType || this.responseType === "text") {
+                                responseBody = this.responseText || "";
+                            } else if (typeof this.response === "string") {
+                                responseBody = this.response;
+                            } else if (this.response) {
+                                responseBody = JSON.stringify(this.response);
+                            }
+                        } catch (error) {}
+                        record(this.__debotShopProductsUrl, this.status, responseBody);
+                    } catch (error) {}
+                });
+            } catch (error) {}
+            return originalSend.apply(this, args);
+        };
+    }
+})()"""
+
+
+def _is_shop_product_api_url(url: Any) -> bool:
+    """Return whether a URL is the seller products API used by Depop shops."""
+    raw = str(url or "")
+    return "/products/" in raw and (
+        "/api/v3/shop/" in raw or
+        "/presentation/api/v1/shops/" in raw
+    )
+
+
+def _store_captured_shop_product_page(page: Page, url: Any, status: Any, text: Any) -> None:
+    """Store a captured seller product API response for later link extraction."""
+    if not _is_shop_product_api_url(url) or not isinstance(text, str) or not text.strip():
+        return
+
+    try:
+        normalized_status = int(status or 0)
+    except Exception:
+        normalized_status = 0
+
+    key = f"{str(url)}|{text[:120]}"
+    page_key = id(page)
+    with _CAPTURED_SHOP_PRODUCT_LOCK:
+        pages = _CAPTURED_SHOP_PRODUCT_PAGES.setdefault(page_key, [])
+        if any(entry.get("key") == key for entry in pages):
+            return
+        pages.append({"key": key, "url": str(url), "status": normalized_status, "text": text})
+        if len(pages) > SHOP_PRODUCTS_CAPTURE_MAX_PAGES:
+            del pages[:len(pages) - SHOP_PRODUCTS_CAPTURE_MAX_PAGES]
+
+
+def install_shop_products_capture(page: Page) -> None:
+    """Install hooks that record seller product API responses made by the page."""
+    page_key = id(page)
+    with _CAPTURED_SHOP_PRODUCT_LOCK:
+        _CAPTURED_SHOP_PRODUCT_PAGES.setdefault(page_key, [])
+        already_installed = page_key in _SHOP_PRODUCTS_CAPTURE_INSTALLED_PAGE_IDS
+        if not already_installed:
+            _SHOP_PRODUCTS_CAPTURE_INSTALLED_PAGE_IDS.add(page_key)
+
+    if not already_installed:
+        try:
+            def capture_response(response):
+                try:
+                    response_url = getattr(response, "url", "")
+                    if not _is_shop_product_api_url(response_url):
+                        return
+                    _store_captured_shop_product_page(
+                        page,
+                        response_url,
+                        getattr(response, "status", 0),
+                        response.text(),
+                    )
+                except Exception:
+                    pass
+
+            page.on("response", capture_response)
+        except Exception:
+            pass
+
+    try:
+        page.add_init_script(SHOP_PRODUCTS_CAPTURE_SCRIPT)
+    except Exception:
+        pass
+
+    try:
+        page.evaluate(SHOP_PRODUCTS_CAPTURE_SCRIPT)
+    except Exception:
+        pass
+
+
+def _read_captured_shop_product_pages(page: Page) -> List[Dict[str, Any]]:
+    """Return captured seller product API response payloads from the browser page."""
+    page_key = id(page)
+    with _CAPTURED_SHOP_PRODUCT_LOCK:
+        captured_pages = list(_CAPTURED_SHOP_PRODUCT_PAGES.get(page_key, []))
+
+    try:
+        browser_pages = page.evaluate("""() => Array.isArray(window.__debotShopProductPages)
+            ? window.__debotShopProductPages.slice()
+            : []
+        """)
+        if isinstance(browser_pages, list):
+            captured_pages.extend(entry for entry in browser_pages if isinstance(entry, dict))
+    except Exception:
+        pass
+
+    return captured_pages
+
+
+def _shop_product_payload_products(payload: Any) -> List[Dict[str, Any]]:
+    """Extract product records from known seller API payload shapes."""
+    if not isinstance(payload, dict):
+        return []
+
+    for key in ("products", "results", "items"):
+        products = payload.get(key)
+        if isinstance(products, list):
+            return [product for product in products if isinstance(product, dict)]
+
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return _shop_product_payload_products(data)
+
+    return []
+
+
+def extract_captured_shop_product_hrefs(page: Page) -> List[str]:
+    """Extract product hrefs from captured seller API responses."""
+    hrefs: List[str] = []
+    seen_slugs: set[str] = set()
+
+    for entry in _read_captured_shop_product_pages(page):
+        try:
+            status = int(entry.get("status") or 0)
+        except Exception:
+            status = 0
+        if status >= 400:
+            continue
+
+        text = entry.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+
+        try:
+            payload = json.loads(text)
+        except Exception:
+            continue
+
+        for product in _shop_product_payload_products(payload):
+            if product.get("sold") is True:
+                continue
+            status_text = str(product.get("status") or "").strip().lower()
+            if status_text and any(signal in status_text for signal in ("sold", "deleted", "removed")):
+                continue
+
+            slug = str(product.get("slug") or "").strip().strip("/")
+            if not slug or slug in seen_slugs:
+                continue
+            seen_slugs.add(slug)
+            hrefs.append(f"/products/{slug}/")
+
+    return hrefs
+
+
+def normalize_product_listing_href(href: Optional[str], origin: str) -> Optional[str]:
+    """Normalize Depop product href variants to absolute product URLs."""
+    if not href:
+        return None
+
+    try:
+        origin_parts = urlparse(origin)
+        parsed = urlparse(urljoin(origin, str(href).strip()))
+    except Exception:
+        return None
+
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+
+    host = parsed.netloc.lower()
+    origin_host = origin_parts.netloc.lower()
+    if host != origin_host and not host.endswith(".depop.com"):
+        return None
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    try:
+        products_index = next(
+            index for index, part in enumerate(path_parts)
+            if part.lower() == "products"
+        )
+    except StopIteration:
+        return None
+
+    if products_index != len(path_parts) - 2:
+        return None
+
+    slug = path_parts[products_index + 1].strip()
+    if not slug or slug.lower() == "create":
+        return None
+
+    return parsed.geturl()
+
+
 def collect_listing_links(
     page: Page,
     max_scrolls: int = 2,
@@ -711,46 +1066,60 @@ def collect_listing_links(
     u = urlparse(page.url)
     origin = f"{u.scheme}://{u.netloc}"
     
-    selectors = ['a[href^="/products/"]']
-
     def stall_limit() -> int:
-        if len(seen) < EARLY_SCROLL_LINK_THRESHOLD:
+        if len(seen) <= EARLY_SCROLL_LINK_THRESHOLD:
             return MAX_STALLED_SCROLL_STEPS + EARLY_SCROLL_STALL_BUFFER
         return MAX_STALLED_SCROLL_STEPS
 
     def collect_visible_links() -> None:
-        for sel in selectors:
-            try:
-                hrefs = page.eval_on_selector_all(sel, """
-                    els => els
-                        .filter(e => {
-                            if (e.closest('[data-debot-sold-root="true"]')) {
-                                return false;
-                            }
-                            const listItem = e.closest('li');
-                            if (listItem) {
-                                const text = (listItem.textContent || '').toLowerCase();
-                                if (text.includes('sold out')) return false;
-                            }
-                            return true;
-                        })
-                        .map(e => e.getAttribute('href'))
-                """)
-            except Exception:
-                hrefs = []
+        hrefs: List[Any] = []
 
-            for href in hrefs:
-                if not href:
-                    continue
-                full = urljoin(origin, href)
-                if full not in seen:
-                    seen.add(full)
-                    ordered.append(full)
-                    if max_links and len(seen) >= max_links:
-                        return
+        try:
+            hrefs.extend(extract_captured_shop_product_hrefs(page))
+        except Exception:
+            pass
+
+        try:
+            dom_hrefs = page.eval_on_selector_all("a[href]", """
+                els => els
+                    .filter(e => {
+                        if (e.closest('[data-debot-sold-root="true"]')) {
+                            return false;
+                        }
+                        const listItem = e.closest('li');
+                        if (listItem) {
+                            const text = (listItem.textContent || '').toLowerCase();
+                            if (text.includes('sold out')) return false;
+                        }
+                        return true;
+                    })
+                    .map(e => e.getAttribute('href'))
+            """)
+            if isinstance(dom_hrefs, list):
+                hrefs.extend(dom_hrefs)
+        except Exception:
+            pass
+
+        for href in hrefs:
+            full = normalize_product_listing_href(href, origin)
+            if not full:
+                continue
+            if full not in seen:
+                seen.add(full)
+                ordered.append(full)
+                if max_links and len(seen) >= max_links:
+                    return
 
     if aggressive_end_scroll:
         total_batches = max(max_scrolls, 1)
+        if max_links and max_links > EARLY_SCROLL_LINK_THRESHOLD:
+            requested_pages = (
+                max_links + EARLY_SCROLL_LINK_THRESHOLD - 1
+            ) // EARLY_SCROLL_LINK_THRESHOLD
+            total_batches = max(
+                total_batches,
+                min(requested_pages + 1, MAX_ADAPTIVE_END_SCROLL_BATCHES),
+            )
         stalled_batches = 0
         last_count = 0
         wait_ms = max(per_scroll_wait_ms, BROWSE_END_SCROLL_WAIT_MS)
@@ -820,6 +1189,110 @@ def collect_listing_links(
     return ordered
 
 
+LISTING_DOM_EXTRACTOR = r"""() => {
+    const clean = (value) => (value || "").replace(/[ \t\r\f\v]+/g, " ").trim();
+    const keepLines = (value) => (value || "")
+        .replace(/\r/g, "\n")
+        .split("\n")
+        .map((line) => clean(line))
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+    const textOf = (selector) => {
+        const element = document.querySelector(selector);
+        return element ? keepLines(element.innerText || element.textContent || "") : "";
+    };
+    const firstPrice = (text) => {
+        const match = (text || "").match(/[$£€]\s?\d[\d,]*(?:\.\d{2})?/);
+        return match ? match[0] : "";
+    };
+    const usernameFromHref = (href) => {
+        try {
+            const url = new URL(href || "", window.location.origin);
+            const first = url.pathname.replace(/^\/+|\/+$/g, "").split("/")[0] || "";
+            if (!first || first.toLowerCase() === "products") return "";
+            return first;
+        } catch (error) {
+            return "";
+        }
+    };
+
+    const bodyText = document.body ? document.body.innerText || "" : "";
+    const description = [
+        ...document.querySelectorAll(
+            "p[class*='styles_textWrapper__'], [data-testid*='description'], [itemprop='description']"
+        ),
+    ]
+        .map((element) => keepLines(element.innerText || element.textContent || ""))
+        .filter((text) => text.length > 8)
+        .sort((a, b) => b.length - a.length)[0] || "";
+
+    const imageElement = [
+        ...document.querySelectorAll("img.styles_imageItem__UWJs6[src], img[src*='media-photos.depop.com']")
+    ].find((image) => {
+        const src = image.getAttribute("src") || "";
+        const className = String(image.className || "");
+        return src.includes("media-photos.depop.com") &&
+            !className.includes("_userImage") &&
+            !src.includes("/U1.");
+    });
+
+    const anchors = [...document.querySelectorAll("a[href]")];
+    const shopAnchor =
+        anchors.find((anchor) => /'s shop$/i.test(anchor.getAttribute("aria-label") || "")) ||
+        anchors.find((anchor) => clean(anchor.innerText || anchor.textContent || "").toLowerCase() === "visit shop") ||
+        anchors.find((anchor) => (anchor.getAttribute("href") || "").includes("productId="));
+    let seller = usernameFromHref(shopAnchor && shopAnchor.getAttribute("href"));
+    if (!seller) {
+        const sellerImage = [...document.querySelectorAll("img[alt^='item listed by ']")][0];
+        const alt = sellerImage ? sellerImage.getAttribute("alt") || "" : "";
+        const match = alt.match(/^item listed by\s+([A-Za-z0-9._-]+)/i);
+        seller = match ? match[1] : "";
+    }
+
+    const timeElement = document.querySelector("time[datetime]");
+    return {
+        title: document.title || "",
+        bodyText,
+        description,
+        price: textOf("p[aria-label='Price']") ||
+            textOf("[data-testid*='price']") ||
+            textOf("[class*='price']") ||
+            textOf("[itemprop='price']") ||
+            firstPrice(bodyText),
+        image: imageElement ? (
+            imageElement.getAttribute("src") ||
+            ((imageElement.getAttribute("srcset") || "").split(",").pop() || "").trim().split(/\s+/)[0] ||
+            ""
+        ) : "",
+        seller,
+        datetime: timeElement ? timeElement.getAttribute("datetime") || "" : "",
+        timeText: timeElement ? keepLines(timeElement.innerText || timeElement.textContent || "") : "",
+    };
+}"""
+
+
+LISTING_READY_FUNCTION = r"""() => {
+    const body = (document.body && document.body.innerText || "").toLowerCase();
+    return Boolean(
+        document.querySelector("p[class*='styles_textWrapper__'], p[aria-label='Price'], img.styles_imageItem__UWJs6") ||
+        body.includes("too many requests") ||
+        body.includes("rate limit") ||
+        body.includes("checking your browser") ||
+        body.includes("access denied")
+    );
+}"""
+
+
+def _extract_listing_dom_details(page: Page) -> Dict[str, Any]:
+    """Extract listing fields with one browser round-trip."""
+    try:
+        details = page.evaluate(LISTING_DOM_EXTRACTOR)
+        return details if isinstance(details, dict) else {}
+    except Exception:
+        return {}
+
+
 def parse_listing(
     page: Page,
     url: str,
@@ -828,119 +1301,34 @@ def parse_listing(
     """Parse a single listing page and extract item details."""
     try:
         raise_if_cancelled(should_cancel)
-        response = guarded_goto(page, url, wait_until="domcontentloaded", timeout=60_000)
+        cached_item = get_cached_listing(url)
+        if cached_item is not None:
+            return cached_item
+
+        response = guarded_goto(
+            page,
+            url,
+            wait_until="domcontentloaded",
+            timeout=60_000,
+            should_cancel=should_cancel,
+        )
         raise_if_cancelled(should_cancel)
-        accept_cookies(page)
+
+        response_status = _response_status(response)
+        if response_status == 429:
+            check_page_for_rate_limit(page, response_status=response_status, expect_listing=True)
+
         try:
-            page.wait_for_selector(LISTING_READY_SELECTOR, timeout=LISTING_READY_TIMEOUT_MS)
+            page.wait_for_function(LISTING_READY_FUNCTION, timeout=FAST_LISTING_READY_TIMEOUT_MS)
         except Exception:
             pass
-        dismiss_login_modal(page)
 
-        check_page_for_rate_limit(
-            page,
-            response_status=_response_status(response),
-            expect_listing=True,
-            retry_after_seconds=extract_retry_after_seconds(response),
-        )
-        product_json_ld = _pick_product_json_ld(page)
-        page_html = ""
-        body_text = ""
-
-        # Description
-        desc = ""
-        if isinstance(product_json_ld, dict):
-            desc = str(product_json_ld.get("description") or "").strip()
-
-        if not desc:
-            for selector in [
-                "p[class*='styles_textWrapper__']",
-                "[data-testid*='description'], [itemprop='description']",
-                "article, [class*='description']"
-            ]:
-                try:
-                    loc = page.locator(selector).first
-                    if loc.count():
-                        desc = (loc.inner_text(timeout=1_000) or "").strip()
-                        if desc:
-                            break
-                except Exception:
-                    pass
-
-        # Price
-        price_text = ""
-        if isinstance(product_json_ld, dict):
-            price_text = _format_price_from_offer(product_json_ld.get("offers"))
-
-        if not price_text:
-            try:
-                ploc = page.locator("p[aria-label='Price']").first
-                if ploc.count():
-                    price_text = (ploc.inner_text(timeout=800) or "").strip()
-            except Exception:
-                pass
-
-        if not price_text:
-            for sel in ["[data-testid*='price']", "[class*='price']", "[itemprop='price']"]:
-                try:
-                    loc = page.locator(sel).first
-                    if loc.count():
-                        price_text = (loc.inner_text(timeout=800) or "").strip()
-                        if price_text:
-                            break
-                except Exception:
-                    pass
-        
-        if not price_text:
-            try:
-                all_txt = page.inner_text("body", timeout=800)
-                m = PRICE_RX.search(all_txt or "")
-                if m:
-                    price_text = m.group(1)
-            except Exception:
-                    pass
-
-        # Image
-        image_url = None
-        if isinstance(product_json_ld, dict):
-            images = product_json_ld.get("image")
-            if isinstance(images, list) and images:
-                image_url = images[0]
-            elif isinstance(images, str):
-                image_url = images
-
-        if not image_url:
-            try:
-                img = page.locator("img.styles_imageItem__UWJs6").first
-                if img.count():
-                    image_url = img.get_attribute("src")
-            except Exception:
-                pass
-
-        if not image_url:
-            try:
-                img2 = page.locator("img[srcset], img[src]").first
-                if img2.count():
-                    srcset = img2.get_attribute("srcset")
-                    if srcset:
-                        parts = [p.strip() for p in srcset.split(',') if p.strip()]
-                        if parts:
-                            image_url = parts[-1].split()[0]
-                    if not image_url:
-                        image_url = img2.get_attribute("src")
-            except Exception:
-                    pass
-
-        # Seller info
-        seller_name = _extract_seller_name(page, "")
-        if not seller_name:
-            page_html = page.content()
-            seller_name = _extract_seller_name(page, page_html)
-
-        try:
-            body_text = page.inner_text("body", timeout=1_500) or ""
-        except Exception:
-            body_text = ""
+        dom_details = _extract_listing_dom_details(page)
+        desc = str(dom_details.get("description") or "").strip()
+        price_text = str(dom_details.get("price") or "").strip()
+        image_url = str(dom_details.get("image") or "").strip() or None
+        seller_name = str(dom_details.get("seller") or "").strip()
+        body_text = str(dom_details.get("bodyText") or "")
 
         size_label = extract_size_label_from_text(body_text)
         if not size_label:
@@ -949,61 +1337,51 @@ def parse_listing(
         # Listing time
         listed_at_iso: Optional[str] = None
         age_days: Optional[float] = None
-        try:
-            tloc = page.locator("time[datetime]").first
-            if tloc.count():
-                dt_attr = tloc.get_attribute("datetime")
-                if dt_attr:
-                    listed_at_iso = dt_attr
-                    parsed_dt = parse_iso_datetime(dt_attr)
-                    if parsed_dt:
-                        age_days = age_days_from(parsed_dt)
-                
-                if age_days is None:
-                    time_text = tloc.inner_text(timeout=400) or ""
-                    rel_dt = parse_relative_time(time_text)
-                    if rel_dt:
-                        age_days = age_days_from(rel_dt)
-                        listed_at_iso = rel_dt.isoformat()
-        except Exception:
-            pass
+        dt_attr = str(dom_details.get("datetime") or "").strip()
+        if dt_attr:
+            listed_at_iso = dt_attr
+            parsed_dt = parse_iso_datetime(dt_attr)
+            if parsed_dt:
+                age_days = age_days_from(parsed_dt)
 
         if age_days is None:
-            rel_dt = parse_relative_time(body_text)
+            rel_dt = parse_relative_time(str(dom_details.get("timeText") or ""))
             if rel_dt:
                 age_days = age_days_from(rel_dt)
                 listed_at_iso = rel_dt.isoformat()
 
         if listed_at_iso is None:
-            created_at = extract_created_at_from_json_ld(product_json_ld)
-            parsed_dt = parse_iso_datetime(created_at or "")
-            if parsed_dt:
-                listed_at_iso = parsed_dt.isoformat()
-                age_days = age_days_from(parsed_dt)
+            try:
+                product_json_ld = _pick_product_json_ld(page)
+            except Exception:
+                product_json_ld = None
+            if isinstance(product_json_ld, dict):
+                if not desc:
+                    desc = str(product_json_ld.get("description") or "").strip()
+                if not price_text:
+                    price_text = _format_price_from_offer(product_json_ld.get("offers"))
+                if not image_url:
+                    images = product_json_ld.get("image")
+                    if isinstance(images, list) and images:
+                        image_url = images[0]
+                    elif isinstance(images, str):
+                        image_url = images
 
-        if listed_at_iso is None:
-            if not page_html:
-                page_html = page.content()
-            created_at = extract_created_at_from_html(page_html)
-            parsed_dt = parse_iso_datetime(created_at or "")
-            if parsed_dt:
-                listed_at_iso = parsed_dt.isoformat()
-                age_days = age_days_from(parsed_dt)
-
-        if age_days is None and page_html:
-            rel_dt = parse_relative_time(page_html)
-            if rel_dt:
-                age_days = age_days_from(rel_dt)
-                listed_at_iso = rel_dt.isoformat()
+                created_at = extract_created_at_from_json_ld(product_json_ld)
+                parsed_dt = parse_iso_datetime(created_at or "")
+                if parsed_dt:
+                    listed_at_iso = parsed_dt.isoformat()
+                    age_days = age_days_from(parsed_dt)
 
         if not any([desc, price_text, image_url, seller_name]):
             check_page_for_rate_limit(
                 page,
-                response_status=_response_status(response),
+                response_status=response_status,
                 expect_listing=True,
+                retry_after_seconds=extract_retry_after_seconds(response),
             )
 
-        return {
+        item = {
             "url": url,
             "description": desc,
             "image": image_url,
@@ -1014,6 +1392,9 @@ def parse_listing(
             "sizeLabel": size_label,
             "soldCount": None,
         }
+        if any([desc, price_text, image_url, seller_name]):
+            _cache_listing(item)
+        return item
     except SearchCancelled:
         raise
     except RateLimitError:
@@ -1022,19 +1403,27 @@ def parse_listing(
         return None
 
 
-def create_browser_context(pw, headless: bool = True, slowmo: int = 0) -> tuple:
+def create_browser_context(
+    pw,
+    headless: bool = True,
+    slowmo: int = 0,
+    storage_state: Optional[Dict[str, Any]] = None,
+) -> tuple:
     """Create a browser and context with anti-detection settings."""
-    # Use Firefox - harder to fingerprint than Chromium
     browser = pw.firefox.launch(
         headless=headless,
         slow_mo=slowmo,
     )
-    ctx = browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-        viewport={"width": 1280, "height": 900},
-        locale="en-US",
-        timezone_id="America/New_York",
-    )
+    context_options: Dict[str, Any] = {
+        "viewport": {"width": 1280, "height": 900},
+        "locale": "en-US",
+        "timezone_id": "America/New_York",
+    }
+    if storage_state:
+        context_options["storage_state"] = storage_state
+
+    ctx = browser.new_context(**context_options)
+    ctx.add_init_script(BROWSER_INIT_SCRIPT)
     try:
         install_resource_blocking(ctx)
     except Exception as exc:
