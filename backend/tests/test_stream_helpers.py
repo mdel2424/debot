@@ -8,22 +8,17 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-DEPENDENCY_IMPORT_ERROR = None
-
-try:
-    import main  # noqa: E402
-    from main import (  # noqa: E402
-        _browse_all,
-        _error_payload_for_exception,
-        MAX_LISTING_AGE_DAYS,
-        _process_item,
-        _run_with_rate_limit_retries,
-        _search_seller,
-        _sse,
-    )
-    from scraper import RateLimitError, SearchCancelled, sleep_with_cancel  # noqa: E402
-except Exception as exc:  # pragma: no cover - protects VS Code discovery on wrong interpreter
-    DEPENDENCY_IMPORT_ERROR = exc
+import main  # noqa: E402
+from main import (  # noqa: E402
+    _browse_all,
+    _error_payload_for_exception,
+    MAX_LISTING_AGE_DAYS,
+    _process_item,
+    _run_with_rate_limit_retries,
+    _search_seller,
+    _sse,
+)
+from scraper import RateLimitError, SearchCancelled, sleep_with_cancel  # noqa: E402
 
 
 class FakePage:
@@ -64,10 +59,6 @@ class FakeParallelParser:
         self.closed = True
 
 
-@unittest.skipIf(
-    DEPENDENCY_IMPORT_ERROR is not None,
-    f"Stream helper tests require backend dependencies: {DEPENDENCY_IMPORT_ERROR}",
-)
 class StreamHelpersTest(unittest.TestCase):
     def setUp(self):
         with main.RATE_LIMIT_STATE_LOCK:
@@ -199,6 +190,50 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(event["type"], "error")
         self.assertEqual(event["code"], "rate_limited")
         self.assertEqual(event["searchId"], "search-123")
+
+    def test_mixed_navigation_errors_do_not_consume_rate_limit_retry_budget(self):
+        outcomes = iter([
+            RuntimeError('NS_BINDING_ABORTED'), RateLimitError('limited'),
+            RateLimitError('limited'), RateLimitError('limited'), 'ok',
+        ])
+
+        def action():
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        with patch('builtins.print'), patch('main.sleep_with_cancel') as sleep:
+            self.assertEqual(_run_with_rate_limit_retries(action, lambda: False, 'listing'), 'ok')
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 60, 180, 600])
+
+    def test_exhausted_rate_limit_still_protects_other_workers(self):
+        with (
+            patch('builtins.print'), patch('main.sleep_with_cancel'),
+            patch('main._mark_recent_rate_limit') as mark,
+        ):
+            with self.assertRaises(RateLimitError):
+                _run_with_rate_limit_retries(
+                    lambda: (_ for _ in ()).throw(RateLimitError('limited', retry_after_seconds=900)),
+                    lambda: False, 'listing',
+                )
+        self.assertEqual(mark.call_count, 4)
+        self.assertEqual(mark.call_args.args, (900,))
+
+    def test_cancellation_during_cooldown_never_rebuilds_or_retries(self):
+        from unittest.mock import Mock
+        action = Mock(side_effect=RateLimitError('limited'))
+        rebuild = Mock()
+        with patch('builtins.print'), patch('main.sleep_with_cancel', side_effect=SearchCancelled()):
+            with self.assertRaises(SearchCancelled):
+                _run_with_rate_limit_retries(action, lambda: False, 'listing', before_retry=rebuild)
+        action.assert_called_once()
+        rebuild.assert_not_called()
+
+    def test_size_filters_do_not_drop_decimals_or_treat_uk_as_us(self):
+        self.assertEqual(main._extract_bottoms_size('W34.5'), 34.5)
+        self.assertIsNone(main._extract_footwear_size('UK 10'))
+        self.assertEqual(main._extract_footwear_size('UK 9 / US 10'), 10.0)
 
     def test_recent_rate_limit_enables_temporary_navigation_pacing(self):
         with patch("main.time.time", return_value=1_000.0):
@@ -631,12 +666,13 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(progress_events[-1]['processed'], 2)
         self.assertEqual(progress_events[-1]['total'], 2)
 
-    def test_search_seller_stops_current_group_once_listing_exceeds_age_window(self):
+    def test_search_seller_skips_old_item_without_losing_newer_items_after_it(self):
         ctx = FakeContext()
         page = FakePage()
         parse_results = {
             'recent-top': {'seller': 'onthemarkco', 'url': 'recent-top', 'ageDays': 12.0},
             'stale-top': {'seller': 'onthemarkco', 'url': 'stale-top', 'ageDays': float(MAX_LISTING_AGE_DAYS) + 1},
+            'never-top': {'seller': 'onthemarkco', 'url': 'never-top', 'ageDays': 2.0},
             'fresh-coat': {'seller': 'onthemarkco', 'url': 'fresh-coat', 'ageDays': 4.0},
         }
         parse_calls = []
@@ -656,7 +692,7 @@ class StreamHelpersTest(unittest.TestCase):
                 'main._process_item',
                 side_effect=lambda item, *args: (
                     {'seller': item['seller'], 'url': item['url'], 'p2p': 21.5, 'length': 27.0}
-                    if item['url'] in {'recent-top', 'fresh-coat'}
+                    if item['url'] in {'recent-top', 'never-top', 'fresh-coat'}
                     else None
                 ),
             ),
@@ -683,11 +719,11 @@ class StreamHelpersTest(unittest.TestCase):
         match_events = [evt for evt in decoded if evt['type'] == 'match']
         progress_events = [evt for evt in decoded if evt['type'] == 'progress']
 
-        self.assertEqual(parse_calls, ['recent-top', 'stale-top', 'fresh-coat'])
-        self.assertEqual([evt['item']['url'] for evt in match_events], ['recent-top', 'fresh-coat'])
-        self.assertEqual(progress_events[-1]['processed'], 3)
-        self.assertEqual(progress_events[-1]['total'], 3)
-        self.assertEqual(decoded[-1]['stopReason'], 'age_window')
+        self.assertEqual(parse_calls, ['recent-top', 'stale-top', 'never-top', 'fresh-coat'])
+        self.assertEqual([evt['item']['url'] for evt in match_events], ['recent-top', 'never-top', 'fresh-coat'])
+        self.assertEqual(progress_events[-1]['processed'], 4)
+        self.assertEqual(progress_events[-1]['total'], 4)
+        self.assertEqual(decoded[-1]['stopReason'], 'completed')
 
     def test_browse_all_collect_listing_rate_limit_emits_cooldown_and_recovers(self):
         ctx = FakeContext()
@@ -736,7 +772,7 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(decoded[-1]['type'], 'done')
         self.assertEqual(decoded[-1]['stopReason'], 'match_limit')
 
-    def test_browse_all_aggregates_multiple_groups_and_stops_stale_group(self):
+    def test_browse_all_keeps_newer_items_after_a_stale_item(self):
         ctx = FakeContext()
         browse_page = FakePage()
         parse_calls = []
@@ -744,6 +780,7 @@ class StreamHelpersTest(unittest.TestCase):
         parse_results = {
             'top-1': {'seller': 'seller-top', 'url': 'top-1', 'ageDays': 3.0},
             'stale-top': {'seller': 'seller-top', 'url': 'stale-top', 'ageDays': float(MAX_LISTING_AGE_DAYS) + 5},
+            'never-top': {'seller': 'seller-top', 'url': 'never-top', 'ageDays': 1.0},
             'coat-1': {'seller': 'seller-coat', 'url': 'coat-1', 'ageDays': 6.0},
         }
 
@@ -782,10 +819,10 @@ class StreamHelpersTest(unittest.TestCase):
         decoded = self._decode_events(events)
         match_events = [evt for evt in decoded if evt['type'] == 'match']
 
-        self.assertEqual(load_mock.call_count, 2)
-        self.assertEqual(collect_mock.call_count, 2)
-        self.assertEqual(parse_calls, ['top-1', 'stale-top', 'coat-1'])
-        self.assertEqual([evt['item']['url'] for evt in match_events], ['top-1', 'coat-1'])
+        self.assertEqual(load_mock.call_count, 1)
+        self.assertEqual(collect_mock.call_count, 1)
+        self.assertEqual(parse_calls, ['top-1', 'stale-top', 'never-top'])
+        self.assertEqual([evt['item']['url'] for evt in match_events], ['top-1', 'never-top'])
         self.assertEqual(decoded[-1]['type'], 'done')
         self.assertEqual(decoded[-1]['stopReason'], 'match_limit')
 

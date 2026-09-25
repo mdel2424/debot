@@ -423,8 +423,11 @@ const readInitialPageId = () => {
     return hashValue;
   }
 
-  const storedValue = window.localStorage.getItem(ACTIVE_PAGE_STORAGE_KEY);
-  return resolvePageId(storedValue);
+  try {
+    return resolvePageId(window.localStorage.getItem(ACTIVE_PAGE_STORAGE_KEY));
+  } catch {
+    return DEFAULT_CATEGORY_PAGE_ID;
+  }
 };
 
 const buildSellerPageHref = (sellerUsername, page) => {
@@ -438,7 +441,7 @@ const buildSellerPageHref = (sellerUsername, page) => {
 
 const parseMeasurementNumber = (value, fallback) => {
   const parsed = parseFloat(value);
-  return Number.isNaN(parsed) ? fallback : parsed;
+  return Number.isFinite(parsed) ? parsed : fallback;
 };
 
 const getResultAgeDays = (result) => {
@@ -474,7 +477,7 @@ const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
     groups: page.group,
     gender: 'male',
     maxItems: 40,
-    maxLinks: 128,
+    maxLinks: 1000,
     maxScrolls: 16,
     parseWorkers: 4,
     searchId,
@@ -541,7 +544,7 @@ function ReconnectSearches({ onReconnect }) {
 }
 
 function App() {
-  const initialSellerAccounts = readStoredSellerAccounts();
+  const [initialSellerAccounts] = useState(readStoredSellerAccounts);
   const searchRegistryRef = useRef(new Map());
   const searchQueueRef = useRef([]);
   const batchCounterRef = useRef(0);
@@ -666,7 +669,11 @@ function App() {
       return;
     }
 
-    window.localStorage.setItem(ACTIVE_PAGE_STORAGE_KEY, activePageId);
+    try {
+      window.localStorage.setItem(ACTIVE_PAGE_STORAGE_KEY, activePageId);
+    } catch (error) {
+      console.warn('[App] Failed to save active page:', error);
+    }
     const nextHash = `#${activePageId}`;
     if (window.location.hash !== nextHash) {
       window.history.replaceState(null, '', nextHash);
@@ -770,18 +777,22 @@ function App() {
   };
 
   const updateSellerRow = (pageId, sellerUsername, updates) => {
-    setPageWorkspaces((prev) => ({
+    const prev = pageWorkspacesRef.current;
+    const next = {
       ...prev,
       [pageId]: {
         sellerRows: prev[pageId].sellerRows.map((row) =>
           row.seller === sellerUsername ? { ...row, ...updates } : row
         ),
       },
-    }));
+    };
+    pageWorkspacesRef.current = next;
+    setPageWorkspaces(next);
   };
 
   const addSellerResult = (pageId, sellerUsername, item) => {
-    setPageWorkspaces((prev) => ({
+    const prev = pageWorkspacesRef.current;
+    const next = {
       ...prev,
       [pageId]: {
         sellerRows: prev[pageId].sellerRows.map((row) => {
@@ -796,7 +807,9 @@ function App() {
           return { ...row, results: [...row.results, item] };
         }),
       },
-    }));
+    };
+    pageWorkspacesRef.current = next;
+    setPageWorkspaces(next);
   };
 
   const getSellerRow = (pageId, sellerUsername) =>
@@ -830,6 +843,7 @@ function App() {
     const total = Number(summary?.total) || 0;
     const retryTask = {
       ...task,
+      searchId: makeSearchId(),
       resetResults: false,
       lowParseRetryCount: (task.lowParseRetryCount || 0) + 1,
     };
@@ -841,8 +855,8 @@ function App() {
     updateSellerRow(task.pageId, task.sellerUsername, {
       loading: false,
       controller: null,
-      searchId: '',
-      searchTask: null,
+      searchId: retryTask.searchId,
+      searchTask: cloneQueueTask(retryTask),
       processed: false,
       error: null,
       errorCode: null,
@@ -929,32 +943,18 @@ function App() {
       return;
     }
 
-    let didChange = false;
-
-    setSellerAccounts((prev) => {
-      const existingAccount = prev.find((account) => account.username === username);
-      if (existingAccount) {
-        if (!displayName || displayName === existingAccount.name) {
-          return prev;
-        }
-
-        didChange = true;
-        return prev.map((account) =>
-          account.username === username ? { ...account, name: displayName } : account
-        );
-      }
-
-      didChange = true;
-      return [...prev, { username, name: displayName || username }];
-    });
-
-    if (!didChange) {
+    const existingAccount = sellerAccounts.find((account) => account.username === username);
+    if (existingAccount && (!displayName || displayName === existingAccount.name)) {
       setSellerForm((prev) => ({
         ...prev,
         error: 'That seller is already in your list.',
       }));
       return;
     }
+
+    setSellerAccounts((prev) => existingAccount
+      ? prev.map((account) => account.username === username ? { ...account, name: displayName } : account)
+      : [...prev, { username, name: displayName || username }]);
 
     setSellerForm({
       username: '',
@@ -978,7 +978,12 @@ function App() {
       return;
     }
 
-    await cancelSearch(searchId);
+    try {
+      await cancelSearch(searchId);
+    } catch (error) {
+      updateSellerRow(pageId, sellerUsername, { error: error.message });
+      return;
+    }
 
     if (activeSearch?.controller) {
       try {
@@ -1071,7 +1076,7 @@ function App() {
     resumePendingTasks();
   };
 
-  const executeSellerSearch = async (incomingTask) => {
+  const executeSellerSearch = async (incomingTask, registration = null) => {
     const task = {
       ...incomingTask,
       searchId: incomingTask.searchId || makeSearchId(),
@@ -1106,15 +1111,38 @@ function App() {
     }
     updateSellerRow(pageId, sellerUsername, sellerRowUpdate);
     syncQueueState();
+    if (!registration) {
+      try {
+        window.localStorage.setItem(PAGE_WORKSPACES_STORAGE_KEY, serializePageWorkspaces(pageWorkspacesRef.current));
+      } catch (error) {
+        console.warn('[Search] Failed to save search ID:', error);
+      }
+    }
+
+    try {
+      await registration;
+    } catch (error) {
+      finishSellerSearch(pageId, sellerUsername, searchId, {
+        loading: false, processed: false, error: error.message, errorCode: 'batch_start_failed',
+      });
+      return { status: 'error', code: 'batch_start_failed' };
+    }
+    if (controller.signal.aborted) {
+      await cancelSearch(searchId).catch(console.warn);
+      return { status: 'cancelled', code: null };
+    }
+    const isCurrent = () => searchRegistryRef.current.get(searchKey)?.searchId === searchId;
 
     await streamSearch({
       payload,
       controller,
-      onMatch: (evt) => addSellerResult(pageId, sellerUsername, evt.item),
-      onProgress: (progress) => {
-        updateSellerRow(pageId, sellerUsername, { progress });
+      onMatch: (evt) => {
+        if (isCurrent()) addSellerResult(pageId, sellerUsername, evt.item);
       },
-      onMeta: (meta) => updateSellerRow(pageId, sellerUsername, {
+      onProgress: (progress) => {
+        if (isCurrent()) updateSellerRow(pageId, sellerUsername, { progress });
+      },
+      onMeta: (meta) => isCurrent() && updateSellerRow(pageId, sellerUsername, {
         progress: createProgressState({
           phase: 'collecting',
           total: meta.total,
@@ -1148,6 +1176,13 @@ function App() {
         }
       },
       onDone: (summary) => {
+        if (summary?.stopReason === 'cancelled') {
+          finalized = finishSellerSearch(pageId, sellerUsername, searchId, {
+            loading: false, processed: false, progress: null,
+          });
+          outcome = { status: 'cancelled', code: null };
+          return;
+        }
         const existingProgress = getSellerRow(pageId, sellerUsername)?.progress;
         const doneProgress = existingProgress
           ? {
@@ -1219,7 +1254,7 @@ function App() {
       lowParseRetryCount: options.lowParseRetryCount || 0,
     };
 
-    void executeSellerSearch(task).then((outcome) => handleSearchCompletion(task, outcome));
+    void executeSellerSearch(task, options.registration).then((outcome) => handleSearchCompletion(task, outcome));
     return true;
   };
 
@@ -1281,20 +1316,33 @@ function App() {
       return;
     }
 
-    try {
-      await startSearchBatch(searchesToStart.map((entry) => entry.payload));
-    } catch (error) {
-      console.warn('[Search] Batch registration failed; streams will retry:', error);
-    }
-
+    let registered;
+    let registrationFailed;
+    const registration = new Promise((resolve, reject) => {
+      registered = resolve;
+      registrationFailed = reject;
+    });
     searchesToStart.forEach(({ sellerUsername, searchId }) => {
       queueSellerSearch(pageId, sellerUsername, {
         source: 'batch',
         batchId,
         filters,
         searchId,
+        registration,
       });
     });
+    // Persist every job ID before the batch request can outlive this tab.
+    try {
+      window.localStorage.setItem(PAGE_WORKSPACES_STORAGE_KEY, serializePageWorkspaces(pageWorkspacesRef.current));
+    } catch (error) {
+      console.warn('[Search] Failed to save batch:', error);
+    }
+    try {
+      await startSearchBatch(searchesToStart.map((entry) => entry.payload));
+      registered();
+    } catch (error) {
+      registrationFailed(error);
+    }
   };
 
   const cancelPageSearches = async (pageId) => {
@@ -1457,6 +1505,7 @@ function App() {
       <aside
         className={`seller-manager-drawer ${sellerManagerOpen ? 'open' : ''}`}
         aria-hidden={!sellerManagerOpen}
+        inert={!sellerManagerOpen}
       >
         <div className="seller-manager-header">
           <div>
@@ -1556,6 +1605,7 @@ function App() {
                 <button
                   type="button"
                   className="sidebar-nav-button"
+                  aria-label={page.label}
                   onClick={() => switchPage(page.id)}
                 >
                   <span className="sidebar-icon">{page.shortLabel}</span>

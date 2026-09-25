@@ -60,6 +60,8 @@ class ParallelListingParser:
         if self._started:
             return self
 
+        if self._stop_event.is_set():
+            raise RuntimeError("A closed listing parser cannot be restarted.")
         self._started = True
         for worker_index in range(self.worker_count):
             thread = threading.Thread(
@@ -146,7 +148,7 @@ class ParallelListingParser:
                     item = self.parse_job(
                         lambda: page,
                         url,
-                        self._worker_cancelled,
+                        lambda: self._worker_cancelled() or self._batch_cancelled(batch_id),
                         reset_session,
                     )
                 except Exception as exc:
@@ -170,7 +172,12 @@ class ParallelListingParser:
             return backlog.pop(0)
 
         while True:
-            result = self._results.get()
+            try:
+                result = self._results.get(timeout=0.1)
+            except queue.Empty:
+                if not any(thread.is_alive() for thread in self._threads):
+                    raise RuntimeError("Listing workers exited before completing the batch.")
+                continue
             result_batch_id = result[0]
             if result_batch_id == batch_id:
                 return result
@@ -216,16 +223,17 @@ class ParallelListingParser:
                     received += 1
                     buffered[index] = (url, item, error)
 
-                    if submitted < total:
-                        submit_one(submitted)
-                        submitted += 1
-
                 url, item, error = buffered.pop(next_index)
                 if error is not None:
                     raise error
 
                 yield url, item
                 next_index += 1
+                # Bound work ahead of the consumer, including out-of-order
+                # results buffered behind a slow or rate-limited first item.
+                if submitted < total:
+                    submit_one(submitted)
+                    submitted += 1
 
         finally:
             if received < submitted:

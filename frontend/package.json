@@ -7,10 +7,10 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
+    "test": "node --test src/hooks/*.test.js",
     "preview": "vite preview"
   },
   "dependencies": {
-    "24": "^0.0.0",
     "@tailwindcss/vite": "^4.1.13",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"

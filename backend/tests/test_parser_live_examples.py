@@ -11,6 +11,17 @@ from parser import parser  # noqa: E402
 
 
 class ParserLiveExamplesTest(unittest.TestCase):
+    def test_millimeters_and_shared_pair_units_are_converted(self):
+        self.assertEqual(parser.extract_tops('Pit to pit 533.4 mm\nLength 685.8 mm'), (21.0, 27.0))
+        p2p, length = parser.extract_tops('Measurements: 53.34 x 68.58 cm')
+        self.assertAlmostEqual(p2p, 21.0)
+        self.assertAlmostEqual(length, 27.0)
+
+    def test_tagged_waist_length_pair_uses_both_named_values(self):
+        result = parser.extract_bottoms('W34 L32')
+        self.assertEqual(result['waist'], 34.0)
+        self.assertEqual(result['inseam'], 32.0)
+
     def test_live_examples_parse_expected_measurements(self):
         cases = [
             {

@@ -66,6 +66,8 @@ class MeasurementParser:
         u = (unit_str or "").lower().strip()
         if u.startswith("cm"):
             return value / 2.54
+        if u.startswith("mm"):
+            return value / 25.4
         return value
 
     def _extract_labeled_value_from_line(self, line: str, label_pattern: str) -> Optional[float]:
@@ -101,8 +103,11 @@ class MeasurementParser:
             return None
 
         try:
-            first = self.to_inches(match.group(1), match.group(2) or "")
-            second = self.to_inches(match.group(3), match.group(4) or "")
+            groups = match.groupdict()
+            first_unit = groups.get("u1") or groups.get("u2") or ""
+            second_unit = groups.get("u2") or groups.get("u1") or ""
+            first = self.to_inches(groups.get("w") or groups["waist"], first_unit)
+            second = self.to_inches(groups.get("l") or groups["inseam"], second_unit)
         except Exception:
             return None
 

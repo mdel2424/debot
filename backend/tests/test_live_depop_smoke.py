@@ -19,7 +19,10 @@ try:
         collect_listing_links,
         create_browser_context,
         dismiss_login_modal,
+        check_page_for_rate_limit,
         extract_seller_sold_count,
+        guarded_goto,
+        install_shop_products_capture,
         parse_listing,
     )
 except Exception as exc:  # pragma: no cover - protects VS Code discovery on wrong interpreter
@@ -50,7 +53,9 @@ class LiveDepopSmokeTest(unittest.TestCase):
                 self.playwright.stop()
 
     def _prepare_page(self, url: str) -> None:
-        self.page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        install_shop_products_capture(self.page)
+        response = guarded_goto(self.page, url)
+        check_page_for_rate_limit(self.page, response_status=response.status, expect_product_links=True)
         accept_cookies(self.page)
         try:
             self.page.wait_for_load_state("networkidle", timeout=20_000)

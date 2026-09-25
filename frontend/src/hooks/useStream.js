@@ -2,13 +2,13 @@
  * SSE stream hook for handling Server-Sent Events
  */
 
-const API_BASE = import.meta.env && import.meta.env.DEV ? 'http://127.0.0.1:8000' : '';
+const API_BASE = import.meta.env?.VITE_API_BASE || '';
 
 /**
  * Generate a unique search ID
  */
 export const makeSearchId = () => 
-  `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  crypto.randomUUID();
 
 export async function startSearchBatch(searches) {
   if (!Array.isArray(searches) || searches.length === 0) {
@@ -24,7 +24,11 @@ export async function startSearchBatch(searches) {
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
   }
-  return response.json();
+  const result = await response.json();
+  if (!result.ok) {
+    throw new Error(result.error || 'Search batch was not accepted.');
+  }
+  return result;
 }
 
 /**
@@ -40,6 +44,34 @@ export async function startSearchBatch(searches) {
  * @param {Function} options.onDone - Called when stream completes
  */
 const STREAM_RECONNECT_DELAYS_MS = [500, 1000, 2000, 5000];
+const MAX_RESULT_STREAMS = 3;
+let activeStreams = 0;
+const streamWaiters = [];
+
+// Leave HTTP connections free for batch registration and Stop requests.
+const acquireStreamSlot = (signal) => new Promise((resolve) => {
+  const grant = () => {
+    signal.removeEventListener('abort', abort);
+    activeStreams += 1;
+    resolve(() => {
+      activeStreams -= 1;
+      streamWaiters.shift()?.();
+    });
+  };
+  const abort = () => {
+    const index = streamWaiters.indexOf(grant);
+    if (index >= 0) streamWaiters.splice(index, 1);
+    resolve(null);
+  };
+  if (signal.aborted) {
+    resolve(null);
+  } else if (activeStreams < MAX_RESULT_STREAMS) {
+    grant();
+  } else {
+    streamWaiters.push(grant);
+    signal.addEventListener('abort', abort, { once: true });
+  }
+});
 
 const waitForReconnect = (delayMs, signal) => new Promise((resolve) => {
   if (signal.aborted) {
@@ -47,13 +79,13 @@ const waitForReconnect = (delayMs, signal) => new Promise((resolve) => {
     return;
   }
 
-  const timeoutId = window.setTimeout(() => {
+  const timeoutId = globalThis.setTimeout(() => {
     signal.removeEventListener('abort', handleAbort);
     resolve();
   }, delayMs);
 
   const handleAbort = () => {
-    window.clearTimeout(timeoutId);
+    globalThis.clearTimeout(timeoutId);
     resolve();
   };
 
@@ -62,6 +94,16 @@ const waitForReconnect = (delayMs, signal) => new Promise((resolve) => {
 
 const dispatchSearchEvent = (evt, callbacks) => {
   switch (evt.type) {
+    case 'following_list':
+      callbacks.onFollowingList?.({ usernames: evt.usernames, count: evt.count });
+      return false;
+    case 'seller_done':
+    case 'seller_error':
+      callbacks.onSellerDone?.({
+        seller: evt.seller, matches: evt.matches || 0,
+        processed: evt.processed, total: evt.total, error: evt.error,
+      });
+      return false;
     case 'match':
       if (evt.item) {
         callbacks.onMatch?.(evt);
@@ -88,6 +130,8 @@ const dispatchSearchEvent = (evt, callbacks) => {
       });
       return false;
     case 'cancelled':
+      callbacks.onDone?.({ stopReason: 'cancelled' });
+      return true;
     case 'done':
       callbacks.onDone?.({
         processed: evt.processed,
@@ -103,7 +147,6 @@ const dispatchSearchEvent = (evt, callbacks) => {
       });
       return true;
     case 'hello':
-      console.log('[SSE] Attached to backend job:', evt.searchId);
       return false;
     default:
       return false;
@@ -113,13 +156,9 @@ const dispatchSearchEvent = (evt, callbacks) => {
 async function consumeSearchStream({
   payload,
   controller,
-  onMatch,
-  onProgress,
-  onMeta,
-  onError,
-  onDone,
-}) {
-  const res = await fetch(`${API_BASE}/api/search/stream`, {
+  ...callbacks
+}, endpoint = '/api/search/stream') {
+  const res = await fetch(`${API_BASE}${endpoint}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -131,6 +170,10 @@ async function consumeSearchStream({
   });
 
   if (!res.ok) {
+    if (res.status >= 400 && res.status < 500 && ![408, 429].includes(res.status)) {
+      callbacks.onError?.({ message: `Search request rejected (HTTP ${res.status}).`, code: 'invalid_request' });
+      return true;
+    }
     throw new Error(`HTTP ${res.status}: ${res.statusText}`);
   }
   if (!res.body) {
@@ -149,36 +192,32 @@ async function consumeSearchStream({
       }
 
       buffer += decoder.decode(value, { stream: true });
-      let separatorIndex;
-      while ((separatorIndex = buffer.indexOf('\n\n')) !== -1) {
-        const rawEvent = buffer.slice(0, separatorIndex).trim();
-        buffer = buffer.slice(separatorIndex + 2);
-        if (!rawEvent || rawEvent.startsWith(':')) {
+      let separator;
+      while ((separator = /\r?\n\r?\n/.exec(buffer)) !== null) {
+        const rawEvent = buffer.slice(0, separator.index);
+        buffer = buffer.slice(separator.index + separator[0].length);
+        const eventLine = rawEvent.split(/\r?\n/)
+          .filter((line) => line.startsWith('data:'))
+          .map((line) => line.slice(5).replace(/^ /, ''))
+          .join('\n');
+        if (!eventLine) {
           continue;
         }
-
-        const eventLine = rawEvent.startsWith('data:')
-          ? rawEvent.slice(5).trim()
-          : rawEvent;
-
+        let event;
         try {
-          const event = JSON.parse(eventLine);
-          const terminal = dispatchSearchEvent(event, {
-            onMatch,
-            onProgress,
-            onMeta,
-            onError,
-            onDone,
-          });
-          if (terminal) {
-            return true;
-          }
+          event = JSON.parse(eventLine);
         } catch (error) {
           console.warn('[SSE] Failed to parse event:', error);
+          continue;
+        }
+        const terminal = dispatchSearchEvent(event, callbacks);
+        if (terminal) {
+          return true;
         }
       }
     }
   } finally {
+    await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 
@@ -187,11 +226,17 @@ async function consumeSearchStream({
 
 export async function streamSearch(options) {
   const { controller } = options;
+  const stableOptions = {
+    ...options,
+    payload: { ...options.payload, searchId: options.payload.searchId || makeSearchId() },
+  };
   let reconnectAttempt = 0;
 
   while (!controller.signal.aborted) {
+    const release = await acquireStreamSlot(controller.signal);
+    if (!release) return;
     try {
-      const reachedTerminalEvent = await consumeSearchStream(options);
+      const reachedTerminalEvent = await consumeSearchStream(stableOptions);
       if (reachedTerminalEvent || controller.signal.aborted) {
         return;
       }
@@ -200,6 +245,8 @@ export async function streamSearch(options) {
         return;
       }
       console.warn('[SSE] Connection lost; reattaching to saved job:', error);
+    } finally {
+      release();
     }
 
     const delayIndex = Math.min(
@@ -222,14 +269,17 @@ export async function cancelSearch(searchId) {
   if (!searchId) return;
   
   try {
-    await fetch(`${API_BASE}/api/search/cancel`, {
+    const response = await fetch(`${API_BASE}/api/search/cancel`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ searchId }),
     });
-    console.log('[Cancel] Backend notified of cancellation');
+    if (!response.ok) {
+      throw new Error(`Cancellation failed (HTTP ${response.status}).`);
+    }
   } catch (e) {
     console.warn('[Cancel] Failed to notify backend:', e);
+    throw e;
   }
 }
 
@@ -246,151 +296,20 @@ export async function cancelSearch(searchId) {
  * @param {Function} options.onError - Called when an error occurs
  * @param {Function} options.onDone - Called when stream completes
  */
-export async function streamFollowing({
-  payload,
-  controller,
-  onFollowingList,
-  onMatch,
-  onSellerDone,
-  onProgress,
-  onError,
-  onDone,
-}) {
+export async function streamFollowing(options) {
+  const { controller, onError } = options;
+  const release = await acquireStreamSlot(controller.signal);
+  if (!release) return;
   try {
-    console.log('[SSE-Following] Starting stream with payload:', payload);
-    
-    const res = await fetch(`${API_BASE}/api/search/following/stream`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'text/event-stream',
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-      cache: 'no-store',
-    });
-    
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    const finished = await consumeSearchStream(options, '/api/search/following/stream');
+    if (!finished && !controller.signal.aborted) {
+      throw new Error('Following search disconnected before completion.');
     }
-    
-    if (!res.body) {
-      throw new Error('No response body for streaming');
+  } catch (error) {
+    if (!controller.signal.aborted) {
+      onError?.({ message: error.message, code: null });
     }
-    
-    console.log('[SSE-Following] Connected successfully');
-    
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder('utf-8');
-    let buffer = '';
-    let eventCount = 0;
-    let isAborted = false;
-    
-    controller.signal.addEventListener('abort', () => {
-      isAborted = true;
-      console.log('[SSE-Following] Stream aborted by user');
-    });
-    
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        
-        if (done || isAborted) {
-          console.log('[SSE-Following] Stream ended, total events:', eventCount);
-          break;
-        }
-        
-        buffer += decoder.decode(value, { stream: true });
-        
-        // Process complete SSE events
-        let sepIndex;
-        while ((sepIndex = buffer.indexOf('\n\n')) !== -1) {
-          const rawEvent = buffer.slice(0, sepIndex).trim();
-          buffer = buffer.slice(sepIndex + 2);
-          
-          if (!rawEvent || rawEvent.startsWith(':')) continue;
-          
-          const eventLine = rawEvent.startsWith('data:') ? rawEvent.slice(5).trim() : rawEvent;
-          
-          try {
-            const evt = JSON.parse(eventLine);
-            eventCount++;
-            console.log(`[SSE-Following] Event #${eventCount}:`, evt.type);
-            
-            switch (evt.type) {
-              case 'following_list':
-                onFollowingList?.({
-                  usernames: evt.usernames,
-                  count: evt.count
-                });
-                break;
-              case 'match':
-                if (evt.item) {
-                  onMatch?.(evt);
-                }
-                break;
-              case 'seller_done':
-                onSellerDone?.({
-                  seller: evt.seller,
-                  matches: evt.matches,
-                  processed: evt.processed,
-                  total: evt.total
-                });
-                break;
-              case 'seller_error':
-                console.warn(`[SSE-Following] Seller error for ${evt.seller}:`, evt.error);
-                onSellerDone?.({
-                  seller: evt.seller,
-                  matches: 0,
-                  processed: evt.processed,
-                  total: evt.total,
-                  error: evt.error
-                });
-                break;
-              case 'progress':
-                onProgress?.({
-                  phase: evt.phase,
-                  message: evt.message,
-                  processed: evt.processed,
-                  total: evt.total,
-                  matches: evt.matches
-                });
-                break;
-              case 'cancelled':
-              case 'done':
-                onDone?.();
-                return;
-              case 'error':
-                onError?.({
-                  message: evt.message || 'Stream error',
-                  code: evt.code || null,
-                });
-                return;
-              case 'hello':
-                console.log('[SSE-Following] Hello from server:', evt.ts);
-                break;
-            }
-          } catch (e) {
-            console.warn('[SSE-Following] Failed to parse event:', e);
-          }
-        }
-      }
-    } catch (readError) {
-      if (!isAborted) throw readError;
-    }
-    
-    onDone?.();
-    
-  } catch (err) {
-    if (err.name === 'AbortError' || err.message?.includes('aborted')) {
-      console.log('[SSE-Following] Stream was cancelled by user');
-      onDone?.();
-    } else {
-      console.error('[SSE-Following] Stream failed:', err);
-      onError?.({
-        message: String(err),
-        code: null,
-      });
-    }
+  } finally {
+    release();
   }
 }
