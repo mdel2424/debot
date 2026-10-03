@@ -32,6 +32,73 @@ class FakeJsonRequest:
 
 
 class SearchJobTest(unittest.TestCase):
+    def test_age_filter_is_optional_and_validated(self):
+        from search_models import validate_search_payload
+        self.assertNotIn('maxAgeDays', validate_search_payload({}))
+        self.assertNotIn('maxAgeDays', validate_search_payload({'maxAgeDays': None}))
+        self.assertEqual(validate_search_payload({'maxAgeDays': 80})['maxAgeDays'], 80)
+        for age in (-1, 0, float('nan'), float('inf')):
+            with self.subTest(age=age), self.assertRaises(main.HTTPException):
+                validate_search_payload({'maxAgeDays': age})
+
+    def test_waiting_job_publishes_shared_cooldown_without_starting_a_browser(self):
+        registry = SearchJobRegistry()
+        search_id = 'shared-cooldown-cancel'
+
+        def cancel_on_sleep(*args):
+            main.CANCEL_FLAGS[search_id] = True
+
+        with (
+            mock.patch.object(main, 'SEARCH_JOBS', registry),
+            mock.patch.object(main, 'RATE_LIMIT_BLOCKED_UNTIL_TS', 4593.0),
+            mock.patch.object(main.time, 'time', return_value=1000.0),
+            mock.patch.object(main, 'SEARCH_JOB_SLOTS') as slots,
+            mock.patch.object(main, 'sync_playwright') as playwright,
+            mock.patch.object(main, 'sleep_with_cancel', side_effect=cancel_on_sleep),
+            mock.patch.object(main.threading, 'Thread') as thread,
+            mock.patch('builtins.print'),
+        ):
+            job = main._ensure_search_job({'searchId': search_id})
+            thread.call_args.kwargs['target']()
+            events = [json.loads(event.decode().split('data: ', 1)[1]) for event in job.read_from(0)[0]]
+            self.assertEqual(events[0]['phase'], 'waiting_rate_limit')
+            self.assertEqual(events[0]['retryDelaySeconds'], 3593)
+            self.assertEqual(events[-1]['type'], 'cancelled')
+            self.assertEqual(len(events), 2)
+            self.assertTrue(job.complete)
+            slots.acquire.assert_not_called()
+            playwright.assert_not_called()
+
+    def test_waiting_job_starts_automatically_when_cooldown_ends(self):
+        registry = SearchJobRegistry()
+        search_id = 'shared-cooldown-resume'
+
+        def end_cooldown(*args):
+            main.RATE_LIMIT_BLOCKED_UNTIL_TS = 0.0
+
+        with (
+            mock.patch.object(main, 'SEARCH_JOBS', registry),
+            mock.patch.object(main, 'RATE_LIMIT_BLOCKED_UNTIL_TS', 1001.0),
+            mock.patch.object(main.time, 'time', return_value=1000.0),
+            mock.patch.object(main, 'SEARCH_JOB_SLOTS') as slots,
+            mock.patch.object(main, 'sync_playwright'),
+            mock.patch.object(main, 'create_browser_context', return_value=(mock.Mock(), mock.Mock())),
+            mock.patch.object(main, 'sleep_with_cancel', side_effect=end_cooldown),
+            mock.patch.object(main, '_search_seller', return_value=iter([main._sse({'type': 'done'})])) as search,
+            mock.patch.object(main.threading, 'Thread') as thread,
+            mock.patch('builtins.print'),
+        ):
+            slots.acquire.return_value = True
+            job = main._ensure_search_job({'searchId': search_id, 'seller': 'onthemarkco', 'maxAgeDays': 80})
+            thread.call_args.kwargs['target']()
+            events = [json.loads(event.decode().split('data: ', 1)[1]) for event in job.read_from(0)[0]]
+            self.assertEqual(events[0]['phase'], 'waiting_rate_limit')
+            self.assertEqual(events[-1]['type'], 'done')
+            self.assertTrue(job.complete)
+            self.assertEqual(search.call_args.kwargs['max_age_days'], 80)
+            slots.acquire.assert_called_once()
+            slots.release.assert_called_once()
+
     def test_invalid_request_does_not_leave_an_unfinishable_job(self):
         registry = SearchJobRegistry()
         with mock.patch.object(main, 'SEARCH_JOBS', registry):

@@ -11,7 +11,7 @@ class MeasurementParser:
     NUM = r'(?P<val>\d+(?:\.\d+)?(?:\s+\d\/\d)?)'
     UNIT = r'(?P<unit>\s*(?:cm|mm|in|inch|inches|["″"]))?'
     LINE_LABEL_GAP = 40
-    P2P_LABELS = r'(?:p2p|pit\s*[- ]?to\s*[- ]?pit|pit[- ]?to[- ]?pit|pit\s*to\s*pit|chest|width|across\s*chest)'
+    P2P_LABELS = r'(?:p2p|pit\s*[- ]?(?:to|2)\s*[- ]?pit|chest|width|across\s*chest)'
     LENGTH_LABELS = (
         r'(?:length|top\s*to\s*bottom|back\s*length|hps\s*to\s*hem|'
         r'neck\s*to\s*hem|shoulder\s*to\s*hem|'

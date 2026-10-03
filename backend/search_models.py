@@ -48,6 +48,7 @@ class SearchRequest(SearchModel):
     maxItems: int = Field(default=40, ge=1, le=10000)
     maxLinks: int = Field(default=1000, ge=1, le=10000)
     maxScrolls: int = Field(default=8, ge=0, le=200)
+    maxAgeDays: float | None = Field(default=None, gt=0, le=36500)
     parseWorkers: int | None = Field(default=None, ge=1, le=6)
     headless: bool = True
     slowmo: int = Field(default=0, ge=0, le=1000)

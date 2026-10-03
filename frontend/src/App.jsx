@@ -5,7 +5,11 @@ import {
   startSearchBatch,
   streamSearch,
 } from './hooks/useStream';
-import { DEFAULT_FOLLOWING_ACCOUNTS } from './data/defaultSellers';
+import {
+  DEFAULT_FOLLOWING_ACCOUNTS,
+  DEFAULT_SELLER_ADDITIONS,
+  DEFAULT_SELLER_ADDITIONS_VERSION,
+} from './data/defaultSellers';
 import {
   CATEGORY_FILTER_DEFAULTS_SIGNATURE,
   CATEGORY_PAGES,
@@ -18,13 +22,13 @@ import './App.css';
 import './index.css';
 
 const FOLLOWING_STORAGE_KEY = 'debot.followingAccounts.v1';
+const SELLER_ADDITIONS_STORAGE_KEY = 'debot.sellerAdditions.version';
 const ACTIVE_PAGE_STORAGE_KEY = 'debot.categoryPage.v1';
 const PAGE_FILTERS_STORAGE_KEY = 'debot.categoryFilters.v1';
 const PAGE_FILTERS_VERSION_STORAGE_KEY = 'debot.categoryFilters.defaults.v1';
 const PAGE_WORKSPACES_STORAGE_KEY = 'debot.pageWorkspaces.v1';
 const LOW_PARSE_RETRY_RATIO = 0.9;
 const MAX_LOW_PARSE_RETRIES = 1;
-const LISTING_AGE_CUTOFF_DAYS = 80;
 
 const createProgressState = (overrides = {}) => ({
   processed: 0,
@@ -50,7 +54,7 @@ const getRetryCountdownSeconds = (progress, nowMs) => {
 };
 
 const getSellerStateTone = (sellerRow) => {
-  if (sellerRow?.progress?.phase === 'queued') {
+  if (['queued', 'waiting_rate_limit'].includes(sellerRow?.progress?.phase)) {
     return 'queued';
   }
 
@@ -70,6 +74,9 @@ const getSellerStateTone = (sellerRow) => {
 };
 
 const getSellerStateLabel = (sellerRow) => {
+  if (sellerRow?.progress?.phase === 'waiting_rate_limit') {
+    return 'Cooldown';
+  }
   if (sellerRow?.progress?.phase === 'queued') {
     return 'Queued';
   }
@@ -99,6 +106,9 @@ const formatSellerStatusLabel = (sellerRow, queuePosition = null) => {
   const total = Number(progress?.total) || 0;
   const safeHits = Number.isFinite(hits) ? hits : (sellerRow?.results?.length || 0);
 
+  if (progress?.phase === 'waiting_rate_limit') {
+    return 'Waiting for Depop cooldown';
+  }
   if (progress?.phase === 'queued') {
     return queuePosition ? `Queue position ${queuePosition}` : 'Waiting for the global queue';
   }
@@ -120,12 +130,17 @@ const getSellerProgressDetails = (sellerRow, nowMs, queuePosition = null) => {
     return null;
   }
 
-  if (progress.phase === 'rate_limited' && progress.retryAvailableAt) {
+  if (['rate_limited', 'waiting_rate_limit'].includes(progress.phase) && progress.retryAvailableAt) {
     const secondsRemaining = getRetryCountdownSeconds(progress, nowMs);
+    const duration = secondsRemaining >= 60
+      ? `${Math.floor(secondsRemaining / 60)}m ${secondsRemaining % 60}s`
+      : `${secondsRemaining}s`;
     const attempt = progress.retryAttempt || 1;
     const totalAttempts = progress.retryTotalAttempts || 1;
     return {
-      primary: `Cooldown ${secondsRemaining}s • retry ${attempt}/${totalAttempts}`,
+      primary: progress.phase === 'waiting_rate_limit'
+        ? `Cooldown ${duration}`
+        : `Cooldown ${duration} • retry ${attempt}/${totalAttempts}`,
       secondary: progress.message || 'Paused while retrying this seller.',
     };
   }
@@ -139,7 +154,7 @@ const getSellerProgressDetails = (sellerRow, nowMs, queuePosition = null) => {
 
   if (progress.phase === 'done' && progress.stopReason === 'age_window') {
     return {
-      primary: `Stopped at ${LISTING_AGE_CUTOFF_DAYS}-day cutoff`,
+      primary: 'Listing-age filter applied',
       secondary: '',
     };
   }
@@ -369,7 +384,10 @@ const readStoredSellerAccounts = () => {
     }
 
     const normalized = dedupeSellerAccounts(parsed);
-    return normalized.length > 0 ? normalized : getDefaultSellerAccounts();
+    const savedVersion = Number(window.localStorage.getItem(SELLER_ADDITIONS_STORAGE_KEY)) || 0;
+    return savedVersion < DEFAULT_SELLER_ADDITIONS_VERSION
+      ? dedupeSellerAccounts([...normalized, ...DEFAULT_SELLER_ADDITIONS])
+      : normalized;
   } catch (error) {
     console.warn('[App] Failed to read saved seller accounts:', error);
     return getDefaultSellerAccounts();
@@ -639,6 +657,7 @@ function App() {
 
     try {
       window.localStorage.setItem(FOLLOWING_STORAGE_KEY, sellerAccountsSnapshot);
+      window.localStorage.setItem(SELLER_ADDITIONS_STORAGE_KEY, String(DEFAULT_SELLER_ADDITIONS_VERSION));
     } catch (error) {
       console.warn('[App] Failed to persist seller accounts:', error);
     }

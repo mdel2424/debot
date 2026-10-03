@@ -40,12 +40,16 @@ A production frontend needs an `/api` reverse proxy or an explicit API base.
 - The UI collects up to 1,000 links and returns up to 40 matches per seller.
   API callers can set `maxLinks` and `maxItems` up to 10,000. Collection has an
   additional 200-page safety bound.
-- Listings older than 80 days are filtered individually; an old item does not
-  stop the rest of the scan.
+- Available listings are searched regardless of their original creation date.
+  API callers can opt into an age filter with `maxAgeDays`; it is disabled by
+  default because an older listing is not evidence of an inactive seller.
 - HTTP 403/429 triggers shared 60, 180, and 600-second cooldowns, extended by
   `Retry-After`. Final exhaustion remains an error and preserves the shared pause.
+  Queued sellers show the shared cooldown and start automatically when it ends.
 - Closing the browser detaches seller searches. Reopening restores saved job IDs
   and replays results. Stop explicitly cancels active or queued jobs.
+- New curated seller additions are merged into saved lists once. Custom names,
+  existing sellers, and subsequent removals are preserved.
 - Jobs are process-local. Keep one backend process running and avoid `--reload`
   during searches. A restart loses in-memory jobs; a saved request can start
   again on reconnect. The legacy following-account API remains connection-owned.
@@ -94,3 +98,5 @@ DEPOP_LIVE_SMOKE=1 .venv/bin/python -m unittest backend.tests.test_live_depop_sm
 Live availability and throttling depend on Depop. Offline regressions exercise
 blocked pages, partial-page failures, retries, and cancellation deterministically.
 See [the code review](docs/code-review.md) for findings and coverage.
+See [the October search diagnosis](docs/search-diagnosis-2026-10-02.md) for the
+listing-age fix, cooldown behavior, and new seller sources.

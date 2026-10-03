@@ -1,3 +1,10 @@
+export const DEFAULT_SELLER_ADDITIONS_VERSION = 1;
+export const DEFAULT_SELLER_ADDITIONS = [
+  { name: 'Thrifts N Spliffs', username: 'thriftsnspliffs' },
+  { name: 'The Loop MTL', username: 'theloopmtl' },
+  { name: 'Mountain Vintage Thrifts', username: 'mountainvintagethrifts' },
+];
+
 export const DEFAULT_FOLLOWING_ACCOUNTS = [
   { name: 'OnTheMarkCo', username: 'onthemarkco' },
   { name: 'Reduce & Re - Use ♻️', username: 'reducereuseclothes' },
@@ -23,4 +30,5 @@ export const DEFAULT_FOLLOWING_ACCOUNTS = [
   { name: 'Jizzy Pant Thrifts', username: 'jizzypantthrifts' },
   { name: 'Dead Threads', username: 'dead_threads00' },
   { name: 'Ryan Is Garments', username: 'ryan_is_garments' },
+  ...DEFAULT_SELLER_ADDITIONS,
 ];

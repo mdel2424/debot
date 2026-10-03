@@ -4,6 +4,7 @@ import sys
 import asyncio
 import datetime as dt
 import json
+import math
 import os
 import queue
 import random
@@ -92,7 +93,6 @@ DEFAULT_LENGTH_TOL = 1.25
 RATE_LIMIT_RETRY_DELAYS = (60, 180, 600)
 TRANSIENT_NAVIGATION_RETRY_DELAYS = (1, 2, 4)
 BROWSE_ALL_STALLED_BATCHES = 3
-MAX_LISTING_AGE_DAYS = 80
 RECENT_RATE_LIMIT_PACING_WINDOW_SECONDS = 180
 RECENT_RATE_LIMIT_JITTER_RANGE_SECONDS = (1.25, 3.0)
 MEASUREMENT_CATEGORIES = {"tops", "coats-jackets"}
@@ -277,9 +277,9 @@ def _error_payload_for_exception(exc: Exception, search_id: str) -> Dict[str, An
     return payload
 
 
-def _listing_exceeds_age_window(item: Dict[str, Any] | None, max_age_days: int = MAX_LISTING_AGE_DAYS) -> bool:
-    """Return whether a parsed listing is older than the allowed recency window."""
-    if not item:
+def _listing_exceeds_age_window(item: Dict[str, Any] | None, max_age_days: Optional[float] = None) -> bool:
+    """Apply an explicitly requested creation-age filter, not a seller activity test."""
+    if not item or max_age_days is None:
         return False
 
     age_days = item.get("ageDays")
@@ -800,6 +800,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
     max_items = int(payload.get("maxItems") or 40)
     max_links = int(payload.get("maxLinks") or 1000)
     max_scrolls = int(payload.get("maxScrolls", 8))
+    max_age_days = payload.get("maxAgeDays")
     parse_workers = _listing_parse_worker_count(payload.get("parseWorkers"))
     headless = bool(payload.get("headless", True))
     slowmo = int(payload.get("slowmo") or 0)
@@ -851,6 +852,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
                                 parse_workers=parse_workers,
                                 headless=headless,
                                 slowmo=slowmo,
+                                max_age_days=max_age_days,
                             )
                         else:
                             yield from _browse_all(
@@ -863,6 +865,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
                                 parse_workers=parse_workers,
                                 headless=headless,
                                 slowmo=slowmo,
+                                max_age_days=max_age_days,
                             )
                     except SearchCancelled:
                         yield _sse({"type": "cancelled", "searchId": search_id or None})
@@ -886,28 +889,47 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
                 del CANCEL_FLAGS[search_id]
 
     def worker() -> None:
-        acquired_slot = SEARCH_JOB_SLOTS.acquire(blocking=False)
+        acquired_slot = False
+        waiting_state = None
         try:
-            if not acquired_slot:
-                job.publish(_sse({
-                    "type": "progress",
-                    "phase": "queued",
-                    "processed": 0,
-                    "total": 0,
-                    "matches": 0,
-                    "message": "Waiting for the backend search queue.",
-                    "searchId": search_id,
-                }))
-                while not _is_cancelled(search_id):
-                    acquired_slot = SEARCH_JOB_SLOTS.acquire(timeout=0.1)
-                    if acquired_slot:
-                        break
+            while not _is_cancelled(search_id):
+                with RATE_LIMIT_STATE_LOCK:
+                    blocked_until = RATE_LIMIT_BLOCKED_UNTIL_TS
+                remaining = blocked_until - time.time()
+                if remaining > 0:
+                    state = ("waiting_rate_limit", blocked_until)
+                    if waiting_state != state:
+                        job.publish(_sse({
+                            "type": "progress", "phase": state[0],
+                            "processed": 0, "total": 0, "matches": 0,
+                            "message": "Depop has paused requests. This search will start after the shared cooldown.",
+                            "retryDelaySeconds": math.ceil(remaining),
+                            "retryAvailableAt": dt.datetime.fromtimestamp(blocked_until, dt.timezone.utc).isoformat(),
+                            "searchId": search_id,
+                        }))
+                        waiting_state = state
+                    sleep_with_cancel(min(remaining, 0.1), _cancel_check(search_id))
+                    continue
+
+                acquired_slot = SEARCH_JOB_SLOTS.acquire(timeout=0.1)
+                if acquired_slot:
+                    break
+                if waiting_state != ("queued", None):
+                    job.publish(_sse({
+                        "type": "progress", "phase": "queued",
+                        "processed": 0, "total": 0, "matches": 0,
+                        "message": "Waiting for the backend search queue.",
+                        "searchId": search_id,
+                    }))
+                    waiting_state = ("queued", None)
 
             if _is_cancelled(search_id):
                 job.publish(_sse({"type": "cancelled", "searchId": search_id}))
             else:
                 for chunk in run_search():
                     job.publish(chunk)
+        except SearchCancelled:
+            job.publish(_sse({"type": "cancelled", "searchId": search_id}))
         except Exception as exc:
             log_debug(f"[stream] persistent job error: {exc}")
             job.publish(_sse(_error_payload_for_exception(exc, search_id)))
@@ -974,7 +996,8 @@ def _search_seller(ctx, page, seller, groups, gender,
                    category="tops", size_range=None, bottoms_measurements=None,
                    emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
                    reset_session: Optional[Callable[[], tuple[Any, Any]]] = None,
-                   parse_workers: int = 1, headless: bool = True, slowmo: int = 0):
+                   parse_workers: int = 1, headless: bool = True, slowmo: int = 0,
+                   max_age_days: Optional[float] = None):
     """Search a specific seller's listings."""
     should_cancel = _cancel_check(search_id)
     normalized_groups = _normalize_groups(groups)
@@ -1142,11 +1165,11 @@ def _search_seller(ctx, page, seller, groups, gender,
                     processed += 1
 
                     if item:
-                        if _listing_exceeds_age_window(item):
+                        if _listing_exceeds_age_window(item, max_age_days):
                             age_days = float(item.get("ageDays"))
                             log_debug(
                                 f"[stream] skipping @{seller} group={group} at {age_days:.1f}d "
-                                f"(>{MAX_LISTING_AGE_DAYS}d window)"
+                                f"(>{max_age_days}d requested window)"
                             )
                             yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
                             continue
@@ -1191,7 +1214,8 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                 category="tops", size_range=None, bottoms_measurements=None,
                 emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
                 reset_session: Optional[Callable[[], tuple[Any, Any]]] = None,
-                parse_workers: int = 1, headless: bool = True, slowmo: int = 0):
+                parse_workers: int = 1, headless: bool = True, slowmo: int = 0,
+                max_age_days: Optional[float] = None):
     """Browse all listings on the category page."""
     should_cancel = _cancel_check(search_id)
     normalized_groups = _normalize_groups(groups)
@@ -1381,11 +1405,11 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                         processed += 1
 
                         if item:
-                            if _listing_exceeds_age_window(item):
+                            if _listing_exceeds_age_window(item, max_age_days):
                                 age_days = float(item.get("ageDays"))
                                 log_debug(
                                     f"[stream] skipping browse group={group} at {age_days:.1f}d "
-                                    f"(>{MAX_LISTING_AGE_DAYS}d window)"
+                                    f"(>{max_age_days}d requested window)"
                                 )
                                 yield _sse({"type": "progress", "processed": processed, "total": len(seen_urls), "matches": matches, "searchId": search_id or None})
                                 continue

@@ -1,5 +1,6 @@
 """Browser regressions against Vite with local, deterministic API fixtures."""
 
+import datetime as dt
 import json
 import os
 import unittest
@@ -16,6 +17,7 @@ class FrontendSmokeTest(unittest.TestCase):
         self.context.set_default_timeout(10000)
         self.context.add_init_script("""
             if (!localStorage.getItem('debot.followingAccounts.v1')) {
+                localStorage.setItem('debot.sellerAdditions.version', '1');
                 localStorage.setItem('debot.followingAccounts.v1', JSON.stringify([
                     {username: 'fixture_one', name: 'Fixture One'},
                     {username: 'fixture_two', name: 'Fixture Two'}
@@ -90,6 +92,54 @@ class FrontendSmokeTest(unittest.TestCase):
         self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows.every(row => row.processed)")
         self.assertEqual(len(registered), 2)
         self.assertEqual(set(registered), set(saved_before_request))
+        self.page.set_viewport_size({'width': 390, 'height': 844})
+        self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'))
+        self.assertEqual(self.errors, [])
+
+    def test_new_sellers_are_added_once_without_resetting_a_custom_list(self):
+        self.context.add_init_script("""
+            if (!localStorage.getItem('fixture_migration_seeded')) {
+                localStorage.setItem('debot.followingAccounts.v1', JSON.stringify([
+                    {username: 'fixture_one', name: 'My Custom Name'},
+                    {username: 'theloopmtl', name: 'My Loop Name'}
+                ]));
+                localStorage.removeItem('debot.sellerAdditions.version');
+                localStorage.setItem('fixture_migration_seeded', '1');
+            }
+        """)
+        self.page.goto(self.url)
+        self.page.wait_for_function("localStorage.getItem('debot.sellerAdditions.version') === '1'")
+        sellers = self.page.evaluate("JSON.parse(localStorage.getItem('debot.followingAccounts.v1'))")
+        self.assertEqual(len(sellers), 4)
+        self.assertEqual(sellers[0], {'username': 'fixture_one', 'name': 'My Custom Name'})
+        self.assertEqual(sellers[1], {'username': 'theloopmtl', 'name': 'My Loop Name'})
+        self.assertEqual({seller['username'] for seller in sellers}, {
+            'fixture_one', 'theloopmtl', 'thriftsnspliffs', 'mountainvintagethrifts',
+        })
+        self.page.evaluate("""localStorage.setItem('debot.followingAccounts.v1', JSON.stringify(
+            JSON.parse(localStorage.getItem('debot.followingAccounts.v1'))
+                .filter(seller => seller.username !== 'thriftsnspliffs')
+        ))""")
+        self.page.reload()
+        self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.followingAccounts.v1')).length === 3")
+        self.assertEqual(self.page.locator('.seller-row-card').count(), 3)
+        self.assertEqual(self.errors, [])
+
+    def test_queued_seller_shows_the_shared_rate_limit_countdown(self):
+        retry_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=3593)).isoformat()
+        self.context.route('**/api/search/stream', lambda route: route.fulfill(
+            content_type='text/event-stream', body=self.event({
+                'type': 'progress', 'phase': 'waiting_rate_limit',
+                'processed': 0, 'total': 0, 'matches': 0,
+                'retryAvailableAt': retry_at,
+                'message': 'Depop has paused requests. This search will start after the shared cooldown.',
+            }),
+        ))
+        self.page.goto(self.url)
+        self.page.get_by_role('button', name='Search', exact=True).first.click()
+        self.page.get_by_text('Waiting for Depop cooldown', exact=True).wait_for()
+        self.page.get_by_text('Depop has paused requests. This search will start after the shared cooldown.', exact=True).wait_for()
+        self.assertIn('Cooldown 59m', self.page.locator('.seller-progress-primary').first.inner_text())
         self.page.set_viewport_size({'width': 390, 'height': 844})
         self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'))
         self.assertEqual(self.errors, [])

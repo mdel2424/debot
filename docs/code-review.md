@@ -39,7 +39,7 @@ dependencies, documentation, and existing tests.
   with the same job ID, check persistence before batch dispatch, and check mobile
   horizontal overflow.
 
-## Verified Results
+## September Verification
 
 - Backend discovery: 96 tests, 91 passed and five opt-in checks skipped.
   All five opt-in checks also passed separately: two local browser regressions
@@ -61,6 +61,10 @@ Primary implementation locations: [scraper](../backend/scraper.py),
 [request validation](../backend/search_models.py),
 [stream client](../frontend/src/hooks/useStream.js), and
 [workspace persistence](../frontend/src/App.jsx).
+
+The [October follow-up](search-diagnosis-2026-10-02.md) makes creation-age
+filtering optional, exposes shared cooldowns to queued jobs, handles numeric
+pit-to-pit labels, and adds sellers through a tested one-time migration.
 
 ## Operational Limits
 

@@ -2,7 +2,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
@@ -12,7 +12,6 @@ import main  # noqa: E402
 from main import (  # noqa: E402
     _browse_all,
     _error_payload_for_exception,
-    MAX_LISTING_AGE_DAYS,
     _process_item,
     _run_with_rate_limit_retries,
     _search_seller,
@@ -150,6 +149,58 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(result, "ok")
         self.assertEqual(delays, [240])
         self.assertEqual(rebuilds, [(1, 3, 240, "listing page")])
+
+    def test_hour_long_retry_after_is_not_shortened(self):
+        attempts = iter([RateLimitError('limited', retry_after_seconds=3593), 'ok'])
+
+        def action():
+            result = next(attempts)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with patch('builtins.print'), patch('main.sleep_with_cancel') as sleep:
+            self.assertEqual(_run_with_rate_limit_retries(action, lambda: False, 'listing'), 'ok')
+        sleep.assert_called_once_with(3593, ANY)
+
+    def test_available_old_listings_match_without_an_implicit_age_cutoff(self):
+        items = {
+            'old-top': {
+                'seller': 'onthemarkco', 'url': 'old-top', 'ageDays': 338.0,
+                'description': 'Pit2Pit: 21"\nLength: 27"',
+            },
+            'old-coat': {
+                'seller': 'onthemarkco', 'url': 'old-coat', 'ageDays': 385.1,
+                'description': 'PIT 2 PIT: 20.5"\nLENGTH: 26"',
+            },
+        }
+        for search in (_search_seller, _browse_all):
+            for max_age_days, expected_matches in ((None, 2), (80, 0)):
+                with (
+                    self.subTest(search=search.__name__, max_age_days=max_age_days),
+                    patch('builtins.print'), patch('main._load_page_with_retries'),
+                    patch('main.extract_seller_sold_count', return_value=110),
+                    patch('main._resolve_seller_sold_count', return_value=110),
+                    patch('main.remove_sold_sections'),
+                    patch('main.collect_listing_links', side_effect=lambda page, **kwargs: [
+                        url for url in items if url not in kwargs.get('excluded_urls', set())
+                    ]),
+                    patch('main.get_cached_listing', side_effect=items.get),
+                    patch('main.parse_listing') as parse,
+                ):
+                    args = [FakeContext(), FakePage()]
+                    if search is _search_seller:
+                        args.append('onthemarkco')
+                    args.extend([['tops'], 'male', 21.0, 27.0, 0.75, 1.0])
+                    events = self._decode_events(list(search(
+                        *args, max_items=40, max_links=100, max_scrolls=1,
+                        search_id='old-available', max_age_days=max_age_days,
+                    )))
+                matches = [event for event in events if event['type'] == 'match']
+                self.assertEqual(len(matches), expected_matches)
+                self.assertEqual(events[-1]['processed'], 2)
+                self.assertEqual(events[-1]['matches'], expected_matches)
+                parse.assert_not_called()
 
     def test_run_with_rate_limit_retries_recovers_transient_navigation_abort(self):
         attempts = []
@@ -671,7 +722,7 @@ class StreamHelpersTest(unittest.TestCase):
         page = FakePage()
         parse_results = {
             'recent-top': {'seller': 'onthemarkco', 'url': 'recent-top', 'ageDays': 12.0},
-            'stale-top': {'seller': 'onthemarkco', 'url': 'stale-top', 'ageDays': float(MAX_LISTING_AGE_DAYS) + 1},
+            'stale-top': {'seller': 'onthemarkco', 'url': 'stale-top', 'ageDays': 81.0},
             'never-top': {'seller': 'onthemarkco', 'url': 'never-top', 'ageDays': 2.0},
             'fresh-coat': {'seller': 'onthemarkco', 'url': 'fresh-coat', 'ageDays': 4.0},
         }
@@ -712,6 +763,7 @@ class StreamHelpersTest(unittest.TestCase):
                     max_links=100,
                     max_scrolls=4,
                     search_id='search-age-cutoff',
+                    max_age_days=80,
                 )
             )
 
@@ -779,7 +831,7 @@ class StreamHelpersTest(unittest.TestCase):
 
         parse_results = {
             'top-1': {'seller': 'seller-top', 'url': 'top-1', 'ageDays': 3.0},
-            'stale-top': {'seller': 'seller-top', 'url': 'stale-top', 'ageDays': float(MAX_LISTING_AGE_DAYS) + 5},
+            'stale-top': {'seller': 'seller-top', 'url': 'stale-top', 'ageDays': 85.0},
             'never-top': {'seller': 'seller-top', 'url': 'never-top', 'ageDays': 1.0},
             'coat-1': {'seller': 'seller-coat', 'url': 'coat-1', 'ageDays': 6.0},
         }
@@ -813,6 +865,7 @@ class StreamHelpersTest(unittest.TestCase):
                     max_links=50,
                     max_scrolls=4,
                     search_id='browse-multi-group',
+                    max_age_days=80,
                 )
             )
 
