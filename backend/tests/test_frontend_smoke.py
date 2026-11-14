@@ -259,6 +259,25 @@ class FrontendSmokeTest(unittest.TestCase):
         self.assertIsNotNone(saved['resultsFilters'])
         self.assertEqual(self.errors, [])
 
+    def test_saved_recommendations_from_other_sellers_are_not_restored(self):
+        self.context.add_init_script("""
+            if (!localStorage.getItem('fixture_ownership_seeded')) {
+                localStorage.setItem('debot.pageWorkspaces.v1', JSON.stringify({tops: {sellerRows: [
+                    {seller: 'fixture_one', results: [
+                        {url: 'https://www.depop.com/products/correct/', seller: 'fixture_one', price: '$25'},
+                        {url: 'https://www.depop.com/products/wrong/', seller: 'another_shop', price: '$30'}
+                    ]}
+                ]}}));
+                localStorage.setItem('fixture_ownership_seeded', '1');
+            }
+        """)
+        self.page.goto(self.url)
+        self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].results.length === 1")
+        self.assertEqual(self.page.locator('.result-card').count(), 1)
+        results = self.page.evaluate("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].results")
+        self.assertEqual(results[0]['seller'], 'fixture_one')
+        self.assertEqual(self.errors, [])
+
     def test_previous_day_or_changed_filter_results_are_not_merged(self):
         self.context.route('**/api/search/stream', lambda route: route.fulfill(
             content_type='text/event-stream', body=''.join(self.event(e) for e in [

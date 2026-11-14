@@ -228,7 +228,9 @@ const currentResultDay = () => {
 const createSellerRow = (account, existingRow = null) => ({
   seller: account.username,
   displayName: account.name || account.username,
-  results: existingRow?.results || [],
+  results: (existingRow?.results || []).filter((item) =>
+    !item.seller || normalizeSellerUsername(item.seller) === account.username
+  ),
   resultsDay: existingRow?.resultsDay || '',
   resultsFilters: existingRow?.resultsFilters || null,
   loading: existingRow?.loading || false,
@@ -823,6 +825,9 @@ function App() {
   };
 
   const addSellerResult = (pageId, sellerUsername, item) => {
+    if (item.seller && normalizeSellerUsername(item.seller) !== sellerUsername) {
+      return;
+    }
     const prev = pageWorkspacesRef.current;
     const next = {
       ...prev,

@@ -11,6 +11,12 @@ from parser import parser  # noqa: E402
 
 
 class ParserLiveExamplesTest(unittest.TestCase):
+    def test_quoted_units_and_short_pit_labels_from_live_search(self):
+        self.assertEqual(parser.extract_tops("24' inch pit to pit, 26' top to bottom"), (24.0, 26.0))
+        self.assertEqual(parser.extract_tops('26.75" length\n21" pit\n16" shoulders'), (21.0, 26.75))
+        self.assertEqual(parser.extract_tops('Pit to pit: 21"\nShoulder to bottom: 27"'), (21.0, 27.0))
+        self.assertEqual(parser.extract_tops('21 inches pit to pit\n27 inches length'), (21.0, 27.0))
+
     def test_numeric_pit_to_pit_labels_used_by_vintage_sellers(self):
         for label in ('Pit2Pit', 'PIT 2 PIT', 'Pit-2-Pit', 'Pit to pit'):
             with self.subTest(label=label):

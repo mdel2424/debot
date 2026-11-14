@@ -1152,7 +1152,8 @@ def _search_seller(ctx, page, seller, groups, gender,
                 streamed_urls.add(url)
                 processed += 1
                 match = None
-                if not _listing_exceeds_age_window(item, max_age_days):
+                if (not _listing_exceeds_age_window(item, max_age_days)
+                        and (not item.get('seller') or item['seller'].lower() == seller.lower())):
                     match = _process_item(
                         item, target_p2p, target_length, p2p_tol, length_tol,
                         category, size_range, bottoms_measurements,
@@ -1320,6 +1321,10 @@ def _search_seller(ctx, page, seller, groups, gender,
 
                     if item:
                         local_items[url] = item
+                        if item.get('seller') and item['seller'].lower() != seller.lower():
+                            yield _sse({"type": "remove", "url": url, "searchId": search_id or None})
+                            yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
+                            continue
                         if _listing_exceeds_age_window(item, max_age_days):
                             age_days = float(item.get("ageDays"))
                             log_debug(

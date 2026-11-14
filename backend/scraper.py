@@ -185,8 +185,16 @@ def _clear_listing_cache() -> None:
 
 
 def get_cached_shop_collection(url, max_links, excluded_urls=None, *, allow_partial=False, allow_stale=False):
-    return SHOP_CACHE.get(url, max_links=max_links, excluded_urls=excluded_urls,
-                          allow_partial=allow_partial, allow_stale=allow_stale)
+    snapshot = SHOP_CACHE.get(url, max_links=max_links, excluded_urls=excluded_urls,
+                              allow_partial=allow_partial, allow_stale=allow_stale)
+    seller = extract_seller_username_from_href(url)
+    if snapshot and seller and any(
+        item.get('seller') and item['seller'].lower() != seller.lower()
+        for item in snapshot.items.values()
+    ):
+        SHOP_CACHE.discard(url)
+        return None
+    return snapshot
 
 
 def cache_shop_collection(page, sold_count=0, *, url=None, items=None, previous=None):
@@ -1404,7 +1412,9 @@ def collect_listing_links(
                     })
                     .map(e => e.getAttribute('href'))
             """)
-            if isinstance(dom_hrefs, list):
+            # Shop API responses are authoritative, including empty categories.
+            # Page-wide anchors can contain recommendations from other sellers.
+            if isinstance(dom_hrefs, list) and not list(_captured_shop_payloads(page)):
                 hrefs.extend(dom_hrefs)
         except Exception:
             pass

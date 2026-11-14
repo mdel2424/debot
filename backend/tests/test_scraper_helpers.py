@@ -427,7 +427,7 @@ class ScraperHelpersTest(unittest.TestCase):
             ["/products/api-active-one/", "/products/api-active-two/"],
         )
 
-    def test_collect_listing_links_merges_captured_api_products_with_dom_links(self):
+    def test_shop_api_products_take_precedence_over_page_wide_dom_links(self):
         page = FakeCollectPage([["/products/dom-one/"]])
         page.captured_shop_pages = [
             {
@@ -448,7 +448,6 @@ class ScraperHelpersTest(unittest.TestCase):
             [
                 "https://www.depop.com/products/api-one/",
                 "https://www.depop.com/products/api-two/",
-                "https://www.depop.com/products/dom-one/",
             ],
         )
 
@@ -776,6 +775,24 @@ class ScraperHelpersTest(unittest.TestCase):
         self.assertEqual(len(links), 24)
         self.assertEqual(len(batches), 1)
         self.assertEqual(page.api_requests, [])
+
+    def test_empty_shop_api_does_not_collect_recommended_dom_products(self):
+        page = FakeCollectPage([['/products/unrelated-recommendation/']])
+        page.captured_shop_pages = [{
+            'status': 200,
+            'text': json.dumps({'objects': [], 'page_info': {'has_more': False}}),
+        }]
+        self.assertEqual(collect_listing_links(page, aggressive_end_scroll=True), [])
+        self.assertEqual(scraper._SHOP_COLLECTION_RESULTS[page], ([], True))
+
+    def test_cross_seller_cached_recommendations_are_discarded(self):
+        url = scraper.build_seller_url('fixture_shop', groups='tops', gender='male')
+        item_url = 'https://www.depop.com/products/recommendation/'
+        scraper.SHOP_CACHE.put(url, scraper.ShopSnapshot([item_url], {
+            item_url: {'url': item_url, 'seller': 'different_shop', 'description': 'P2P 21 length 27'},
+        }, True))
+        self.assertIsNone(scraper.get_cached_shop_collection(url, 1000))
+        self.assertIsNone(scraper.SHOP_CACHE.get(url, max_links=1000))
 
     def test_first_party_telemetry_is_blocked_without_blocking_shop_data(self):
         for path in ('/presentation/api/v1/events/', '/presentation/api/v1/performance/collect/', '/vwdj/gs/ccm/collect'):

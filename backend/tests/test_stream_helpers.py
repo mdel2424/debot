@@ -95,6 +95,24 @@ class StreamHelpersTest(unittest.TestCase):
         with self.assertRaises(SearchCancelled):
             sleep_with_cancel(0.02, should_cancel=should_cancel, interval_seconds=0.01)
 
+    def test_seller_search_rejects_a_recommendation_owned_by_another_seller(self):
+        items = {
+            'wrong-owner': {'url': 'wrong-owner', 'seller': 'other_shop', 'description': 'P2P 21 inches length 27 inches'},
+            'correct-owner': {'url': 'correct-owner', 'seller': 'fixture_shop', 'description': 'P2P 21 inches length 27 inches'},
+        }
+        with (
+            patch('main._load_page_with_retries'), patch('main.install_shop_products_capture'),
+            patch('main.extract_seller_sold_count', return_value=100), patch('main.remove_sold_sections'),
+            patch('main.collect_listing_links', return_value=list(items)),
+            patch('main.get_cached_listing', side_effect=items.get),
+        ):
+            events = self._decode_events(list(_search_seller(
+                FakeContext(), FakePage(), 'fixture_shop', ['tops'], 'male',
+                21, 27, 0.75, 1, 40, 1000, 1, 'owner-check',
+            )))
+        self.assertEqual([event['item']['url'] for event in events if event['type'] == 'match'], ['correct-owner'])
+        self.assertEqual(events[-1]['matches'], 1)
+
     def test_run_with_rate_limit_retries_uses_expected_backoff(self):
         attempts = []
         delays = []

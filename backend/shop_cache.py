@@ -144,6 +144,12 @@ class ShopCache:
                 return copy.deepcopy(newest[2].items[url])
         return None
 
+    def discard(self, key):
+        with self._lock:
+            if key in self._entries:
+                self._remove(key)
+                self._persist()
+
     def invalidate_urls(self, urls):
         urls = set(urls)
         if not urls:

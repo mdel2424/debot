@@ -9,12 +9,12 @@ class MeasurementParser:
     """Parses clothing measurements from text descriptions."""
     
     NUM = r'(?P<val>\d+(?:\.\d+)?(?:\s+\d\/\d)?)'
-    UNIT = r'(?P<unit>\s*(?:cm|mm|in|inch|inches|["″"]))?'
+    UNIT = r'''(?P<unit>\s*(?:cm|mm|["'″]?\s*(?:inches|inch|in)\b|["'″]))?'''
     LINE_LABEL_GAP = 40
-    P2P_LABELS = r'(?:p2p|pit\s*[- ]?(?:to|2)\s*[- ]?pit|chest|width|across\s*chest)'
+    P2P_LABELS = r'(?:p2p|pit\s*[- ]?(?:to|2)\s*[- ]?pit|chest|width|across\s*chest|pit)'
     LENGTH_LABELS = (
         r'(?:length|top\s*to\s*bottom|back\s*length|hps\s*to\s*hem|'
-        r'neck\s*to\s*hem|shoulder\s*to\s*hem|'
+        r'neck\s*to\s*hem|shoulder\s*to\s*(?:hem|bottom)|'
         r'collar\s*(?:[- ]?down|to\s*(?:bottom|hem)))'
     )
     WAIST_LABELS = r'(?:waist|waistband|across\s*waist)'
