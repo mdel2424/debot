@@ -31,12 +31,19 @@ from scraper import (
     dismiss_login_modal,
     flush_debug_logs,
     get_cached_listing,
+    get_cached_shop_collection,
+    cache_shop_collection,
+    cache_parsed_collection,
+    unavailable_shop_urls,
+    invalidate_cached_listings,
+    prepare_shop_collection_retry,
     remove_sold_sections,
     collect_listing_links,
     parse_listing,
     extract_seller_sold_count,
     extract_retry_after_seconds,
     create_browser_context,
+    remember_browser_state,
     get_following_list,
     guarded_goto,
     install_shop_products_capture,
@@ -364,7 +371,9 @@ def _is_transient_navigation_error(exc: Exception) -> bool:
     """Detect Playwright navigation errors that are safe to recover by rebuilding the session."""
     if isinstance(exc, CollectionIncompleteError):
         return False
-    if isinstance(exc, (PlaywrightTimeoutError, FetchError)):
+    if isinstance(exc, FetchError):
+        return exc.status is None or exc.status in (408, 425) or exc.status >= 500
+    if isinstance(exc, PlaywrightTimeoutError):
         return True
     message = str(exc or "").lower()
     return any(
@@ -533,8 +542,8 @@ def _start_parallel_listing_parser(
             )
 
         def before_retry(attempt, total_attempts, delay, exc, label):
-            del attempt, total_attempts, delay, exc, label
-            rebuild_worker()
+            if not isinstance(exc, (RateLimitError, FetchError)):
+                rebuild_worker()
 
         return _run_with_rate_limit_retries(
             open_listing,
@@ -763,6 +772,43 @@ def _process_item(item: Dict[str, Any], target_p2p: float, target_length: float,
     return _build_match_payload(item)
 
 
+def _cached_seller_collections(payload):
+    """Reserve fresh data only when it covers the budget or enough fit matches."""
+    seller = payload.get("seller")
+    if not seller:
+        return None
+    seen = set()
+    snapshots = {}
+    match_count = 0
+    measurements = payload.get("measurements") or {}
+    size_range = _normalize_size_range(payload.get("sizeRange"))
+    bottoms = _normalize_bottoms_measurements(payload.get("bottomsMeasurements"))
+    for group in _normalize_groups(payload.get("groups") or "tops"):
+        remaining = payload["maxLinks"] - len(seen)
+        if remaining <= 0:
+            break
+        url = build_seller_url(seller, groups=group, gender=payload.get("gender") or "male")
+        snapshot = get_cached_shop_collection(url, remaining, seen, allow_partial=True)
+        if snapshot is None:
+            return None
+        snapshots[group] = snapshot
+        for item in snapshot.items.values():
+            if _listing_exceeds_age_window(item, payload.get("maxAgeDays")):
+                continue
+            if _process_item(
+                item, measurements.get("first"), measurements.get("second"),
+                payload["p2pTolerance"], payload["lengthTolerance"],
+                payload["category"], size_range, bottoms,
+            ):
+                match_count += 1
+                if match_count >= payload["maxItems"]:
+                    return snapshots
+        if not snapshot.complete and len(snapshot.links) < remaining:
+            return None
+        seen.update(snapshot.links)
+    return snapshots
+
+
 def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
     """Start or retrieve a console-owned search job."""
     if isinstance(payload, dict) and isinstance(payload.get("searchId"), str):
@@ -810,10 +856,21 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
     def emit_stream_event(event_payload: Dict[str, Any]) -> None:
         job.publish(_sse(event_payload))
 
-    def run_search():
+    def run_search(cached_collections=None):
         """Synchronous search generator."""
         try:
             yield _sse({"type": "hello", "searchId": search_id, "ts": dt.datetime.now(dt.timezone.utc).isoformat()})
+
+            if cached_collections is not None:
+                yield from _search_seller(
+                    None, None, seller, groups, gender,
+                    target_p2p, target_length, p2p_tol, length_tol,
+                    max_items, max_links, max_scrolls, search_id,
+                    category, size_range, bottoms_measurements,
+                    emit_event=emit_stream_event, max_age_days=max_age_days,
+                    cached_collections=cached_collections,
+                )
+                return
 
             with sync_playwright() as pw:
                 browser, ctx = create_browser_context(pw, headless=headless, slowmo=slowmo)
@@ -826,6 +883,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
                     except Exception:
                         pass
                     try:
+                        remember_browser_state(ctx)
                         ctx.close()
                     except Exception:
                         pass
@@ -836,7 +894,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
 
                     browser, ctx = create_browser_context(pw, headless=headless, slowmo=slowmo)
                     page = ctx.new_page()
-                    log_debug("[stream] Rebuilt Playwright browser session after rate limit")
+                    log_debug("[stream] Rebuilt Playwright browser after navigation failure")
                     return ctx, page
 
                 try:
@@ -871,6 +929,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
                         yield _sse({"type": "cancelled", "searchId": search_id or None})
                 finally:
                     try:
+                        remember_browser_state(ctx)
                         ctx.close()
                     finally:
                         browser.close()
@@ -892,6 +951,11 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
         acquired_slot = False
         waiting_state = None
         try:
+            cached_collections = _cached_seller_collections(payload)
+            if cached_collections is not None:
+                for chunk in run_search(cached_collections):
+                    job.publish(chunk)
+                return
             while not _is_cancelled(search_id):
                 with RATE_LIMIT_STATE_LOCK:
                     blocked_until = RATE_LIMIT_BLOCKED_UNTIL_TS
@@ -997,14 +1061,15 @@ def _search_seller(ctx, page, seller, groups, gender,
                    emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
                    reset_session: Optional[Callable[[], tuple[Any, Any]]] = None,
                    parse_workers: int = 1, headless: bool = True, slowmo: int = 0,
-                   max_age_days: Optional[float] = None):
+                   max_age_days: Optional[float] = None, cached_collections=None):
     """Search a specific seller's listings."""
     should_cancel = _cancel_check(search_id)
     normalized_groups = _normalize_groups(groups)
     processed = 0
     matches = 0
     total = 0
-    install_shop_products_capture(page)
+    streamed_urls = set()
+    local_items = {}
 
     def notify_rate_limit(attempt: int, total_attempts: int, delay: int, exc: Exception, label: str) -> None:
         if not emit_event:
@@ -1028,6 +1093,11 @@ def _search_seller(ctx, page, seller, groups, gender,
 
     def rebuild_seller_page(attempt: int, total_attempts: int, delay: int, exc: Exception, label: str) -> None:
         nonlocal ctx, page, current_seller_page_url
+        if isinstance(exc, (RateLimitError, FetchError)):
+            if label == "collecting listings" and prepare_shop_collection_retry(page):
+                return
+            current_seller_page_url = None
+            return
         if reset_session:
             ctx, page = reset_session()
         install_shop_products_capture(page)
@@ -1048,11 +1118,79 @@ def _search_seller(ctx, page, seller, groups, gender,
     seller_sold_count = 0
     seen_urls = set()
     grouped_links = []
+    collected_snapshots = []
     current_seller_page_url = None
 
     for group in normalized_groups:
         raise_if_cancelled(should_cancel)
+        remaining_capacity = max(max_links - len(seen_urls), 0)
+        if remaining_capacity <= 0 or matches >= max_items:
+            break
         search_url = build_seller_url(seller, groups=group, gender=gender)
+        group_urls = set()
+
+        def publish_cached_batch(urls):
+            nonlocal processed, matches, total
+            unavailable = unavailable_shop_urls(page) if page is not None else set()
+            invalidate_cached_listings(unavailable)
+            for url in unavailable:
+                local_items.pop(url, None)
+                if emit_event:
+                    emit_event({"type": "remove", "url": url, "searchId": search_id or None})
+            group_urls.update(urls)
+            total = len(seen_urls | group_urls)
+            if not emit_event:
+                return True
+            for url in urls:
+                raise_if_cancelled(should_cancel)
+                if url in streamed_urls or url in seen_urls or url in unavailable:
+                    continue
+                item = get_cached_listing(url) or local_items.get(url)
+                if item is None:
+                    continue
+                local_items[url] = item
+                streamed_urls.add(url)
+                processed += 1
+                match = None
+                if not _listing_exceeds_age_window(item, max_age_days):
+                    match = _process_item(
+                        item, target_p2p, target_length, p2p_tol, length_tol,
+                        category, size_range, bottoms_measurements,
+                    )
+                    if match:
+                        match["soldCount"] = seller_sold_count
+                        emit_event({"type": "match", "item": match, "searchId": search_id or None})
+                        matches += 1
+                if match is None:
+                    emit_event({"type": "remove", "url": url, "searchId": search_id or None})
+                emit_event({
+                    "type": "progress", "phase": "parsing", "processed": processed,
+                    "total": total, "matches": matches, "searchId": search_id or None,
+                })
+                if matches >= max_items:
+                    return False
+            return True
+
+        snapshot = (
+            cached_collections.get(group) if cached_collections is not None
+            else get_cached_shop_collection(search_url, remaining_capacity, seen_urls,
+                                            allow_partial=True, allow_stale=True)
+        )
+        if snapshot is not None:
+            local_items.update(snapshot.items)
+            seller_sold_count = max(seller_sold_count, snapshot.sold_count)
+            if snapshot.fresh:
+                keep_collecting = publish_cached_batch(snapshot.links)
+                if not keep_collecting or snapshot.complete or len(snapshot.links) >= remaining_capacity:
+                    seen_urls.update(snapshot.links)
+                    grouped_links.append((group, snapshot.links))
+                    continue
+
+        refresh_base = get_cached_shop_collection(search_url, 10000, allow_partial=True, allow_stale=True)
+
+        if page is None:
+            raise FetchError("The cached shop does not cover this search.")
+        install_shop_products_capture(page)
         log_debug(f"[stream] navigating: {search_url}")
 
         _load_page_with_retries(
@@ -1070,10 +1208,6 @@ def _search_seller(ctx, page, seller, groups, gender,
             seller_sold_count = extract_seller_sold_count(page) or 0
 
         remove_sold_sections(page)
-
-        remaining_capacity = max(max_links - len(seen_urls), 0)
-        if remaining_capacity <= 0:
-            break
 
         def collect_group_links(current_capacity=remaining_capacity, current_url=search_url):
             nonlocal current_seller_page_url
@@ -1100,6 +1234,8 @@ def _search_seller(ctx, page, seller, groups, gender,
                 aggressive_end_scroll=True,
                 excluded_urls=seen_urls,
                 before_request=lambda: _sleep_request_jitter(should_cancel),
+                on_batch=publish_cached_batch,
+                known_urls=set(refresh_base.links) if refresh_base is not None and refresh_base.complete else None,
             )
 
         links = _run_with_rate_limit_retries(
@@ -1109,6 +1245,16 @@ def _search_seller(ctx, page, seller, groups, gender,
             on_rate_limit=notify_rate_limit,
             before_retry=rebuild_seller_page,
         )
+        updated = cache_shop_collection(page, seller_sold_count, url=search_url,
+                                        items=local_items, previous=snapshot)
+        if updated is not None:
+            if len(updated.items) < len(updated.links):
+                collected_snapshots.append((search_url, updated, seller_sold_count))
+            if snapshot is not None and updated.complete and emit_event:
+                for removed_url in set(snapshot.links) - set(updated.links):
+                    emit_event({"type": "remove", "url": removed_url, "searchId": search_id or None})
+            local_items.update(updated.items)
+            links = updated.links[:remaining_capacity]
         unique_links = [url for url in links if url not in seen_urls]
         seen_urls.update(unique_links)
         grouped_links.append((group, unique_links))
@@ -1116,11 +1262,15 @@ def _search_seller(ctx, page, seller, groups, gender,
     total = sum(len(urls) for _, urls in grouped_links)
     log_debug(f"[stream] collected {total} links for @{seller}")
     
-    yield _sse({"type": "meta", "links": total, "seller": seller, "searchId": search_id or None})
+    yield _sse({"type": "meta", "links": total, "seller": seller, "processed": processed, "matches": matches, "searchId": search_id or None})
+    if matches >= max_items:
+        yield emit_done("match_limit")
+        return
 
     parser_pool = None
     uncached_count = sum(
-        get_cached_listing(url) is None for _, links in grouped_links for url in links
+        url not in local_items and get_cached_listing(url) is None
+        for _, links in grouped_links for url in links if url not in streamed_urls
     )
     if uncached_count > 1:
         parser_pool = _start_parallel_listing_parser(
@@ -1135,6 +1285,9 @@ def _search_seller(ctx, page, seller, groups, gender,
     def parse_sequential(current_links):
         for current_url in current_links:
             raise_if_cancelled(should_cancel)
+            if current_url in local_items:
+                yield current_url, local_items[current_url]
+                continue
 
             def open_listing(url=current_url):
                 return _parse_listing_with_request_pacing(
@@ -1154,6 +1307,7 @@ def _search_seller(ctx, page, seller, groups, gender,
 
     try:
         for group, links in grouped_links:
+            links = [url for url in links if url not in streamed_urls]
             parsed_items = (
                 parser_pool.map_ordered(links)
                 if parser_pool is not None
@@ -1165,6 +1319,7 @@ def _search_seller(ctx, page, seller, groups, gender,
                     processed += 1
 
                     if item:
+                        local_items[url] = item
                         if _listing_exceeds_age_window(item, max_age_days):
                             age_days = float(item.get("ageDays"))
                             log_debug(
@@ -1172,6 +1327,7 @@ def _search_seller(ctx, page, seller, groups, gender,
                                 f"(>{max_age_days}d requested window)"
                             )
                             yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
+                            yield _sse({"type": "remove", "url": url, "searchId": search_id or None})
                             continue
 
                         match = _process_item(
@@ -1196,6 +1352,8 @@ def _search_seller(ctx, page, seller, groups, gender,
                             if matches >= max_items:
                                 yield emit_done("match_limit")
                                 return
+                        else:
+                            yield _sse({"type": "remove", "url": url, "searchId": search_id or None})
 
                     yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
             finally:
@@ -1205,6 +1363,8 @@ def _search_seller(ctx, page, seller, groups, gender,
     finally:
         if parser_pool is not None:
             parser_pool.close()
+        for url, snapshot, sold_count in collected_snapshots:
+            cache_parsed_collection(url, snapshot.links, local_items, snapshot.complete, sold_count)
 
     yield emit_done("link_limit" if total >= max_links else "completed")
 
@@ -1253,6 +1413,11 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
 
     def rebuild_browse_session(attempt: int, total_attempts: int, delay: int, exc: Exception, label: str) -> None:
         nonlocal ctx, page, item_page, current_browse_page_url
+        if isinstance(exc, (RateLimitError, FetchError)):
+            if label == "collecting listings" and prepare_shop_collection_retry(page):
+                return
+            current_browse_page_url = None
+            return
         try:
             item_page.close()
         except Exception:

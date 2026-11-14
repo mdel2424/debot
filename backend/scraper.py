@@ -13,8 +13,10 @@ from email.utils import parsedate_to_datetime
 from typing import Optional, List, Dict, Any, Callable
 from urllib.parse import urljoin, urlparse, urlencode, parse_qsl
 from weakref import WeakKeyDictionary, WeakSet
+from pathlib import Path
 
 from playwright.sync_api import sync_playwright, Page, BrowserContext
+from shop_cache import ShopCache, ShopSnapshot
 
 # Constants
 PRICE_RX = re.compile(r"([$£€]\s?\d[\d,]*(?:\.\d{2})?)")
@@ -93,9 +95,14 @@ _LAST_NAVIGATION_STARTED_AT = 0.0
 _NAVIGATION_PACING_UNTIL_TS = 0.0
 _CAPTURED_SHOP_PRODUCT_PAGES = WeakKeyDictionary()
 _SHOP_PRODUCTS_CAPTURE_INSTALLED_PAGES = WeakSet()
+_SHOP_COLLECTION_RESULTS = WeakKeyDictionary()
+_SHOP_COLLECTION_BOUNDARIES = WeakSet()
+_SHOP_COLLECTION_RETRY_URLS = WeakKeyDictionary()
 _CAPTURED_SHOP_PRODUCT_LOCK = threading.Lock()
 _LISTING_CACHE: OrderedDict[str, tuple[float, Dict[str, Any]]] = OrderedDict()
 _LISTING_CACHE_LOCK = threading.Lock()
+_BROWSER_STATE_LOCK = threading.Lock()
+_BROWSER_STORAGE_STATE = None
 
 
 def _read_float_env(name: str, default: float) -> float:
@@ -118,8 +125,16 @@ def _read_int_env(name: str, default: int) -> int:
 
 MIN_NAV_INTERVAL_SECONDS = _read_float_env("DEBOT_MIN_NAV_INTERVAL_SECONDS", 0.0)
 RATE_LIMIT_NAV_INTERVAL_SECONDS = _read_float_env("DEBOT_RATE_LIMIT_NAV_INTERVAL_SECONDS", 1.0)
+REQUEST_INTERVAL_SECONDS = _read_float_env("DEBOT_REQUEST_INTERVAL_SECONDS", 1.0)
 LISTING_CACHE_TTL_SECONDS = _read_float_env("DEBOT_LISTING_CACHE_TTL_SECONDS", 300.0)
 LISTING_CACHE_MAX_ITEMS = _read_int_env("DEBOT_LISTING_CACHE_MAX_ITEMS", 1000)
+SHOP_CACHE = ShopCache(
+    ttl_seconds=_read_float_env("DEBOT_SHOP_CACHE_TTL_SECONDS", 300),
+    max_items=_read_int_env("DEBOT_SHOP_CACHE_MAX_ITEMS", 50000),
+    max_entries=_read_int_env("DEBOT_SHOP_CACHE_MAX_ENTRIES", 256),
+    path=os.environ.get("DEBOT_SHOP_CACHE_PATH", str(Path(__file__).parent / '.cache' / 'shops.sqlite3')),
+    day_key=lambda: dt.date.today().isoformat(),
+)
 
 
 def get_cached_listing(url: str) -> Optional[Dict[str, Any]]:
@@ -135,12 +150,12 @@ def get_cached_listing(url: str) -> Optional[Dict[str, Any]]:
     with _LISTING_CACHE_LOCK:
         cached = _LISTING_CACHE.get(cache_key)
         if cached is None:
-            return None
+            return SHOP_CACHE.find_listing(cache_key)
 
         cached_at, item = cached
         if now - cached_at > LISTING_CACHE_TTL_SECONDS:
             _LISTING_CACHE.pop(cache_key, None)
-            return None
+            return SHOP_CACHE.find_listing(cache_key)
 
         _LISTING_CACHE.move_to_end(cache_key)
         return copy.deepcopy(item)
@@ -166,6 +181,58 @@ def _clear_listing_cache() -> None:
     """Clear cached listings for isolated tests."""
     with _LISTING_CACHE_LOCK:
         _LISTING_CACHE.clear()
+    SHOP_CACHE.clear()
+
+
+def get_cached_shop_collection(url, max_links, excluded_urls=None, *, allow_partial=False, allow_stale=False):
+    return SHOP_CACHE.get(url, max_links=max_links, excluded_urls=excluded_urls,
+                          allow_partial=allow_partial, allow_stale=allow_stale)
+
+
+def cache_shop_collection(page, sold_count=0, *, url=None, items=None, previous=None):
+    result = _SHOP_COLLECTION_RESULTS.get(page)
+    if result is None:
+        return
+    links, complete = result
+    known = items or {}
+    unavailable = unavailable_shop_urls(page)
+    if previous is not None and not complete:
+        previous = SHOP_CACHE.get(url or page.url, max_links=SHOP_CACHE.max_items,
+                                  allow_partial=True, allow_stale=True) or previous
+        links = list(dict.fromkeys([*links, *previous.links]))
+        complete = previous.complete and page in _SHOP_COLLECTION_BOUNDARIES
+    links = [link for link in links if link not in unavailable]
+    records = {link: get_cached_listing(link) or known.get(link) for link in links}
+    snapshot = ShopSnapshot(links, {key: item for key, item in records.items() if item is not None}, complete, sold_count)
+    SHOP_CACHE.put(url or page.url, snapshot)
+    return snapshot
+
+
+def cache_parsed_collection(url, links, items, complete, sold_count):
+    records = {link: items.get(link) or get_cached_listing(link) for link in links}
+    if all(item is not None for item in records.values()):
+        SHOP_CACHE.put(url, ShopSnapshot(links, records, complete, sold_count))
+
+
+def invalidate_cached_listings(urls):
+    with _LISTING_CACHE_LOCK:
+        for url in urls:
+            _LISTING_CACHE.pop(url, None)
+    SHOP_CACHE.invalidate_urls(urls)
+
+
+def unavailable_shop_urls(page):
+    return {
+        f"https://www.depop.com/products/{str(product['slug']).strip('/')}/"
+        for _, payload in _captured_shop_payloads(page)
+        for product in _shop_product_payload_products(payload)
+        if product.get('slug') and (
+            product.get('sold') is True
+            or product.get('active_status') not in (None, 'active')
+            or any(signal in str(product.get('status', '')).lower()
+                   for signal in ('sold', 'purchased', 'deleted', 'removed'))
+        )
+    }
 
 
 class SearchCancelled(Exception):
@@ -176,6 +243,10 @@ class FetchError(RuntimeError):
     """A page could not be read; never count it as a successful empty scan."""
 
     code = "fetch_failed"
+
+    def __init__(self, message, *, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 class CollectionIncompleteError(FetchError):
@@ -262,7 +333,7 @@ def _current_navigation_interval_seconds() -> float:
     return interval
 
 
-def wait_for_navigation_slot(should_cancel: CancelCheck = None) -> None:
+def wait_for_navigation_slot(should_cancel: CancelCheck = None, *, minimum_interval=0.0) -> None:
     """Share pacing between page navigations and public pagination requests."""
     global _LAST_NAVIGATION_STARTED_AT
 
@@ -271,7 +342,7 @@ def wait_for_navigation_slot(should_cancel: CancelCheck = None) -> None:
         if _NAVIGATION_LOCK.acquire(timeout=0.1):
             break
     try:
-        interval = _current_navigation_interval_seconds()
+        interval = max(_current_navigation_interval_seconds(), minimum_interval)
         now = time.monotonic()
         delay = interval - (now - _LAST_NAVIGATION_STARTED_AT)
         if delay > 0:
@@ -290,9 +361,10 @@ def guarded_goto(
     wait_until: str = "domcontentloaded",
     timeout: int = 60_000,
     should_cancel: CancelCheck = None,
+    minimum_interval: float = 0.0,
 ):
     """Space navigation starts without holding a lock during network requests."""
-    wait_for_navigation_slot(should_cancel)
+    wait_for_navigation_slot(should_cancel, minimum_interval=minimum_interval)
     clear_shop_products_capture(page)
     return page.goto(url, wait_until=wait_until, timeout=timeout)
 
@@ -311,6 +383,10 @@ def should_block_request(request: Any) -> bool:
     except Exception:
         url = ""
 
+    parsed = urlparse(url)
+    if parsed.hostname and (parsed.hostname == "depop.com" or parsed.hostname.endswith(".depop.com")):
+        if parsed.path.startswith(("/presentation/api/v1/events/", "/presentation/api/v1/performance/collect/", "/vwdj/")):
+            return True
     return any(signal in url for signal in BLOCKED_URL_SIGNALS)
 
 
@@ -463,7 +539,7 @@ def check_page_for_rate_limit(
         )
 
     if response_status is not None and response_status >= 400:
-        raise FetchError(f"Depop returned HTTP {response_status} while loading {page.url}.")
+        raise FetchError(f"Depop returned HTTP {response_status} while loading {page.url}.", status=response_status)
 
 
 def parse_iso_datetime(ts: str) -> Optional[dt.datetime]:
@@ -940,6 +1016,16 @@ def _store_captured_shop_product_page(
 
     with _CAPTURED_SHOP_PRODUCT_LOCK:
         pages = _CAPTURED_SHOP_PRODUCT_PAGES.setdefault(page, [])
+        previous = next((entry for entry in pages if entry["url"] == str(url)), None)
+        if previous is not None:
+            if previous["status"] == normalized_status and retry_after is None:
+                retry_after = previous.get("retryAfter")
+            if previous["status"] == normalized_status and previous["text"] == text:
+                if retry_after is not None:
+                    previous["retryAfter"] = retry_after
+                return
+            if normalized_status < 400 and not text and previous["text"]:
+                return
         pages[:] = [entry for entry in pages if entry["url"] != str(url)]
         pages.append({"url": str(url), "status": normalized_status, "text": text, "retryAfter": retry_after})
         if len(pages) > SHOP_PRODUCTS_CAPTURE_MAX_PAGES:
@@ -964,16 +1050,28 @@ def install_shop_products_capture(page: Page) -> None:
                     response_url = getattr(response, "url", "")
                     if not _is_shop_product_api_url(response_url):
                         return
+                    response_status = getattr(response, "status", 0)
+                    retry_after = extract_retry_after_seconds(response)
+                    _store_captured_shop_product_page(page, response_url, response_status, "", retry_after)
+                except Exception:
+                    pass
+
+            def capture_finished_request(request):
+                # The response event can precede the body, especially for routed Firefox requests.
+                try:
+                    if not _is_shop_product_api_url(request.url):
+                        return
+                    response = request.response()
+                    if response is None or response.status >= 400:
+                        return
                     try:
                         text = response.text()
                     except Exception:
-                        # Firefox can omit routed response bodies. The page hook
-                        # records those bodies; keep HTTP errors here regardless.
-                        text = ""
+                        return
                     _store_captured_shop_product_page(
                         page,
-                        response_url,
-                        getattr(response, "status", 0),
+                        response.url,
+                        response.status,
                         text,
                         extract_retry_after_seconds(response),
                     )
@@ -981,7 +1079,8 @@ def install_shop_products_capture(page: Page) -> None:
                     pass
 
             page.on("response", capture_response)
-            page.on("close", lambda: clear_shop_products_capture(page))
+            page.on("requestfinished", capture_finished_request)
+            page.on("close", lambda: _forget_shop_page(page))
         except Exception:
             pass
 
@@ -998,25 +1097,51 @@ def install_shop_products_capture(page: Page) -> None:
 
 def _read_captured_shop_product_pages(page: Page) -> List[Dict[str, Any]]:
     """Return captured seller product API response payloads from the browser page."""
-    with _CAPTURED_SHOP_PRODUCT_LOCK:
-        captured_pages = list(_CAPTURED_SHOP_PRODUCT_PAGES.get(page, []))
-
     try:
         browser_pages = page.evaluate("""() => Array.isArray(window.__debotShopProductPages)
-            ? window.__debotShopProductPages.slice()
+            ? window.__debotShopProductPages.splice(0)
             : []
         """)
         if isinstance(browser_pages, list):
-            captured_pages = [entry for entry in browser_pages if isinstance(entry, dict)] + captured_pages
+            for entry in browser_pages:
+                if isinstance(entry, dict):
+                    _store_captured_shop_product_page(
+                        page, entry.get("url", ""), entry.get("status"), entry.get("text", ""),
+                        _parse_retry_after_seconds(entry.get("retryAfter")),
+                    )
     except Exception:
         pass
 
-    return captured_pages
+    with _CAPTURED_SHOP_PRODUCT_LOCK:
+        return list(_CAPTURED_SHOP_PRODUCT_PAGES.get(page, []))
+
+
+def prepare_shop_collection_retry(page):
+    """Retry the failed cursor without discarding successful pages or cookies."""
+    entries = _read_captured_shop_product_pages(page)
+    failed = [entry for entry in entries if int(entry.get("status") or 0) >= 400]
+    urls = [entry["url"] for entry in failed if _is_shop_product_api_url(entry.get("url"))]
+    if not urls:
+        return False
+    with _CAPTURED_SHOP_PRODUCT_LOCK:
+        _CAPTURED_SHOP_PRODUCT_PAGES[page] = [entry for entry in entries if entry not in failed]
+        _SHOP_COLLECTION_RETRY_URLS[page] = list(dict.fromkeys(urls))
+    return True
+
+
+def _forget_shop_page(page):
+    with _CAPTURED_SHOP_PRODUCT_LOCK:
+        _CAPTURED_SHOP_PRODUCT_PAGES.pop(page, None)
+        _SHOP_PRODUCTS_CAPTURE_INSTALLED_PAGES.discard(page)
+        _SHOP_COLLECTION_RESULTS.pop(page, None)
+        _SHOP_COLLECTION_RETRY_URLS.pop(page, None)
 
 
 def clear_shop_products_capture(page: Page) -> None:
     """Do not carry a previous shop/category's responses into a new navigation."""
     with _CAPTURED_SHOP_PRODUCT_LOCK:
+        _SHOP_COLLECTION_RESULTS.pop(page, None)
+        _SHOP_COLLECTION_RETRY_URLS.pop(page, None)
         if page not in _CAPTURED_SHOP_PRODUCT_PAGES:
             return
         _CAPTURED_SHOP_PRODUCT_PAGES[page] = []
@@ -1067,11 +1192,14 @@ def _captured_shop_payloads(page: Page):
                 retry_after_seconds=_parse_retry_after_seconds(entry.get("retryAfter")),
             )
         if status >= 400:
-            raise FetchError(f"Depop returned HTTP {status} while loading more listings.")
+            raise FetchError(f"Depop returned HTTP {status} while loading more listings.", status=status)
         if not text:
             continue
         try:
-            payload = json.loads(text)
+            payload = entry.get("payload")
+            if payload is None:
+                payload = json.loads(text)
+                entry["payload"] = payload
         except (TypeError, ValueError) as exc:
             raise FetchError("Depop returned an unreadable shop products response.") from exc
         if not isinstance(payload, dict):
@@ -1194,7 +1322,7 @@ def _next_shop_products_url(page: Page) -> tuple[Optional[str], bool]:
 
 
 def _load_shop_products_page(page: Page, url: str, should_cancel: CancelCheck) -> None:
-    wait_for_navigation_slot(should_cancel)
+    wait_for_navigation_slot(should_cancel, minimum_interval=REQUEST_INTERVAL_SECONDS)
     response = page.evaluate("""async (url) => {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 15000);
@@ -1225,21 +1353,37 @@ def collect_listing_links(
     aggressive_end_scroll: bool = False,
     excluded_urls: Optional[set[str]] = None,
     before_request: Optional[Callable[[], None]] = None,
+    on_batch: Optional[Callable[[List[str]], bool]] = None,
+    known_urls: Optional[set[str]] = None,
 ) -> List[str]:
     """Collect product listing links from the current page."""
     seen: set = set()
     ordered: List[str] = []
+    all_ordered: List[str] = []
     excluded = excluded_urls or set()
     
     u = urlparse(page.url)
     origin = f"{u.scheme}://{u.netloc}"
+
+    _SHOP_COLLECTION_RESULTS.pop(page, None)
+    _SHOP_COLLECTION_BOUNDARIES.discard(page)
+    with _CAPTURED_SHOP_PRODUCT_LOCK:
+        retry_urls = _SHOP_COLLECTION_RETRY_URLS.pop(page, [])
+    for retry_url in retry_urls:
+        if before_request:
+            before_request()
+        _load_shop_products_page(page, retry_url, should_cancel)
+
+    def finish(complete=False):
+        _SHOP_COLLECTION_RESULTS[page] = (list(all_ordered), complete)
+        return ordered
     
     def stall_limit() -> int:
         if len(seen) <= EARLY_SCROLL_LINK_THRESHOLD:
             return MAX_STALLED_SCROLL_STEPS + EARLY_SCROLL_STALL_BUFFER
         return MAX_STALLED_SCROLL_STEPS
 
-    def collect_visible_links() -> None:
+    def collect_visible_links() -> bool:
         hrefs: List[Any] = []
 
         hrefs.extend(extract_captured_shop_product_hrefs(page))
@@ -1271,10 +1415,15 @@ def collect_listing_links(
                 continue
             if full not in seen:
                 seen.add(full)
+                all_ordered.append(full)
                 if full not in excluded:
                     ordered.append(full)
                 if max_links and len(ordered) >= max_links:
-                    return
+                    break
+        if on_batch and ordered:
+            # DOM links may arrive before their API details, so revisit uncached links too.
+            return on_batch(list(ordered)) is not False
+        return True
 
     if aggressive_end_scroll:
         # A scroll hint must never truncate a growing shop to 12/24 items.
@@ -1286,13 +1435,26 @@ def collect_listing_links(
 
         for batch in range(total_batches):
             raise_if_cancelled(should_cancel)
-            collect_visible_links()
+            if not collect_visible_links():
+                return finish()
             if max_links and len(ordered) >= max_links:
-                return ordered
+                return finish()
 
             next_url, exhausted = _next_shop_products_url(page)
             if exhausted:
-                return ordered
+                return finish(complete=True)
+            if known_urls and next_url:
+                # Two whole known pages avoid stopping on a pinned/reordered old item.
+                payloads = list(_captured_shop_payloads(page))
+                recent_pages = payloads[-2:]
+                if len(recent_pages) == 2 and all(
+                    _shop_product_payload_products(payload) and all(
+                        f"https://www.depop.com/products/{str(product.get('slug', '')).strip('/')}/" in known_urls
+                        for product in _shop_product_payload_products(payload)
+                    ) for _, payload in recent_pages
+                ):
+                    _SHOP_COLLECTION_BOUNDARIES.add(page)
+                    return finish()
             if next_url:
                 if next_url in requested_pages:
                     raise CollectionIncompleteError("Shop pagination stopped advancing before all listings were collected.")
@@ -1310,7 +1472,7 @@ def collect_listing_links(
 
             if stalled_batches >= stall_limit():
                 check_page_for_rate_limit(page, expect_product_links=True)
-                return ordered
+                return finish()
 
             if before_request:
                 before_request()
@@ -1325,9 +1487,10 @@ def collect_listing_links(
             except Exception:
                 pass
             page.wait_for_timeout(wait_ms)
-        collect_visible_links()
+        if not collect_visible_links():
+            return finish()
         if max_links and len(ordered) >= max_links:
-            return ordered
+            return finish()
         raise CollectionIncompleteError("Collection reached its safety limit before the shop was exhausted.")
     else:
         total_steps = max(max_scrolls, 0) * SCROLL_STEPS_PER_BATCH
@@ -1337,9 +1500,10 @@ def collect_listing_links(
 
         for step in range(total_steps):
             raise_if_cancelled(should_cancel)
-            collect_visible_links()
+            if not collect_visible_links():
+                return finish()
             if max_links and len(ordered) >= max_links:
-                return ordered
+                return finish()
 
             if len(seen) == last_count:
                 stalled_steps += 1
@@ -1367,7 +1531,7 @@ def collect_listing_links(
     if not ordered:
         check_page_for_rate_limit(page, expect_product_links=True)
     
-    return ordered
+    return finish()
 
 
 LISTING_DOM_EXTRACTOR = r"""() => {
@@ -1492,6 +1656,7 @@ def parse_listing(
             wait_until="domcontentloaded",
             timeout=60_000,
             should_cancel=should_cancel,
+            minimum_interval=REQUEST_INTERVAL_SECONDS,
         )
         raise_if_cancelled(should_cancel)
 
@@ -1589,13 +1754,25 @@ def parse_listing(
         raise
 
 
+def remember_browser_state(ctx):
+    """Keep anonymous session and consent state across console-owned jobs."""
+    global _BROWSER_STORAGE_STATE
+    try:
+        state = ctx.storage_state()
+    except Exception:
+        return
+    if isinstance(state, dict):
+        with _BROWSER_STATE_LOCK:
+            _BROWSER_STORAGE_STATE = copy.deepcopy(state)
+
+
 def create_browser_context(
     pw,
     headless: bool = True,
     slowmo: int = 0,
     storage_state: Optional[Dict[str, Any]] = None,
 ) -> tuple:
-    """Create a browser and context with anti-detection settings."""
+    """Create a consistent Firefox context with resource filtering."""
     browser = pw.firefox.launch(
         headless=headless,
         slow_mo=slowmo,
@@ -1605,6 +1782,9 @@ def create_browser_context(
         "locale": "en-US",
         "timezone_id": "America/New_York",
     }
+    if storage_state is None:
+        with _BROWSER_STATE_LOCK:
+            storage_state = copy.deepcopy(_BROWSER_STORAGE_STATE)
     if storage_state:
         context_options["storage_state"] = storage_state
 

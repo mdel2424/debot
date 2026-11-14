@@ -18,6 +18,7 @@ from main import (  # noqa: E402
     _sse,
 )
 from scraper import RateLimitError, SearchCancelled, sleep_with_cancel  # noqa: E402
+from shop_cache import ShopCache
 
 
 class FakePage:
@@ -60,6 +61,9 @@ class FakeParallelParser:
 
 class StreamHelpersTest(unittest.TestCase):
     def setUp(self):
+        cache = patch('scraper.SHOP_CACHE', ShopCache())
+        cache.start()
+        self.addCleanup(cache.stop)
         with main.RATE_LIMIT_STATE_LOCK:
             self._previous_rate_limit_state = (main.RATE_LIMIT_BLOCKED_UNTIL_TS, main.RECENT_RATE_LIMIT_UNTIL_TS)
             main.RATE_LIMIT_BLOCKED_UNTIL_TS = 0.0
@@ -228,6 +232,14 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertEqual(result, "ok")
         self.assertEqual(delays, [1])
         self.assertEqual(rebuilds, [(1, 3, 1, "seller page")])
+
+    def test_missing_shop_does_not_rebuild_and_retry_a_permanent_404(self):
+        action = unittest.mock.Mock(side_effect=main.FetchError('Shop not found', status=404))
+        with patch('main.sleep_with_cancel') as sleep:
+            with self.assertRaises(main.FetchError):
+                _run_with_rate_limit_retries(action, lambda: False, 'opening shop')
+        action.assert_called_once()
+        sleep.assert_not_called()
 
     def test_rate_limit_error_payload_is_encoded_as_sse_error(self):
         payload = _error_payload_for_exception(

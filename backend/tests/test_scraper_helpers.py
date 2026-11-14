@@ -1,6 +1,8 @@
 import json
 import datetime as dt
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -98,7 +100,13 @@ class FakeCollectPage:
             self.captured_shop_pages.clear()
             return None
         if "__debotShopProductPages" in script:
-            return list(self.captured_shop_pages)
+            pages = [
+                {"url": f"https://webapi.depop.com/presentation/api/v1/shops/fixture/products/?page={index}", **entry}
+                for index, entry in enumerate(self.captured_shop_pages)
+            ]
+            if ".splice(0)" in script:
+                self.captured_shop_pages.clear()
+            return pages
         if "window.innerHeight" in script:
             return 1000
         if "window.scrollBy" in script:
@@ -231,8 +239,14 @@ class FakeNoModalPage:
 
 class ScraperHelpersTest(unittest.TestCase):
     def setUp(self):
+        cache = mock.patch.object(scraper, 'SHOP_CACHE', scraper.ShopCache())
+        cache.start()
+        self.addCleanup(cache.stop)
         scraper._clear_listing_cache()
         self.addCleanup(scraper._clear_listing_cache)
+        pacing = mock.patch.object(scraper, "REQUEST_INTERVAL_SECONDS", 0)
+        pacing.start()
+        self.addCleanup(pacing.stop)
 
     def test_extract_created_at_from_hydration_html(self):
         html = (
@@ -449,6 +463,7 @@ class ScraperHelpersTest(unittest.TestCase):
         try:
             install_shop_products_capture(page)
             page.handlers["response"](api_response)
+            page.handlers["requestfinished"](mock.Mock(url=api_response.url, response=mock.Mock(return_value=api_response)))
 
             self.assertEqual(
                 extract_captured_shop_product_hrefs(page),
@@ -607,6 +622,169 @@ class ScraperHelpersTest(unittest.TestCase):
         self.assertEqual(caught.exception.status, 429)
         self.assertEqual(len(page.api_requests), 1)
 
+    def test_retry_preserves_successful_pages_and_retries_only_the_failed_cursor(self):
+        page = FakeCollectPage([[f'/products/item-{index}/' for index in range(24)]])
+        first = self.shop_response(0)
+        first['url'] = 'https://webapi.depop.com/presentation/api/v1/shops/123/products/?limit=24'
+        page.captured_shop_pages = [first]
+        page.api_responses = [{'status': 429, 'text': '', 'retryAfter': '240'}, self.shop_response(24, has_more=False)]
+        with self.assertRaises(RateLimitError):
+            collect_listing_links(page, max_links=72, aggressive_end_scroll=True)
+        self.assertTrue(scraper.prepare_shop_collection_retry(page))
+        links = collect_listing_links(page, max_links=72, aggressive_end_scroll=True)
+        self.assertEqual(len(links), 48)
+        self.assertEqual(len(set(links)), 48)
+        self.assertEqual(page.api_requests, [page.api_requests[0]] * 2)
+        self.assertIn('after=cursor-24', page.api_requests[0])
+
+    def test_shop_cursor_requests_are_paced_before_the_first_rate_limit(self):
+        page = FakeCollectPage([[]])
+        page.api_responses = [self.shop_response(24)]
+        cancel = lambda: False
+        with (
+            mock.patch.object(scraper, 'REQUEST_INTERVAL_SECONDS', 1),
+            mock.patch.object(scraper, '_LAST_NAVIGATION_STARTED_AT', 100.0),
+            mock.patch.object(scraper, '_NAVIGATION_PACING_UNTIL_TS', 0),
+            mock.patch('scraper.time.monotonic', return_value=100.25),
+            mock.patch('scraper.sleep_with_cancel') as sleep,
+        ):
+            scraper._load_shop_products_page(page, 'https://webapi.depop.com/presentation/api/v1/shops/123/products/', cancel)
+        sleep.assert_called_once_with(0.75, cancel)
+
+    def test_cursor_pacing_is_shared_across_threads(self):
+        now = [100.0]
+        reservations = []
+        real_sleep = time.sleep
+
+        def advance(delay, should_cancel=None):
+            reservations.append(now[0])
+            real_sleep(0.001)
+            now[0] += delay
+
+        with (
+            mock.patch.object(scraper, '_LAST_NAVIGATION_STARTED_AT', 100.0),
+            mock.patch.object(scraper, '_NAVIGATION_PACING_UNTIL_TS', 0),
+            mock.patch('scraper.time.monotonic', side_effect=lambda: now[0]),
+            mock.patch('scraper.sleep_with_cancel', side_effect=advance),
+        ):
+            threads = [threading.Thread(target=lambda: scraper.wait_for_navigation_slot(minimum_interval=1)) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+        self.assertEqual(reservations, [100.0, 101.0, 102.0, 103.0])
+
+    def test_uncached_listing_navigation_uses_the_shared_request_interval(self):
+        with mock.patch('scraper.guarded_goto', return_value=FakeResponse(200)) as navigate:
+            parse_listing(FakeFastListingPage(), 'https://www.depop.com/products/not-cached/')
+        self.assertEqual(navigate.call_args.kwargs['minimum_interval'], scraper.REQUEST_INTERVAL_SECONDS)
+
+    def test_new_jobs_reuse_browser_state_but_explicit_worker_state_takes_precedence(self):
+        playwright = mock.Mock()
+        context = playwright.firefox.launch.return_value.new_context.return_value
+        state = {'cookies': [{'name': 'consent', 'value': 'accepted'}], 'origins': []}
+        context.storage_state.return_value = state
+        with mock.patch.object(scraper, '_BROWSER_STORAGE_STATE', None):
+            scraper.remember_browser_state(context)
+            state['cookies'][0]['value'] = 'changed'
+            scraper.create_browser_context(playwright)
+            options = playwright.firefox.launch.return_value.new_context.call_args.kwargs
+            self.assertEqual(options['storage_state']['cookies'][0]['value'], 'accepted')
+            explicit = {'cookies': [], 'origins': []}
+            scraper.create_browser_context(playwright, storage_state=explicit)
+            self.assertEqual(playwright.firefox.launch.return_value.new_context.call_args.kwargs['storage_state'], explicit)
+
+    def test_api_json_is_decoded_once_and_browser_capture_queue_is_drained(self):
+        page = FakeCollectPage([[]])
+        first = self.shop_response(0)
+        first['url'] = 'https://webapi.depop.com/presentation/api/v1/shops/123/products/?limit=24'
+        page.captured_shop_pages = [first]
+        with mock.patch('scraper.json.loads', wraps=json.loads) as decode:
+            for _ in range(4):
+                self.assertEqual(len(extract_captured_shop_product_hrefs(page)), 24)
+                scraper._next_shop_products_url(page)
+        self.assertEqual(decode.call_count, 1)
+        self.assertEqual(page.captured_shop_pages, [])
+
+    def test_empty_native_response_does_not_overwrite_the_browser_body(self):
+        page = FakeCapturePage()
+        url = 'https://webapi.depop.com/presentation/api/v1/shops/123/products/'
+        scraper._store_captured_shop_product_page(page, url, 200, self.shop_response(0)['text'])
+        scraper._store_captured_shop_product_page(page, url, 200, '')
+        self.assertEqual(len(extract_captured_shop_product_hrefs(page)), 24)
+        scraper._store_captured_shop_product_page(page, url, 429, '', 240)
+        with self.assertRaises(RateLimitError):
+            extract_captured_shop_product_hrefs(page)
+
+    def test_later_native_retry_after_enriches_an_identical_browser_response(self):
+        page = FakeCapturePage()
+        url = 'https://webapi.depop.com/presentation/api/v1/shops/123/products/'
+        scraper._store_captured_shop_product_page(page, url, 429, '')
+        scraper._store_captured_shop_product_page(page, url, 429, '', 240)
+        scraper._store_captured_shop_product_page(page, url, 429, '')
+        with self.assertRaises(RateLimitError) as caught:
+            extract_captured_shop_product_hrefs(page)
+        self.assertEqual(caught.exception.retry_after_seconds, 240)
+
+    def test_native_rate_limit_capture_does_not_wait_for_an_error_body(self):
+        page = FakeCapturePage()
+        install_shop_products_capture(page)
+        response = mock.Mock(
+            url='https://webapi.depop.com/presentation/api/v1/shops/123/products/',
+            status=429,
+        )
+        response.header_value.return_value = '240'
+        page.handlers['response'](response)
+        response.text.assert_not_called()
+        with self.assertRaises(RateLimitError) as caught:
+            extract_captured_shop_product_hrefs(page)
+        self.assertEqual(caught.exception.retry_after_seconds, 240)
+
+    def test_closing_a_page_releases_capture_state_without_browser_calls(self):
+        page = FakeCapturePage()
+        install_shop_products_capture(page)
+        page.evaluate = mock.Mock()
+        page.handlers['close']()
+        page.evaluate.assert_not_called()
+        self.assertNotIn(page, scraper._CAPTURED_SHOP_PRODUCT_PAGES)
+        self.assertNotIn(page, scraper._SHOP_PRODUCTS_CAPTURE_INSTALLED_PAGES)
+
+    def test_snapshot_retains_parsed_details_after_listing_lru_eviction(self):
+        page = FakeCapturePage()
+        url = 'https://www.depop.com/products/evicted/'
+        scraper._SHOP_COLLECTION_RESULTS[page] = ([url], True)
+        scraper.cache_shop_collection(page, 100, items={url: {
+            'url': url, 'description': 'P2P 21 inches, length 27 inches',
+        }})
+        self.assertNotIn(url, scraper._LISTING_CACHE)
+        self.assertIsNotNone(scraper.get_cached_listing(url))
+        snapshot = scraper.get_cached_shop_collection(page.url, 1000)
+        self.assertEqual(snapshot.links, [url])
+        self.assertIn(url, snapshot.items)
+
+    def test_a_batch_can_stop_collection_before_another_network_request(self):
+        page = FakeCollectPage([[]])
+        first = self.shop_response(0)
+        first['url'] = 'https://webapi.depop.com/presentation/api/v1/shops/123/products/?limit=24'
+        page.captured_shop_pages = [first]
+        batches = []
+        links = collect_listing_links(
+            page, max_links=1000, aggressive_end_scroll=True,
+            on_batch=lambda batch: batches.append(batch) or False,
+        )
+        self.assertEqual(len(links), 24)
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(page.api_requests, [])
+
+    def test_first_party_telemetry_is_blocked_without_blocking_shop_data(self):
+        for path in ('/presentation/api/v1/events/', '/presentation/api/v1/performance/collect/', '/vwdj/gs/ccm/collect'):
+            with self.subTest(path=path):
+                self.assertTrue(scraper.should_block_request(mock.Mock(url='https://webapi.depop.com' + path, resource_type='fetch')))
+        self.assertFalse(scraper.should_block_request(mock.Mock(
+            url='https://webapi.depop.com/presentation/api/v1/shops/123/products/', resource_type='fetch',
+        )))
+
     def test_dom_collection_continues_past_eight_batches_while_growing(self):
         page = FakeCollectPage([
             [f'/products/item-{i}/' for i in range(end)]
@@ -643,10 +821,12 @@ class ScraperHelpersTest(unittest.TestCase):
         page.goto = mock.Mock(return_value=FakeResponse(200))
         install_shop_products_capture(page)
         install_shop_products_capture(page)
-        page.handlers['response'](FakeProductApiResponse(
+        response = FakeProductApiResponse(
             'https://webapi.depop.com/presentation/api/v1/shops/123/products/', 200,
             json.dumps({'objects': [{'slug': 'old-category'}]}),
-        ))
+        )
+        page.handlers['response'](response)
+        page.handlers['requestfinished'](mock.Mock(url=response.url, response=mock.Mock(return_value=response)))
         self.assertEqual(extract_captured_shop_product_hrefs(page), ['/products/old-category/'])
         scraper.guarded_goto(page, 'https://www.depop.com/seller/?groups=bottoms')
         self.assertEqual(extract_captured_shop_product_hrefs(page), [])

@@ -10,6 +10,36 @@ const response = (...chunks) => new Response(new ReadableStream({
   },
 }));
 
+test('inventory refresh forwards removed listings without terminating the stream', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => response(
+    'data: {"type":"remove","url":"sold-item"}\n\n',
+    'data: {"type":"match","item":{"url":"new-item"}}\n\n',
+    'data: {"type":"done","matches":1}\n\n',
+  ));
+  const removed = [];
+  const matches = [];
+  await streamSearch({
+    payload: {}, controller: new AbortController(),
+    onRemove: (event) => removed.push(event.url),
+    onMatch: (event) => matches.push(event.item.url),
+  });
+  assert.deepEqual(removed, ['sold-item']);
+  assert.deepEqual(matches, ['new-item']);
+});
+
+test('metadata preserves counters from matches streamed during collection', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => response(
+    'data: {"type":"meta","links":48,"processed":30,"matches":5,"seller":"shop"}\n\n',
+    'data: {"type":"done","processed":30,"matches":5}\n\n',
+  ));
+  const metadata = [];
+  await streamSearch({
+    payload: { searchId: 'streaming' }, controller: new AbortController(),
+    onMeta: (meta) => metadata.push(meta),
+  });
+  assert.deepEqual(metadata, [{ total: 48, processed: 30, matches: 5, seller: 'shop' }]);
+});
+
 test('SSE comments, CRLF, and split chunks preserve the first event and terminal state', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => response(
     ': preamble\r\n',

@@ -7,7 +7,8 @@ import {
 } from './hooks/useStream';
 import {
   DEFAULT_FOLLOWING_ACCOUNTS,
-  DEFAULT_SELLER_ADDITIONS,
+  getSellerAdditionsAfterVersion,
+  getSellerRemovalsAfterVersion,
   DEFAULT_SELLER_ADDITIONS_VERSION,
 } from './data/defaultSellers';
 import {
@@ -219,10 +220,17 @@ const dedupeSellerAccounts = (accounts) => {
 
 const getDefaultSellerAccounts = () => dedupeSellerAccounts(DEFAULT_FOLLOWING_ACCOUNTS);
 
+const currentResultDay = () => {
+  const now = new Date();
+  return `${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()}`;
+};
+
 const createSellerRow = (account, existingRow = null) => ({
   seller: account.username,
   displayName: account.name || account.username,
   results: existingRow?.results || [],
+  resultsDay: existingRow?.resultsDay || '',
+  resultsFilters: existingRow?.resultsFilters || null,
   loading: existingRow?.loading || false,
   processed: existingRow?.processed || false,
   error: existingRow?.error || null,
@@ -302,6 +310,8 @@ const serializePageWorkspaces = (workspaces) => JSON.stringify(
           seller: row.seller,
           displayName: row.displayName,
           results: row.results,
+          resultsDay: row.resultsDay,
+          resultsFilters: row.resultsFilters,
           loading: row.loading,
           processed: row.processed,
           error: row.error,
@@ -385,9 +395,12 @@ const readStoredSellerAccounts = () => {
 
     const normalized = dedupeSellerAccounts(parsed);
     const savedVersion = Number(window.localStorage.getItem(SELLER_ADDITIONS_STORAGE_KEY)) || 0;
-    return savedVersion < DEFAULT_SELLER_ADDITIONS_VERSION
-      ? dedupeSellerAccounts([...normalized, ...DEFAULT_SELLER_ADDITIONS])
-      : normalized;
+    if (savedVersion >= DEFAULT_SELLER_ADDITIONS_VERSION) {
+      return normalized;
+    }
+    const removals = new Set(getSellerRemovalsAfterVersion(savedVersion));
+    return dedupeSellerAccounts([...normalized, ...getSellerAdditionsAfterVersion(savedVersion)])
+      .filter((account) => !removals.has(account.username));
   } catch (error) {
     console.warn('[App] Failed to read saved seller accounts:', error);
     return getDefaultSellerAccounts();
@@ -820,7 +833,7 @@ function App() {
           }
 
           if (row.results.some((result) => result.url === item.url)) {
-            return row;
+            return { ...row, results: row.results.map((result) => result.url === item.url ? item : result) };
           }
 
           return { ...row, results: [...row.results, item] };
@@ -852,7 +865,6 @@ function App() {
       processed: false,
       error: null,
       errorCode: null,
-      results: [],
       progress: message ? createProgressState({ phase: 'idle', message }) : null,
     });
   };
@@ -1125,7 +1137,15 @@ function App() {
       processed: false,
       progress: createProgressState({ phase: 'starting' }),
     };
-    if (task.resetResults !== false) {
+    const existingRow = getSellerRow(pageId, sellerUsername);
+    const day = currentResultDay();
+    const keepResults = task.resetResults === false || (
+      existingRow?.resultsDay === day
+      && JSON.stringify(existingRow?.resultsFilters) === JSON.stringify(filters)
+    );
+    sellerRowUpdate.resultsDay = day;
+    sellerRowUpdate.resultsFilters = filters;
+    if (!keepResults) {
       sellerRowUpdate.results = [];
     }
     updateSellerRow(pageId, sellerUsername, sellerRowUpdate);
@@ -1158,6 +1178,11 @@ function App() {
       onMatch: (evt) => {
         if (isCurrent()) addSellerResult(pageId, sellerUsername, evt.item);
       },
+      onRemove: (evt) => {
+        if (isCurrent()) updateSellerRow(pageId, sellerUsername, {
+          results: (getSellerRow(pageId, sellerUsername)?.results || []).filter((item) => item.url !== evt.url),
+        });
+      },
       onProgress: (progress) => {
         if (isCurrent()) updateSellerRow(pageId, sellerUsername, { progress });
       },
@@ -1165,7 +1190,8 @@ function App() {
         progress: createProgressState({
           phase: 'collecting',
           total: meta.total,
-          matches: getSellerRow(pageId, sellerUsername)?.results?.length || 0,
+          processed: meta.processed ?? getSellerRow(pageId, sellerUsername)?.progress?.processed ?? 0,
+          matches: meta.matches ?? getSellerRow(pageId, sellerUsername)?.results?.length ?? 0,
         }),
       }),
       onError: (error) => {

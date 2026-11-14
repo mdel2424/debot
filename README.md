@@ -37,6 +37,21 @@ A production frontend needs an `/api` reverse proxy or an explicit API base.
   errors rather than successful partial scans.
 - Complete details already returned by the shop are cached, avoiding individual
   product requests. Missing details use a bounded parallel Playwright pool.
+- Matches stream while shop pages are collected. Once the requested match
+  count is reached, remaining pages and categories are not fetched.
+- Shop inventory is saved in `backend/.cache/shops.sqlite3` for the backend's
+  local calendar day, including across backend restarts. Reruns within five
+  minutes reuse it without network requests. Later reruns refresh newest pages,
+  update observed prices/descriptions/sold status, and merge the cached tail.
+  Refresh stops after two consecutive fully known pages when the previous scan
+  covered the full inventory; incomplete scans continue as needed. Changes deep
+  in older stock may not be seen until the next day's fresh scan, subject to the
+  configured search limits. Cache capacity
+  eviction can also require a fresh scan. All rate-limit cooldowns still apply.
+- Same-day reruns with unchanged filters retain and update earlier UI matches,
+  deduplicated by listing URL. Changed filters or a new calendar day start a new
+  result set; explicitly observed sold/nonmatching items are removed. Cached
+  searches can finish during a network cooldown while their snapshot is fresh.
 - The UI collects up to 1,000 links and returns up to 40 matches per seller.
   API callers can set `maxLinks` and `maxItems` up to 10,000. Collection has an
   additional 200-page safety bound.
@@ -46,6 +61,9 @@ A production frontend needs an `/api` reverse proxy or an explicit API base.
 - HTTP 403/429 triggers shared 60, 180, and 600-second cooldowns, extended by
   `Retry-After`. Final exhaustion remains an error and preserves the shared pause.
   Queued sellers show the shared cooldown and start automatically when it ends.
+- Cursor requests and uncached product navigations share one-second start
+  spacing. Recovery keeps cookies and retries the failed cursor; successful
+  pages are retained. Anonymous browser storage is reused between jobs.
 - Closing the browser detaches seller searches. Reopening restores saved job IDs
   and replays results. Stop explicitly cancels active or queued jobs.
 - New curated seller additions are merged into saved lists once. Custom names,
@@ -61,9 +79,14 @@ A production frontend needs an `/api` reverse proxy or an explicit API base.
 | `DEBOT_PARSE_WORKERS` | `4` | Default parser workers, clamped to 1-6 |
 | `DEBOT_CONCURRENT_SEARCH_JOBS` | `1` | Concurrent seller jobs |
 | `DEBOT_MIN_NAV_INTERVAL_SECONDS` | `0` | Optional fixed request spacing |
+| `DEBOT_REQUEST_INTERVAL_SECONDS` | `1` | Shared spacing for cursor requests and uncached product navigations |
 | `DEBOT_RATE_LIMIT_NAV_INTERVAL_SECONDS` | `1` | Temporary recovery spacing |
 | `DEBOT_LISTING_CACHE_TTL_SECONDS` | `300` | Listing cache lifetime |
 | `DEBOT_LISTING_CACHE_MAX_ITEMS` | `1000` | Listing cache capacity |
+| `DEBOT_SHOP_CACHE_TTL_SECONDS` | `300` | Time before checking for inventory updates; same-day data is retained; 0 disables reuse |
+| `DEBOT_SHOP_CACHE_MAX_ITEMS` | `50000` | Total detail records retained in daily shop snapshots |
+| `DEBOT_SHOP_CACHE_MAX_ENTRIES` | `256` | Seller/category/gender snapshots retained within the item budget |
+| `DEBOT_SHOP_CACHE_PATH` | `backend/.cache/shops.sqlite3` | Daily inventory database; empty disables disk persistence |
 | `DEBOT_SEARCH_JOB_HISTORY` | `500` | Retained jobs; completed jobs pruned first |
 | `DEBOT_ALLOWED_ORIGINS` | Localhost Vite origins | Allowed browser origins |
 
@@ -89,6 +112,25 @@ Browser persistence tests use local API fixtures. Start Vite, then run from the 
 DEBOT_FRONTEND_URL=http://127.0.0.1:5173 .venv/bin/python -m unittest backend.tests.test_frontend_smoke
 ```
 
+Real Firefox scraping tests with locally fulfilled responses, including an
+injected 429 and cursor recovery:
+
+```bash
+DEBOT_PLAYWRIGHT_TESTS=1 .venv/bin/python -m unittest backend.tests.test_scraper_playwright
+```
+
+Bounded live request and parsing benchmark:
+
+```bash
+.venv/bin/python backend/benchmark_scraper.py theloopmtl --max-links 72 --runs 2
+```
+
+The benchmark stops on the first 403/429, reports Retry-After, and does not run
+automatic cooldown retries. It caps a run at 240 links and a probe at three
+runs. Its deadline is cancelable; an already-running navigation may take until
+its Playwright timeout to return. Request counts include locally blocked
+telemetry; response counts show completed first-party data responses.
+
 Opt-in live site checks:
 
 ```bash
@@ -100,3 +142,5 @@ blocked pages, partial-page failures, retries, and cancellation deterministicall
 See [the code review](docs/code-review.md) for findings and coverage.
 See [the October search diagnosis](docs/search-diagnosis-2026-10-02.md) for the
 listing-age fix, cooldown behavior, and new seller sources.
+See [the November benchmark](docs/rate-limit-benchmark-2026-11-14.md) for measured
+request reductions, early results, and recovery tests.

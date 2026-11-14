@@ -32,6 +32,63 @@ class FakeJsonRequest:
 
 
 class SearchJobTest(unittest.TestCase):
+    def setUp(self):
+        from shop_cache import ShopCache
+        cache = mock.patch('scraper.SHOP_CACHE', ShopCache())
+        cache.start()
+        self.addCleanup(cache.stop)
+
+    def test_partial_cache_does_not_finish_a_search_with_missing_matches(self):
+        import scraper
+        from shop_cache import ShopSnapshot
+        from search_models import validate_search_payload
+        scraper._clear_listing_cache()
+        self.addCleanup(scraper._clear_listing_cache)
+        url = 'https://www.depop.com/products/prefix-item/'
+        item = {'url': url, 'seller': 'cached_shop', 'description': 'P2P 21 inches. Length 27 inches.'}
+        scraper.SHOP_CACHE.put(
+            scraper.build_seller_url('cached_shop', groups='tops', gender='male'),
+            ShopSnapshot([url], {url: item}, False),
+        )
+        missing = validate_search_payload({'seller': 'cached_shop', 'maxItems': 2})
+        self.assertIsNone(main._cached_seller_collections(missing))
+        different_fit = validate_search_payload({
+            'seller': 'cached_shop', 'maxItems': 1, 'measurements': {'first': 25, 'second': 27},
+        })
+        self.assertIsNone(main._cached_seller_collections(different_fit))
+
+    def test_cached_search_runs_without_browser_or_network_slot_during_cooldown(self):
+        import scraper
+        from shop_cache import ShopSnapshot
+        scraper._clear_listing_cache()
+        self.addCleanup(scraper._clear_listing_cache)
+        url = 'https://www.depop.com/products/cached-item/'
+        item = {'url': url, 'seller': 'cached_shop', 'description': 'P2P 21 inches. Length 27 inches.'}
+        scraper.SHOP_CACHE.put(
+            scraper.build_seller_url('cached_shop', groups='tops', gender='male'),
+            ShopSnapshot([url], {url: item}, False, 100),
+        )
+        registry = SearchJobRegistry()
+        with (
+            mock.patch.object(main, 'SEARCH_JOBS', registry),
+            mock.patch.object(main, 'RATE_LIMIT_BLOCKED_UNTIL_TS', float('inf')),
+            mock.patch.object(main, 'SEARCH_JOB_SLOTS') as slots,
+            mock.patch.object(main, 'sync_playwright') as playwright,
+            mock.patch.object(main.threading, 'Thread') as thread,
+            mock.patch('builtins.print'),
+        ):
+            job = main._ensure_search_job({
+                'searchId': 'cached-during-cooldown', 'seller': 'cached_shop',
+                'maxItems': 1, 'maxLinks': 1000, 'measurements': {'first': 21, 'second': 27},
+            })
+            thread.call_args.kwargs['target']()
+            events = [json.loads(event.decode().split('data: ', 1)[1]) for event in job.read_from(0)[0]]
+            self.assertEqual(len([event for event in events if event['type'] == 'match']), 1)
+            self.assertEqual(events[-1]['matches'], 1)
+            self.assertTrue(job.complete)
+            slots.acquire.assert_not_called()
+            playwright.assert_not_called()
+
     def test_age_filter_is_optional_and_validated(self):
         from search_models import validate_search_payload
         self.assertNotIn('maxAgeDays', validate_search_payload({}))

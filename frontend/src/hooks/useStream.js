@@ -109,6 +109,9 @@ const dispatchSearchEvent = (evt, callbacks) => {
         callbacks.onMatch?.(evt);
       }
       return false;
+    case 'remove':
+      if (evt.url) callbacks.onRemove?.(evt);
+      return false;
     case 'progress':
       callbacks.onProgress?.({
         processed: evt.processed,
@@ -127,6 +130,8 @@ const dispatchSearchEvent = (evt, callbacks) => {
       callbacks.onMeta?.({
         total: evt.links,
         seller: evt.seller,
+        processed: evt.processed,
+        matches: evt.matches,
       });
       return false;
     case 'cancelled':

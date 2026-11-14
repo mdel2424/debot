@@ -3,6 +3,7 @@
 import datetime as dt
 import json
 import os
+import re
 import unittest
 
 from playwright.sync_api import sync_playwright
@@ -17,7 +18,7 @@ class FrontendSmokeTest(unittest.TestCase):
         self.context.set_default_timeout(10000)
         self.context.add_init_script("""
             if (!localStorage.getItem('debot.followingAccounts.v1')) {
-                localStorage.setItem('debot.sellerAdditions.version', '1');
+                localStorage.setItem('debot.sellerAdditions.version', '3');
                 localStorage.setItem('debot.followingAccounts.v1', JSON.stringify([
                     {username: 'fixture_one', name: 'Fixture One'},
                     {username: 'fixture_two', name: 'Fixture Two'}
@@ -108,21 +109,86 @@ class FrontendSmokeTest(unittest.TestCase):
             }
         """)
         self.page.goto(self.url)
-        self.page.wait_for_function("localStorage.getItem('debot.sellerAdditions.version') === '1'")
+        self.page.wait_for_function("localStorage.getItem('debot.sellerAdditions.version') === '3'")
         sellers = self.page.evaluate("JSON.parse(localStorage.getItem('debot.followingAccounts.v1'))")
-        self.assertEqual(len(sellers), 4)
+        self.assertEqual(len(sellers), 6)
         self.assertEqual(sellers[0], {'username': 'fixture_one', 'name': 'My Custom Name'})
         self.assertEqual(sellers[1], {'username': 'theloopmtl', 'name': 'My Loop Name'})
         self.assertEqual({seller['username'] for seller in sellers}, {
             'fixture_one', 'theloopmtl', 'thriftsnspliffs', 'mountainvintagethrifts',
+            'secondlifeinc', 'vintagebysherman',
         })
         self.page.evaluate("""localStorage.setItem('debot.followingAccounts.v1', JSON.stringify(
             JSON.parse(localStorage.getItem('debot.followingAccounts.v1'))
-                .filter(seller => seller.username !== 'thriftsnspliffs')
+                .filter(seller => !['thriftsnspliffs', 'secondlifeinc'].includes(seller.username))
         ))""")
         self.page.reload()
-        self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.followingAccounts.v1')).length === 3")
+        self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.followingAccounts.v1')).length === 4")
+        self.assertEqual(self.page.locator('.seller-row-card').count(), 4)
+        self.assertEqual(self.errors, [])
+
+    def test_second_seller_update_preserves_removals_and_existing_custom_names(self):
+        self.context.add_init_script("""
+            if (!localStorage.getItem('fixture_migration_seeded')) {
+                localStorage.setItem('debot.followingAccounts.v1', JSON.stringify([
+                    {username: 'fixture_one', name: 'My Custom Seller'},
+                    {username: 'secondlifeinc', name: 'My Second Life Name'}
+                ]));
+                localStorage.setItem('debot.sellerAdditions.version', '1');
+                localStorage.setItem('fixture_migration_seeded', '1');
+            }
+        """)
+        self.page.goto(self.url)
+        self.page.wait_for_function("localStorage.getItem('debot.sellerAdditions.version') === '3'")
+        sellers = self.page.evaluate("JSON.parse(localStorage.getItem('debot.followingAccounts.v1'))")
+        self.assertEqual(sellers, [
+            {'username': 'fixture_one', 'name': 'My Custom Seller'},
+            {'username': 'secondlifeinc', 'name': 'My Second Life Name'},
+            {'username': 'vintagebysherman', 'name': 'Vintage by Sherman'},
+        ])
         self.assertEqual(self.page.locator('.seller-row-card').count(), 3)
+        self.assertEqual(self.errors, [])
+
+    def test_removed_sellers_leave_saved_lists_and_workspaces_without_resetting_other_results(self):
+        requests = []
+        self.context.route('**/api/search/stream', lambda route: (
+            requests.append(route.request.post_data_json),
+            route.fulfill(content_type='text/event-stream', body=self.event({'type': 'done'})),
+        ))
+        self.context.add_init_script("""
+            if (!localStorage.getItem('fixture_removal_seeded')) {
+                localStorage.setItem('debot.followingAccounts.v1', JSON.stringify([
+                    {username: 'fixture_one', name: 'My Custom Seller'},
+                    {username: 'former_vintage', name: 'Former'},
+                    {username: 'gwoodsgear', name: 'Gwoods'},
+                    {username: 'jizzypantthrifts', name: 'Jizzy'},
+                    {username: 'secondlifeinc', name: 'My Second Life Name'}
+                ]));
+                localStorage.setItem('debot.sellerAdditions.version', '2');
+                localStorage.setItem('debot.pageWorkspaces.v1', JSON.stringify({tops: {sellerRows: [
+                    {seller: 'fixture_one', results: [{url: 'https://www.depop.com/products/keep/', price: '$25'}]},
+                    {seller: 'former_vintage', searchId: 'removed-job', loading: true, results: []}
+                ]}}));
+                localStorage.setItem('fixture_removal_seeded', '1');
+            }
+        """)
+        self.page.goto(self.url)
+        self.page.wait_for_function("localStorage.getItem('debot.sellerAdditions.version') === '3'")
+        self.page.wait_for_function("""Object.values(JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')))
+            .every(workspace => JSON.stringify(workspace.sellerRows.map(row => row.seller))
+                === JSON.stringify(['fixture_one', 'secondlifeinc']))""")
+        self.page.reload()
+        sellers = self.page.evaluate("JSON.parse(localStorage.getItem('debot.followingAccounts.v1'))")
+        self.assertEqual(sellers, [
+            {'username': 'fixture_one', 'name': 'My Custom Seller'},
+            {'username': 'secondlifeinc', 'name': 'My Second Life Name'},
+        ])
+        workspaces = self.page.evaluate("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1'))")
+        for workspace in workspaces.values():
+            self.assertEqual([row['seller'] for row in workspace['sellerRows']], ['fixture_one', 'secondlifeinc'])
+        self.assertEqual(workspaces['tops']['sellerRows'][0]['results'][0]['url'], 'https://www.depop.com/products/keep/')
+        self.assertEqual(requests, [])
+        self.assertEqual(self.page.locator('.seller-row-card').count(), 2)
         self.assertEqual(self.errors, [])
 
     def test_queued_seller_shows_the_shared_rate_limit_countdown(self):
@@ -142,6 +208,83 @@ class FrontendSmokeTest(unittest.TestCase):
         self.assertIn('Cooldown 59m', self.page.locator('.seller-progress-primary').first.inner_text())
         self.page.set_viewport_size({'width': 390, 'height': 844})
         self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'))
+        self.assertEqual(self.errors, [])
+
+    def test_collection_metadata_keeps_already_streamed_progress(self):
+        self.context.route('**/api/search/stream', lambda route: route.fulfill(
+            content_type='text/event-stream', body=''.join(self.event(event) for event in [
+                {'type': 'match', 'item': {'url': 'https://www.depop.com/products/streamed/', 'price': '$25'}},
+                {'type': 'progress', 'processed': 12, 'total': 24, 'matches': 1},
+                {'type': 'meta', 'links': 24, 'processed': 12, 'matches': 1},
+            ]),
+        ))
+        self.page.goto(self.url)
+        self.page.get_by_role('button', name='Search', exact=True).first.click()
+        self.page.get_by_text(re.compile(r'1 matches.*12 parsed / 24 collected')).wait_for()
+        self.assertEqual(self.errors, [])
+
+    def test_same_day_rerun_merges_updates_and_preserves_unseen_matches(self):
+        calls = []
+
+        def stream(route):
+            calls.append(route.request.post_data_json)
+            if len(calls) == 1:
+                events = [{'type': 'match', 'item': {'url': url, 'price': '$25'}}
+                          for url in ('https://www.depop.com/products/old/',
+                                      'https://www.depop.com/products/kept/',
+                                      'https://www.depop.com/products/sold/')]
+            else:
+                events = [
+                    {'type': 'match', 'item': {'url': 'https://www.depop.com/products/old/', 'price': '$45'}},
+                    {'type': 'match', 'item': {'url': 'https://www.depop.com/products/new/', 'price': '$30'}},
+                    {'type': 'remove', 'url': 'https://www.depop.com/products/sold/'},
+                ]
+            events.append({'type': 'done', 'processed': 3, 'total': 3, 'matches': 3})
+            route.fulfill(content_type='text/event-stream', body=''.join(self.event(e) for e in events))
+
+        self.context.route('**/api/search/stream', stream)
+        self.page.goto(self.url)
+        search = self.page.get_by_role('button', name='Search', exact=True).first
+        search.click()
+        self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].processed")
+        search.click()
+        self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].results.some(item => item.price === '$45')")
+        self.page.reload()
+        saved = self.page.evaluate("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0]")
+        self.assertEqual({item['url'] for item in saved['results']}, {
+            'https://www.depop.com/products/old/', 'https://www.depop.com/products/kept/',
+            'https://www.depop.com/products/new/',
+        })
+        self.assertTrue(saved['resultsDay'])
+        self.assertIsNotNone(saved['resultsFilters'])
+        self.assertEqual(self.errors, [])
+
+    def test_previous_day_or_changed_filter_results_are_not_merged(self):
+        self.context.route('**/api/search/stream', lambda route: route.fulfill(
+            content_type='text/event-stream', body=''.join(self.event(e) for e in [
+                {'type': 'match', 'item': {'url': 'https://www.depop.com/products/current/', 'price': '$30'}},
+                {'type': 'done', 'processed': 1, 'total': 1, 'matches': 1},
+            ]),
+        ))
+        self.page.goto(self.url)
+        search = self.page.get_by_role('button', name='Search', exact=True).first
+        search.click()
+        self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].processed")
+        for expired in (True, False):
+            self.page.evaluate("""(expired) => {
+                const key = 'debot.pageWorkspaces.v1';
+                const state = JSON.parse(localStorage.getItem(key));
+                const row = state.tops.sellerRows[0];
+                row.results.push({url: 'https://www.depop.com/products/stale/', price: '$10'});
+                if (expired) row.resultsDay = '1990-1-1';
+                else row.resultsFilters = {...row.resultsFilters, first: '999'};
+                localStorage.setItem(key, JSON.stringify(state));
+            }""", expired)
+            self.page.reload()
+            search.click()
+            self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].processed")
+            results = self.page.evaluate("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].results")
+            self.assertEqual([item['url'] for item in results], ['https://www.depop.com/products/current/'])
         self.assertEqual(self.errors, [])
 
 
