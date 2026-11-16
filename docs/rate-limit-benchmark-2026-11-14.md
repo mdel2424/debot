@@ -3,7 +3,7 @@
 ## Measured Results
 
 Bounded live Firefox probes on November 14 used men's tops, target P2P 21 inches,
-length 27 inches, and tolerances 0.75 and 1 inch. The baseline used the old
+length 27 inches, and tolerances 0.75 and 0.75 inch. The baseline used the old
 full-collection search flow with normal pacing disabled. Payload decoding had
 already been optimized, so this is not a pristine-commit CPU benchmark.
 

@@ -3,7 +3,7 @@
 Ran the configured 26-seller list through the running backend's batch/stream API.
 The live browser integration was unavailable, so this was not a click-through of
 the user's existing browser tab. Used the configured tops defaults: male,
-tops plus coats/jackets, P2P 21 +/- 0.75 inches, length 27 +/- 1 inch, up to
+tops plus coats/jackets, P2P 21 +/- 0.75 inches, length 27 +/- 0.75 inch, up to
 40 matches and 1,000 collected links per seller. Removed accounts were excluded.
 
 ## Findings and Fixes

@@ -66,7 +66,7 @@ Examples:
 | Polo Ralph Lauren linen button-up | C$30 | 20 x 29 | [Listing](https://www.depop.com/products/wavetwcvtgg-polo-ralph-lauren-baby-blue-b7ba/) |
 | Oakley navy hoodie | C$40 | 22 x 28 | [Listing](https://www.depop.com/products/wavetwoetgg-oakley-navy-poison-skull-hoodie-4837/) |
 
-The Nike crewneck falls inside the earlier search's 21 +/- 0.75 inch width and 27 +/- 1 inch length window. Its title says distressed; inspect the photos even though the description reports no noted flaws.
+The Nike crewneck falls inside the earlier search's 21 +/- 0.75 inch width and 27 +/- 0.75 inch length window. Its title says distressed; inspect the photos even though the description reports no noted flaws.
 
 ### 2. Curated Grails: @curatedgrailss
 

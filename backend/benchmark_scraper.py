@@ -87,7 +87,7 @@ def benchmark(seller, *, max_links=72, max_matches=40, runs=2, timeout=60, categ
                 try:
                     with redirect_stdout(sys.stderr):
                         for chunk in main._search_seller(
-                            context, page, seller, [category], "male", 21, 27, 0.75, 1,
+                            context, page, seller, [category], "male", 21, 27, 0.75, 0.75,
                             max_matches, max_links, 1, search_id,
                             category=category, parse_workers=1,
                             emit_event=consume_event,

@@ -98,7 +98,7 @@ class ScraperPlaywrightTest(unittest.TestCase):
         ):
             chunks = list(main._search_seller(
                 self.context, page, 'fixture_shop', groups or ['tops', 'coats-jackets'], 'male',
-                21, 27, 0.75, 1, max_items, 1000, 1, 'fixture-search',
+                21, 27, 0.75, 0.75, max_items, 1000, 1, 'fixture-search',
                 emit_event=emitted.append,
             ))
         page.close()

@@ -108,7 +108,7 @@ class StreamHelpersTest(unittest.TestCase):
         ):
             events = self._decode_events(list(_search_seller(
                 FakeContext(), FakePage(), 'fixture_shop', ['tops'], 'male',
-                21, 27, 0.75, 1, 40, 1000, 1, 'owner-check',
+                21, 27, 0.75, 0.75, 40, 1000, 1, 'owner-check',
             )))
         self.assertEqual([event['item']['url'] for event in events if event['type'] == 'match'], ['correct-owner'])
         self.assertEqual(events[-1]['matches'], 1)
@@ -213,7 +213,7 @@ class StreamHelpersTest(unittest.TestCase):
                     args = [FakeContext(), FakePage()]
                     if search is _search_seller:
                         args.append('onthemarkco')
-                    args.extend([['tops'], 'male', 21.0, 27.0, 0.75, 1.0])
+                    args.extend([['tops'], 'male', 21.0, 27.0, 0.75, 0.75])
                     events = self._decode_events(list(search(
                         *args, max_items=40, max_links=100, max_scrolls=1,
                         search_id='old-available', max_age_days=max_age_days,

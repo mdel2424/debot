@@ -2,7 +2,7 @@ const MEASUREMENT_DEFAULTS = Object.freeze({
   first: '21',
   second: '27',
   firstTolerance: '0.75',
-  secondTolerance: '1',
+  secondTolerance: '0.75',
 });
 
 const FOOTWEAR_SIZE_OPTIONS = [
