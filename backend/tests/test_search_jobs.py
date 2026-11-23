@@ -45,7 +45,7 @@ class SearchJobTest(unittest.TestCase):
         scraper._clear_listing_cache()
         self.addCleanup(scraper._clear_listing_cache)
         url = 'https://www.depop.com/products/prefix-item/'
-        item = {'url': url, 'seller': 'cached_shop', 'description': 'P2P 21 inches. Length 27 inches.'}
+        item = {'url': url, 'seller': 'cached_shop', 'description': 'P2P 21 inches. Length 27 inches.', 'price': '$35.01'}
         scraper.SHOP_CACHE.put(
             scraper.build_seller_url('cached_shop', groups='tops', gender='male'),
             ShopSnapshot([url], {url: item}, False),
@@ -56,6 +56,8 @@ class SearchJobTest(unittest.TestCase):
             'seller': 'cached_shop', 'maxItems': 1, 'measurements': {'first': 25, 'second': 27},
         })
         self.assertIsNone(main._cached_seller_collections(different_fit))
+        over_budget = validate_search_payload({'seller': 'cached_shop', 'maxItems': 1, 'maxPriceCad': 35})
+        self.assertIsNone(main._cached_seller_collections(over_budget))
 
     def test_cached_search_runs_without_browser_or_network_slot_during_cooldown(self):
         import scraper
@@ -63,10 +65,12 @@ class SearchJobTest(unittest.TestCase):
         scraper._clear_listing_cache()
         self.addCleanup(scraper._clear_listing_cache)
         url = 'https://www.depop.com/products/cached-item/'
-        item = {'url': url, 'seller': 'cached_shop', 'description': 'P2P 21 inches. Length 27 inches.'}
+        expensive_url = 'https://www.depop.com/products/over-budget/'
+        item = {'url': url, 'seller': 'cached_shop', 'description': 'P2P 21 inches. Length 27 inches.', 'price': '$35.00'}
+        expensive_item = {**item, 'url': expensive_url, 'price': '$35.01'}
         scraper.SHOP_CACHE.put(
             scraper.build_seller_url('cached_shop', groups='tops', gender='male'),
-            ShopSnapshot([url], {url: item}, False, 100),
+            ShopSnapshot([expensive_url, url], {expensive_url: expensive_item, url: item}, False, 100),
         )
         registry = SearchJobRegistry()
         with (
@@ -80,10 +84,11 @@ class SearchJobTest(unittest.TestCase):
             job = main._ensure_search_job({
                 'searchId': 'cached-during-cooldown', 'seller': 'cached_shop',
                 'maxItems': 1, 'maxLinks': 1000, 'measurements': {'first': 21, 'second': 27},
+                'maxPriceCad': 35,
             })
             thread.call_args.kwargs['target']()
             events = [json.loads(event.decode().split('data: ', 1)[1]) for event in job.read_from(0)[0]]
-            self.assertEqual(len([event for event in events if event['type'] == 'match']), 1)
+            self.assertEqual([event['item']['url'] for event in events if event['type'] == 'match'], [url])
             self.assertEqual(events[-1]['matches'], 1)
             self.assertTrue(job.complete)
             slots.acquire.assert_not_called()
@@ -97,6 +102,14 @@ class SearchJobTest(unittest.TestCase):
         for age in (-1, 0, float('nan'), float('inf')):
             with self.subTest(age=age), self.assertRaises(main.HTTPException):
                 validate_search_payload({'maxAgeDays': age})
+
+    def test_price_cap_is_optional_and_validated(self):
+        from search_models import validate_search_payload
+        self.assertNotIn('maxPriceCad', validate_search_payload({}))
+        self.assertEqual(validate_search_payload({'maxPriceCad': 0})['maxPriceCad'], 0)
+        for cap in (-1, 10001, float('nan'), float('inf')):
+            with self.subTest(cap=cap), self.assertRaises(main.HTTPException):
+                validate_search_payload({'maxPriceCad': cap})
 
     def test_waiting_job_publishes_shared_cooldown_without_starting_a_browser(self):
         registry = SearchJobRegistry()

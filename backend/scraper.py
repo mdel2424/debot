@@ -36,6 +36,11 @@ CURRENCY_SYMBOLS = {
     "GBP": "£",
     "EUR": "€",
 }
+CAD_PRICE_RX = re.compile(
+    r"(?P<prefix>CAD\s*\$?|(?:CA|C)?\$)?\s*"
+    r"(?P<amount>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*(?P<suffix>CAD)?",
+    re.I,
+)
 SCROLL_STEPS_PER_BATCH = 4
 SCROLL_STEP_RATIO = 0.7
 MAX_STALLED_SCROLL_STEPS = 3
@@ -661,12 +666,13 @@ def extract_seller_sold_count_from_text(text: str) -> Optional[int]:
         return None
 
 
-def _pick_product_json_ld(page: Page) -> Optional[Dict[str, Any]]:
+def _pick_product_json_ld(page: Page, texts: List[str] | None = None) -> Optional[Dict[str, Any]]:
     """Return the product JSON-LD payload when available."""
-    try:
-        texts = page.locator("script[type='application/ld+json']").all_inner_texts()
-    except Exception:
-        texts = []
+    if texts is None:
+        try:
+            texts = page.locator("script[type='application/ld+json']").all_inner_texts()
+        except Exception:
+            texts = []
 
     for text in texts:
         try:
@@ -726,13 +732,16 @@ def extract_size_label_from_text(text: str) -> Optional[str]:
     return None
 
 
+def _first_price_offer(offers: Any) -> Dict[str, Any]:
+    offer = offers[0] if isinstance(offers, list) and offers else offers
+    return offer if isinstance(offer, dict) else {}
+
+
 def _format_price_from_offer(offers: Any) -> str:
     """Format a JSON-LD offer block to match the UI's display needs."""
-    offer = offers[0] if isinstance(offers, list) and offers else offers
-    if not isinstance(offer, dict):
-        return ""
-
-    price = str(offer.get("price") or "").strip()
+    offer = _first_price_offer(offers)
+    raw_price = offer.get("price")
+    price = str(raw_price).strip() if raw_price is not None else ""
     currency = str(offer.get("priceCurrency") or "").upper().strip()
     if not price:
         return ""
@@ -744,6 +753,19 @@ def _format_price_from_offer(offers: Any) -> str:
         except Exception:
             pass
     return f"{symbol}{price}".strip()
+
+
+def listing_price_cad(item: Dict[str, Any]) -> float | None:
+    """Read a CAD price, honoring currency metadata over display symbols."""
+    currency = str(item.get("priceCurrency") or "").strip().upper()
+    if currency and currency != "CAD":
+        return None
+    raw_price = item.get("price")
+    match = CAD_PRICE_RX.fullmatch(str(raw_price).strip()) if raw_price is not None else None
+    # Existing cached CAD prices use a bare dollar sign; USD uses US$.
+    if not match or not (currency or match["prefix"] or match["suffix"]):
+        return None
+    return float(match["amount"].replace(",", ""))
 
 
 def _extract_seller_name(page: Page, html: str) -> str:
@@ -1222,9 +1244,10 @@ def _cache_shop_product(page: Page, product: Dict[str, Any], url: str) -> None:
         return
     pricing = product.get("pricing") or {}
     headline = (pricing.get("display_price") or {}).get("headline_price") or {}
+    currency = headline.get("currency") or pricing.get("currency")
     price = _format_price_from_offer({
         "price": headline.get("amount"),
-        "priceCurrency": headline.get("currency") or pricing.get("currency"),
+        "priceCurrency": currency,
     })
     preview = product.get("preview") or next(iter(product.get("pictures") or []), {})
     image = ((preview.get("formats") or {}).get("P0") or {}).get("url")
@@ -1236,7 +1259,7 @@ def _cache_shop_product(page: Page, product: Dict[str, Any], url: str) -> None:
     if not price or not image or not created or not seller:
         return
     _cache_listing({
-        "url": url, "description": description.strip(), "price": price,
+        "url": url, "description": description.strip(), "price": price, "priceCurrency": currency,
         "image": image, "seller": seller, "sizeLabel": size,
         "listedAt": created.isoformat(), "ageDays": age_days_from(created),
         "soldCount": None,
@@ -1558,7 +1581,7 @@ LISTING_DOM_EXTRACTOR = r"""() => {
         return element ? keepLines(element.innerText || element.textContent || "") : "";
     };
     const firstPrice = (text) => {
-        const match = (text || "").match(/[$£€]\s?\d[\d,]*(?:\.\d{2})?/);
+        const match = (text || "").match(/(?:\b[A-Z]{1,3}[ \t]*)?[$£€]\s?\d[\d,]*(?:\.\d+)?(?:[ \t]+[A-Z]{3}\b)?/);
         return match ? match[0] : "";
     };
     const usernameFromHref = (href) => {
@@ -1606,6 +1629,7 @@ LISTING_DOM_EXTRACTOR = r"""() => {
     }
 
     const timeElement = document.querySelector("time[datetime]");
+    const currencyElement = document.querySelector("[itemprop='priceCurrency']");
     return {
         title: document.title || "",
         bodyText,
@@ -1615,6 +1639,9 @@ LISTING_DOM_EXTRACTOR = r"""() => {
             textOf("[class*='price']") ||
             textOf("[itemprop='price']") ||
             firstPrice(bodyText),
+        priceCurrency: currencyElement ? currencyElement.getAttribute("content") || currencyElement.textContent || "" : "",
+        productJsonLd: [...document.querySelectorAll("script[type='application/ld+json']")]
+            .map((script) => script.textContent || ""),
         image: imageElement ? (
             imageElement.getAttribute("src") ||
             ((imageElement.getAttribute("srcset") || "").split(",").pop() || "").trim().split(/\s+/)[0] ||
@@ -1687,6 +1714,7 @@ def parse_listing(
         dom_details = _extract_listing_dom_details(page)
         desc = str(dom_details.get("description") or "").strip()
         price_text = str(dom_details.get("price") or "").strip()
+        price_currency = str(dom_details.get("priceCurrency") or "").strip()
         image_url = str(dom_details.get("image") or "").strip() or None
         seller_name = str(dom_details.get("seller") or "").strip()
         body_text = str(dom_details.get("bodyText") or "")
@@ -1707,16 +1735,16 @@ def parse_listing(
                 age_days = age_days_from(rel_dt)
                 listed_at_iso = rel_dt.isoformat()
 
-        if listed_at_iso is None or not all((desc, price_text, image_url)):
-            try:
-                product_json_ld = _pick_product_json_ld(page)
-            except Exception:
-                product_json_ld = None
+        if listed_at_iso is None or not all((desc, price_text, price_currency, image_url)):
+            product_json_ld = _pick_product_json_ld(page, dom_details.get("productJsonLd"))
             if isinstance(product_json_ld, dict):
                 if not desc:
                     desc = str(product_json_ld.get("description") or "").strip()
+                offer = _first_price_offer(product_json_ld.get("offers"))
+                if not price_currency:
+                    price_currency = str(offer.get("priceCurrency") or "").strip()
                 if not price_text:
-                    price_text = _format_price_from_offer(product_json_ld.get("offers"))
+                    price_text = _format_price_from_offer(offer)
                 if not image_url:
                     images = product_json_ld.get("image")
                     if isinstance(images, list) and images:
@@ -1747,6 +1775,7 @@ def parse_listing(
             "description": desc,
             "image": image_url,
             "price": price_text,
+            "priceCurrency": price_currency or None,
             "listedAt": listed_at_iso,
             "ageDays": age_days,
             "seller": seller_name,

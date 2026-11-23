@@ -1039,6 +1039,29 @@ class StreamHelpersTest(unittest.TestCase):
                     self.assertIsNotNone(match)
                     self.assertEqual(tuple(match[key] for key in ("inseam", "rise", "inseamRise")), expected)
 
+    def test_price_cap_uses_only_cad_and_includes_the_limit(self):
+        for price, currency, cap, expected in (
+            ("$35.00", None, 35, True),
+            ("$35.01", "CAD", 35, False),
+            ("CA$ 45.00", None, 45, True),
+            ("45.01 CAD", None, 45, False),
+            ("$25", "USD", 35, False),
+            ("US $25", None, 35, False),
+            ("$25 USD", None, 35, False),
+            ("£20", None, 35, False),
+            ("25", None, 35, False),
+            ("25", "CAD", 35, True),
+            (None, None, 35, False),
+            (None, None, None, True),
+            (0, "CAD", 0, True),
+        ):
+            with self.subTest(price=price, currency=currency, cap=cap):
+                result = _process_item(
+                    {"price": price, "priceCurrency": currency}, None, None, 0.5, 1.25,
+                    "accessories", max_price_cad=cap,
+                )
+                self.assertEqual(result is not None, expected)
+
     def test_process_item_matches_tops_when_one_measurement_is_missing(self):
         item = {
             "url": "https://www.depop.com/products/example-tops-partial/",

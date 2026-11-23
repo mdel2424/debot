@@ -40,6 +40,7 @@ from scraper import (
     remove_sold_sections,
     collect_listing_links,
     parse_listing,
+    listing_price_cad,
     extract_seller_sold_count,
     extract_retry_after_seconds,
     create_browser_context,
@@ -695,8 +696,14 @@ def _build_match_payload(item: Dict[str, Any], p2p: Optional[float] = None,
 def _process_item(item: Dict[str, Any], target_p2p: float, target_length: float,
                   p2p_tol: float, length_tol: float, category: str = "tops",
                   size_range: Dict[str, Any] | None = None,
-                  bottoms_measurements: Dict[str, Dict[str, float]] | None = None) -> Dict[str, Any] | None:
+                  bottoms_measurements: Dict[str, Dict[str, float]] | None = None,
+                  *, max_price_cad: float | None = None) -> Dict[str, Any] | None:
     """Check if item matches the active category filter and return a formatted result."""
+    if max_price_cad is not None:
+        price = listing_price_cad(item)
+        if price is None or price > max_price_cad:
+            return None
+
     if category in MEASUREMENT_CATEGORIES:
         text = item.get("description", "")
         w, L = parser.extract_tops(text)
@@ -799,6 +806,7 @@ def _cached_seller_collections(payload):
                 item, measurements.get("first"), measurements.get("second"),
                 payload["p2pTolerance"], payload["lengthTolerance"],
                 payload["category"], size_range, bottoms,
+                max_price_cad=payload.get("maxPriceCad"),
             ):
                 match_count += 1
                 if match_count >= payload["maxItems"]:
@@ -841,6 +849,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
     length_tol = float(payload.get("lengthTolerance", DEFAULT_LENGTH_TOL))
     size_range = _normalize_size_range(payload.get("sizeRange"))
     bottoms_measurements = _normalize_bottoms_measurements(payload.get("bottomsMeasurements"))
+    max_price_cad = payload.get("maxPriceCad")
 
     seller = (payload.get("seller") or "").strip()
     max_items = int(payload.get("maxItems") or 40)
@@ -869,6 +878,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
                     category, size_range, bottoms_measurements,
                     emit_event=emit_stream_event, max_age_days=max_age_days,
                     cached_collections=cached_collections,
+                    max_price_cad=max_price_cad,
                 )
                 return
 
@@ -911,6 +921,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
                                 headless=headless,
                                 slowmo=slowmo,
                                 max_age_days=max_age_days,
+                                max_price_cad=max_price_cad,
                             )
                         else:
                             yield from _browse_all(
@@ -924,6 +935,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
                                 headless=headless,
                                 slowmo=slowmo,
                                 max_age_days=max_age_days,
+                                max_price_cad=max_price_cad,
                             )
                     except SearchCancelled:
                         yield _sse({"type": "cancelled", "searchId": search_id or None})
@@ -1061,7 +1073,8 @@ def _search_seller(ctx, page, seller, groups, gender,
                    emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
                    reset_session: Optional[Callable[[], tuple[Any, Any]]] = None,
                    parse_workers: int = 1, headless: bool = True, slowmo: int = 0,
-                   max_age_days: Optional[float] = None, cached_collections=None):
+                   max_age_days: Optional[float] = None, cached_collections=None,
+                   max_price_cad: float | None = None):
     """Search a specific seller's listings."""
     should_cancel = _cancel_check(search_id)
     normalized_groups = _normalize_groups(groups)
@@ -1157,6 +1170,7 @@ def _search_seller(ctx, page, seller, groups, gender,
                     match = _process_item(
                         item, target_p2p, target_length, p2p_tol, length_tol,
                         category, size_range, bottoms_measurements,
+                        max_price_cad=max_price_cad,
                     )
                     if match:
                         match["soldCount"] = seller_sold_count
@@ -1344,6 +1358,7 @@ def _search_seller(ctx, page, seller, groups, gender,
                             category,
                             size_range,
                             bottoms_measurements,
+                            max_price_cad=max_price_cad,
                         )
                         if match:
                             match["soldCount"] = seller_sold_count
@@ -1380,7 +1395,7 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                 emit_event: Optional[Callable[[Dict[str, Any]], None]] = None,
                 reset_session: Optional[Callable[[], tuple[Any, Any]]] = None,
                 parse_workers: int = 1, headless: bool = True, slowmo: int = 0,
-                max_age_days: Optional[float] = None):
+                max_age_days: Optional[float] = None, max_price_cad: float | None = None):
     """Browse all listings on the category page."""
     should_cancel = _cancel_check(search_id)
     normalized_groups = _normalize_groups(groups)
@@ -1593,6 +1608,7 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                                 category,
                                 size_range,
                                 bottoms_measurements,
+                                max_price_cad=max_price_cad,
                             )
                             if match:
                                 seller_name = (match.get("seller") or "").strip()

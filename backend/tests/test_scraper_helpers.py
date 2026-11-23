@@ -923,6 +923,20 @@ class ScraperHelpersTest(unittest.TestCase):
         item = parse_listing(page, 'https://www.depop.com/products/json-ld/')
         self.assertEqual(item['description'], 'Size US 10.5. Leather shoes.')
 
+    def test_listing_retains_structured_currency_when_display_uses_a_dollar_sign(self):
+        page = FakeFastListingPage()
+        original = page.evaluate
+        page.evaluate = lambda expression: {
+            **original(expression),
+            'productJsonLd': [json.dumps({
+                '@type': 'Product', 'offers': {'price': 22, 'priceCurrency': 'USD'},
+            })],
+        }
+        item = parse_listing(page, 'https://www.depop.com/products/us-price/')
+        self.assertEqual(item['price'], '$22.00')
+        self.assertEqual(item['priceCurrency'], 'USD')
+        self.assertIsNone(scraper.listing_price_cad(item))
+
     def test_server_error_is_not_cached_as_an_empty_listing(self):
         page = FakeRateLimitedListingPage()
         page.goto = mock.Mock(return_value=FakeResponse(500))

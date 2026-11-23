@@ -365,17 +365,26 @@ const normalizeRangeValue = (value, options, fallback) => {
   return options.includes(clean) ? clean : fallback;
 };
 
+const readPriceCap = (value) => {
+  const raw = String(value ?? '').trim();
+  const amount = Number(raw);
+  return raw && /^\d*(?:\.\d{0,2})?$/.test(raw) && Number.isFinite(amount) && amount <= 10000
+    ? amount : null;
+};
+
 const normalizePageFilters = (pageId, rawFilters = null) => {
   const page = CATEGORY_PAGE_MAP[pageId];
   const defaults = getDefaultPageFilters(pageId);
   const source = rawFilters && typeof rawFilters === 'object' ? rawFilters : {};
+  const rawPrice = String(source.maxPriceCad ?? defaults.maxPriceCad).trim();
+  const maxPriceCad = String(readPriceCap(rawPrice) ?? rawPrice);
 
   if (!page) {
     return defaults;
   }
 
   if (page.mode === 'measurements') {
-    return Object.fromEntries(TOPS_RANGES.flatMap(({ min, max }, index) => {
+    const measurements = Object.fromEntries(TOPS_RANGES.flatMap(({ min, max }, index) => {
       const targetKey = index === 0 ? 'first' : 'second';
       const center = readRangeNumber(source[targetKey]);
       const tolerance = readRangeNumber(source[`${targetKey}Tolerance`]);
@@ -385,23 +394,26 @@ const normalizePageFilters = (pageId, rawFilters = null) => {
         [max, normalizeMeasurementValue(source[max], legacy ? String(Math.min(1000, center + tolerance)) : defaults[max])],
       ];
     }));
+    return { ...measurements, maxPriceCad };
   }
 
   if (page.mode === 'sizeRange') {
     return {
       min: normalizeRangeValue(source.min, page.sizeOptions, defaults.min),
       max: normalizeRangeValue(source.max, page.sizeOptions, defaults.max),
+      maxPriceCad,
     };
   }
 
   if (page.mode === 'bottomMeasurements') {
-    return Object.fromEntries(BOTTOMS_RANGES.flatMap(({ min, max }) => [
+    const measurements = Object.fromEntries(BOTTOMS_RANGES.flatMap(({ min, max }) => [
       [min, normalizeMeasurementValue(source[min], defaults[min])],
       [max, normalizeMeasurementValue(source[max], defaults[max])],
     ]));
+    return { ...measurements, maxPriceCad };
   }
 
-  return defaults;
+  return { ...defaults, maxPriceCad };
 };
 
 const getDefaultFiltersByPage = () =>
@@ -591,6 +603,8 @@ const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
     parseWorkers: 4,
     searchId,
   };
+  const maxPriceCad = readPriceCap(filters.maxPriceCad);
+  if (maxPriceCad !== null) payload.maxPriceCad = maxPriceCad;
 
   if (page.mode === 'measurements') {
     const [p2p, length] = TOPS_RANGES.map((range) =>
@@ -771,6 +785,8 @@ function App() {
   const currentFilters = pageFilters[activePage.id] || getDefaultPageFilters(activePage.id);
   const invalidTopsRanges = activePage.mode === 'measurements'
     && TOPS_RANGES.some((range) => !getTopsRange(currentFilters, range));
+  const invalidPriceCap = Boolean(currentFilters.maxPriceCad.trim()) && readPriceCap(currentFilters.maxPriceCad) === null;
+  const invalidSearchFilters = invalidTopsRanges || invalidPriceCap;
   const sellerCount = sellerAccounts.length;
   const activeSearchCount = currentWorkspace.sellerRows.filter((row) => row.loading).length;
   const queuedCountForPage = currentWorkspace.sellerRows.filter((row) => row.progress?.phase === 'queued').length;
@@ -1305,7 +1321,9 @@ function App() {
       existingRow?.resultsDay === day
       && savedFilters
       && !isLegacyBottomsSearch(pageId, savedFilters)
-      && JSON.stringify(normalizePageFilters(pageId, savedFilters)) === JSON.stringify(filters)
+      && JSON.stringify(normalizePageFilters(pageId, {
+        ...savedFilters, maxPriceCad: savedFilters.maxPriceCad ?? '',
+      })) === JSON.stringify(filters)
     );
     sellerRowUpdate.resultsDay = day;
     sellerRowUpdate.resultsFilters = filters;
@@ -1475,7 +1493,10 @@ function App() {
         }
 
         const savedTask = row.searchTask || {};
-        const savedFilters = savedTask.filters ?? pageFilters[pageId];
+        const persistedFilters = savedTask.filters ?? row.resultsFilters;
+        const savedFilters = persistedFilters
+          ? { ...persistedFilters, maxPriceCad: persistedFilters.maxPriceCad ?? '' }
+          : pageFilters[pageId];
         const task = {
           ...savedTask,
           key: searchKeyFor(pageId, row.seller),
@@ -1496,12 +1517,12 @@ function App() {
   };
 
   const startSellerSearch = async (pageId, sellerUsername) => {
-    if (invalidTopsRanges) return;
+    if (invalidSearchFilters) return;
     queueSellerSearch(pageId, sellerUsername, { source: 'manual' });
   };
 
   const startSearchAllForPage = async (pageId) => {
-    if (invalidTopsRanges) return;
+    if (invalidSearchFilters) return;
     setSellerView('all');
     setSellerQuery('');
     const batchId = nextBatchId('batch');
@@ -1778,19 +1799,24 @@ function App() {
           <section className={`home-controls${hasFitGuide ? ' has-fit-guide' : ''}`} aria-labelledby="fit-filters-title">
             <div className="home-controls-content">
               <div className="home-controls-heading">
-                <h2 id="fit-filters-title"><ListFilter size={17} /> {activePage.mode === 'all' ? 'Accessories' : 'Fit filters'}</h2>
-                {activePage.mode !== 'all' && (
-                  <button type="button" className="btn search-btn secondary reset-filters"
-                    onClick={() => resetPageFilters(activePage.id)}>
-                    <RotateCcw size={15} /> Reset filters
-                  </button>
-                )}
+                <h2 id="fit-filters-title"><ListFilter size={17} /> Filters</h2>
+                <button type="button" className="btn search-btn secondary reset-filters"
+                  onClick={() => resetPageFilters(activePage.id)}>
+                  <RotateCcw size={15} /> Reset filters
+                </button>
               </div>
               <div className="home-controls-fields">
                 {renderFilterControls()}
               </div>
 
               <div className="home-controls-actions">
+                <label className="filter-label price-filter">
+                  <span>Max price (CAD)</span>
+                  <input className="input-dark" inputMode="decimal" placeholder="No limit"
+                    value={currentFilters.maxPriceCad} aria-invalid={invalidPriceCap || undefined}
+                    aria-describedby={invalidPriceCap ? 'price-filter-error' : undefined}
+                    onChange={(event) => handlePageFilterChange(activePage.id, 'maxPriceCad', event.target.value)} />
+                </label>
                 {pageIsLoading ? (
                   <button
                     type="button"
@@ -1804,12 +1830,15 @@ function App() {
                     type="button"
                     className="btn btn--primary search-btn"
                     onClick={() => startSearchAllForPage(activePage.id)}
-                    disabled={currentWorkspace.sellerRows.length === 0 || invalidTopsRanges}
+                    disabled={currentWorkspace.sellerRows.length === 0 || invalidSearchFilters}
                   >
                     <Search size={16} /> Search All Sellers
                   </button>
                 )}
               </div>
+              {invalidPriceCap && (
+                <p className="range-error" id="price-filter-error" role="alert">Enter a price from $0 to $10,000.</p>
+              )}
             </div>
             {hasFitGuide && <FitGuide category={activePage.id} />}
           </section>
@@ -1880,7 +1909,7 @@ function App() {
                           type="button"
                           className="btn search-btn secondary small"
                           onClick={() => startSellerSearch(activePage.id, sellerRow.seller)}
-                          disabled={invalidTopsRanges}
+                          disabled={invalidSearchFilters}
                         >
                           <Search size={14} /> Search
                         </button>

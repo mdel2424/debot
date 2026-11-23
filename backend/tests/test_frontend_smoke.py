@@ -152,6 +152,36 @@ class FrontendSmokeTest(unittest.TestCase):
         expect(self.page.get_by_role('main')).to_be_focused()
         self.assertTrue(self.page.url.endswith('#footwear'))
 
+    def test_price_cap_defaults_editing_and_removal(self):
+        searches = []
+
+        def stream(route):
+            searches.append(route.request.post_data_json)
+            route.fulfill(content_type='text/event-stream', body=self.event({'type': 'done'}))
+
+        self.context.route('**/api/search/stream', stream)
+        self.page.goto(self.url + '#tops')
+        price = self.page.get_by_role('textbox', name='Max price (CAD)')
+        expect(price).to_have_value('35')
+        self.page.get_by_role('button', name='Bottoms', exact=True).click()
+        expect(price).to_have_value('45')
+        search = self.page.get_by_role('button', name='Search', exact=True).first
+        price.fill('-1')
+        expect(search).to_be_disabled()
+        expect(self.page.get_by_role('button', name='Search All Sellers')).to_be_disabled()
+        for value in ('39.50', ''):
+            price.fill(value)
+            search.click()
+            self.page.wait_for_function(
+                "JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).bottoms.sellerRows[0].processed"
+            )
+        self.assertEqual(searches[0]['maxPriceCad'], 39.5)
+        self.assertNotIn('maxPriceCad', searches[1])
+        self.page.reload()
+        expect(price).to_have_value('')
+        self.page.get_by_role('button', name='Reset filters').click()
+        expect(price).to_have_value('45')
+
     def test_bottoms_guide_tracks_measurement_focus(self):
         self.page.goto(self.url + '#bottoms')
         guide = self.page.get_by_role('img', name='Bottoms measurement guide')
@@ -420,7 +450,8 @@ class FrontendSmokeTest(unittest.TestCase):
             const key = 'debot.pageWorkspaces.v1';
             const state = JSON.parse(localStorage.getItem(key));
             state.tops.sellerRows[0].resultsFilters = {
-                first: '20.875', firstTolerance: '0.375', second: '26.875', secondTolerance: '0.375'
+                first: '20.875', firstTolerance: '0.375', second: '26.875', secondTolerance: '0.375',
+                maxPriceCad: '35'
             };
             localStorage.setItem(key, JSON.stringify(state));
         }""")
@@ -467,16 +498,18 @@ class FrontendSmokeTest(unittest.TestCase):
         search = self.page.get_by_role('button', name='Search', exact=True).first
         search.click()
         self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].processed")
-        for expired in (True, False):
-            self.page.evaluate("""(expired) => {
+        for change in ('date', 'fit', 'price', 'legacy-price'):
+            self.page.evaluate("""(change) => {
                 const key = 'debot.pageWorkspaces.v1';
                 const state = JSON.parse(localStorage.getItem(key));
                 const row = state.tops.sellerRows[0];
                 row.results.push({url: 'https://www.depop.com/products/stale/', price: '$10'});
-                if (expired) row.resultsDay = '1990-1-1';
-                else row.resultsFilters = {...row.resultsFilters, p2pMin: '999'};
+                if (change === 'date') row.resultsDay = '1990-1-1';
+                if (change === 'fit') row.resultsFilters.p2pMin = '999';
+                if (change === 'price') row.resultsFilters.maxPriceCad = '50';
+                if (change === 'legacy-price') delete row.resultsFilters.maxPriceCad;
                 localStorage.setItem(key, JSON.stringify(state));
-            }""", expired)
+            }""", change)
             self.page.reload()
             search.click()
             self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].processed")

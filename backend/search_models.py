@@ -47,6 +47,7 @@ class SearchRequest(SearchModel):
     lengthTolerance: Measurement = 1.25
     sizeRange: SizeRange | None = None
     bottomsMeasurements: BottomsMeasurements | None = None
+    maxPriceCad: Annotated[float, Field(ge=0, le=10_000)] | None = None
     maxItems: int = Field(default=40, ge=1, le=10000)
     maxLinks: int = Field(default=1000, ge=1, le=10000)
     maxScrolls: int = Field(default=8, ge=0, le=200)

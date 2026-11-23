@@ -3,6 +3,7 @@ const MEASUREMENT_DEFAULTS = Object.freeze({
   p2pMax: '21.25',
   lengthMin: '26.5',
   lengthMax: '27.25',
+  maxPriceCad: '35',
 });
 
 const FOOTWEAR_SIZE_OPTIONS = [
@@ -45,6 +46,7 @@ export const CATEGORY_PAGES = [
       riseMax: '13',
       legOpeningMin: '9.5',
       legOpeningMax: '10.5',
+      maxPriceCad: '45',
     },
   },
   {
@@ -56,6 +58,7 @@ export const CATEGORY_PAGES = [
     defaults: {
       min: '10',
       max: '11',
+      maxPriceCad: '',
     },
     sizeOptions: FOOTWEAR_SIZE_OPTIONS,
     sizeUnitLabel: 'US',
@@ -67,7 +70,7 @@ export const CATEGORY_PAGES = [
     group: 'accessories',
     mode: 'all',
     headline: 'Accessories Search',
-    defaults: {},
+    defaults: { maxPriceCad: '' },
   },
 ];
 

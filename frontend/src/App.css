@@ -124,7 +124,8 @@
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
-.home-controls-actions { display: flex; }
+.home-controls-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 10px 14px; }
+.price-filter { width: 132px; min-width: 0; }
 .fit-guide {
   display: grid;
   align-items: center;
@@ -394,7 +395,7 @@
   .home-controls-content { padding: 12px; gap: 12px; }
   .home-controls-fields { gap: 10px; }
   .filter-range { flex-basis: 125px; }
-  .home-controls-actions .search-btn { width: 100%; }
+  .home-controls-actions .search-btn { flex: 1 0 auto; }
   .fit-guide { min-height: 90px; border-left: 0; border-top: 1px solid var(--line); }
   .fit-diagram { max-height: 88px; width: 158px; }
   .fit-diagram--bottoms { max-height: 150px; width: 224px; padding-block: 4px; }
