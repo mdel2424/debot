@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { ArrowDownUp, ArrowUpRight, ChevronDown, Footprints, ImageOff, ListFilter, Plus, RotateCcw, ScanLine, Search, Shapes, Shirt, Square, UsersRound, X } from 'lucide-react';
 import {
   cancelSearch,
   makeSearchId,
@@ -30,6 +31,25 @@ const PAGE_FILTERS_VERSION_STORAGE_KEY = 'debot.categoryFilters.defaults.v1';
 const PAGE_WORKSPACES_STORAGE_KEY = 'debot.pageWorkspaces.v1';
 const LOW_PARSE_RETRY_RATIO = 0.9;
 const MAX_LOW_PARSE_RETRIES = 1;
+
+const CATEGORY_ICONS = { tops: Shirt, bottoms: ArrowDownUp, footwear: Footprints, accessories: Shapes };
+const TOPS_RANGES = [
+  { label: 'Pit to pit', min: 'p2pMin', max: 'p2pMax' },
+  { label: 'Length', min: 'lengthMin', max: 'lengthMax' },
+];
+const BOTTOMS_RANGES = [
+  { key: 'waist', label: 'Waist', min: 'waistMin', max: 'waistMax' },
+  { key: 'inseam', label: 'Inseam', min: 'inseamMin', max: 'inseamMax' },
+  { key: 'rise', label: 'Rise', min: 'riseMin', max: 'riseMax' },
+  { key: 'legOpening', label: 'Leg opening', min: 'legOpeningMin', max: 'legOpeningMax' },
+];
+const LEGACY_BOTTOMS_RANGES = [
+  ...BOTTOMS_RANGES.filter(({ key }) => key !== 'inseam' && key !== 'rise'),
+  { key: 'inseamRise', min: 'inseamRiseMin', max: 'inseamRiseMax' },
+];
+
+const isLegacyBottomsSearch = (pageId, filters) =>
+  pageId === 'bottoms' && (filters?.inseamRiseMin != null || filters?.inseamRiseMax != null);
 
 const createProgressState = (overrides = {}) => ({
   processed: 0,
@@ -112,10 +132,6 @@ const formatSellerStatusLabel = (sellerRow, queuePosition = null) => {
   }
   if (progress?.phase === 'queued') {
     return queuePosition ? `Queue position ${queuePosition}` : 'Waiting for the global queue';
-  }
-
-  if (!sellerRow?.loading && !sellerRow?.error && !sellerRow?.processed && safeHits === 0 && processed === 0 && total === 0) {
-    return 'Awaiting search';
   }
 
   if (sellerRow?.loading && processed === 0 && total === 0 && safeHits === 0) {
@@ -332,6 +348,18 @@ const normalizeMeasurementValue = (value, fallback) => {
   return clean || fallback;
 };
 
+const readRangeNumber = (value) => {
+  const raw = String(value ?? '').trim();
+  const number = Number(raw);
+  return raw && Number.isFinite(number) && number >= 0 && number <= 1000 ? number : null;
+};
+
+const getTopsRange = (filters, { min, max }) => {
+  const lower = readRangeNumber(filters[min]);
+  const upper = readRangeNumber(filters[max]);
+  return lower !== null && upper !== null && lower <= upper ? [lower, upper] : null;
+};
+
 const normalizeRangeValue = (value, options, fallback) => {
   const clean = String(value ?? '').trim();
   return options.includes(clean) ? clean : fallback;
@@ -347,12 +375,16 @@ const normalizePageFilters = (pageId, rawFilters = null) => {
   }
 
   if (page.mode === 'measurements') {
-    return {
-      first: normalizeMeasurementValue(source.first, defaults.first),
-      second: normalizeMeasurementValue(source.second, defaults.second),
-      firstTolerance: normalizeMeasurementValue(source.firstTolerance, defaults.firstTolerance),
-      secondTolerance: normalizeMeasurementValue(source.secondTolerance, defaults.secondTolerance),
-    };
+    return Object.fromEntries(TOPS_RANGES.flatMap(({ min, max }, index) => {
+      const targetKey = index === 0 ? 'first' : 'second';
+      const center = readRangeNumber(source[targetKey]);
+      const tolerance = readRangeNumber(source[`${targetKey}Tolerance`]);
+      const legacy = center !== null && tolerance !== null;
+      return [
+        [min, normalizeMeasurementValue(source[min], legacy ? String(Math.max(0, center - tolerance)) : defaults[min])],
+        [max, normalizeMeasurementValue(source[max], legacy ? String(Math.min(1000, center + tolerance)) : defaults[max])],
+      ];
+    }));
   }
 
   if (page.mode === 'sizeRange') {
@@ -363,14 +395,10 @@ const normalizePageFilters = (pageId, rawFilters = null) => {
   }
 
   if (page.mode === 'bottomMeasurements') {
-    return {
-      waistMin: normalizeMeasurementValue(source.waistMin, defaults.waistMin),
-      waistMax: normalizeMeasurementValue(source.waistMax, defaults.waistMax),
-      inseamRiseMin: normalizeMeasurementValue(source.inseamRiseMin, defaults.inseamRiseMin),
-      inseamRiseMax: normalizeMeasurementValue(source.inseamRiseMax, defaults.inseamRiseMax),
-      legOpeningMin: normalizeMeasurementValue(source.legOpeningMin, defaults.legOpeningMin),
-      legOpeningMax: normalizeMeasurementValue(source.legOpeningMax, defaults.legOpeningMax),
-    };
+    return Object.fromEntries(BOTTOMS_RANGES.flatMap(({ min, max }) => [
+      [min, normalizeMeasurementValue(source[min], defaults[min])],
+      [max, normalizeMeasurementValue(source[max], defaults[max])],
+    ]));
   }
 
   return defaults;
@@ -416,15 +444,6 @@ const readStoredPageFilters = () => {
 
   try {
     const storedDefaultsSignature = window.localStorage.getItem(PAGE_FILTERS_VERSION_STORAGE_KEY);
-    if (storedDefaultsSignature !== CATEGORY_FILTER_DEFAULTS_SIGNATURE) {
-      window.localStorage.removeItem(PAGE_FILTERS_STORAGE_KEY);
-      window.localStorage.setItem(
-        PAGE_FILTERS_VERSION_STORAGE_KEY,
-        CATEGORY_FILTER_DEFAULTS_SIGNATURE
-      );
-      return getDefaultFiltersByPage();
-    }
-
     const raw = window.localStorage.getItem(PAGE_FILTERS_STORAGE_KEY);
     if (!raw) {
       return getDefaultFiltersByPage();
@@ -435,9 +454,21 @@ const readStoredPageFilters = () => {
       return getDefaultFiltersByPage();
     }
 
-    return Object.fromEntries(
-      CATEGORY_PAGES.map((page) => [page.id, normalizePageFilters(page.id, parsed[page.id])])
-    );
+    let previousDefaults = [];
+    if (storedDefaultsSignature && storedDefaultsSignature !== CATEGORY_FILTER_DEFAULTS_SIGNATURE) {
+      try {
+        const records = JSON.parse(storedDefaultsSignature);
+        if (Array.isArray(records)) previousDefaults = records;
+      } catch {
+        // Legacy signatures may not contain the previous default values.
+      }
+    }
+    return Object.fromEntries(CATEGORY_PAGES.map((page) => {
+      const saved = parsed[page.id];
+      const previous = previousDefaults.find((record) => record?.id === page.id)?.defaults;
+      const unchanged = saved && previous && Object.entries(previous).every(([key, value]) => saved[key] === value);
+      return [page.id, normalizePageFilters(page.id, unchanged ? null : saved)];
+    }));
   } catch (error) {
     console.warn('[App] Failed to read page filters:', error);
     return getDefaultFiltersByPage();
@@ -493,15 +524,60 @@ const getResultAgeDays = (result) => {
   return Math.max((Date.now() - listedAtMs) / 86400000, 0);
 };
 
-const formatResultMeasurement = (value, label) => {
+const readResultMeasurement = (value) => {
   const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) {
-    return null;
-  }
-
-  const display = Number.isInteger(numeric) ? String(numeric) : numeric.toFixed(1);
-  return `${display}" ${label}`;
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
 };
+const resultMeasurementFormat = new Intl.NumberFormat('en-CA', { maximumFractionDigits: 2 });
+const TOPS_RESULT_MEASUREMENTS = [
+  { key: 'p2p', label: 'Pit to pit' },
+  { key: 'length', label: 'Length' },
+];
+
+function ResultCard({ result, category }) {
+  const fields = category === 'bottoms' ? BOTTOMS_RANGES : TOPS_RESULT_MEASUREMENTS;
+  const measurements = fields.flatMap(({ key, label }) => {
+    const value = readResultMeasurement(result[key]);
+    return value === null ? [] : [{ key, label, value }];
+  });
+  const inseam = readResultMeasurement(result.inseam);
+  const rise = readResultMeasurement(result.rise);
+  if (category === 'bottoms' && inseam !== null && rise !== null) {
+    measurements.push({ key: 'inseamRise', label: 'Inseam + rise', value: inseam + rise });
+  }
+  const age = getResultAgeDays(result);
+
+  return (
+    <a className="result-card card m-zoom" href={result.url || undefined} target="_blank" rel="noreferrer">
+      <div className="result-media">
+        {result.image ? (
+          <img className="result-img frame__img" src={result.image} alt="Depop listing photo" loading="lazy" />
+        ) : (
+          <div className="result-img placeholder" aria-hidden="true"><ImageOff size={24} /></div>
+        )}
+      </div>
+      <div className="result-info">
+        {result.price && <div className="result-price">{result.price}</div>}
+        {(result.sizeLabel || age !== null) && (
+          <div className="result-details">
+            {result.sizeLabel && <span>Size {result.sizeLabel}</span>}
+            {age !== null && <span>{Math.round(age)}d old</span>}
+          </div>
+        )}
+        {measurements.length > 0 && (
+          <dl className="result-measurements">
+            {measurements.map(({ key, label, value }) => (
+              <div key={key} className={key === 'inseamRise' ? 'result-measurement-total' : undefined}>
+                <dt>{label}</dt>
+                <dd>{resultMeasurementFormat.format(value)}&Prime;</dd>
+              </div>
+            ))}
+          </dl>
+        )}
+      </div>
+    </a>
+  );
+}
 
 const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
   const payload = {
@@ -517,12 +593,15 @@ const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
   };
 
   if (page.mode === 'measurements') {
+    const [p2p, length] = TOPS_RANGES.map((range) =>
+      getTopsRange(filters, range) ?? getTopsRange(page.defaults, range)
+    );
     payload.measurements = {
-      first: parseMeasurementNumber(filters.first, null),
-      second: parseMeasurementNumber(filters.second, null),
+      first: (p2p[0] + p2p[1]) / 2,
+      second: (length[0] + length[1]) / 2,
     };
-    payload.p2pTolerance = parseMeasurementNumber(filters.firstTolerance, 0.5);
-    payload.lengthTolerance = parseMeasurementNumber(filters.secondTolerance, 1.25);
+    payload.p2pTolerance = (p2p[1] - p2p[0]) / 2;
+    payload.lengthTolerance = (length[1] - length[0]) / 2;
   } else if (page.mode === 'sizeRange') {
     const minSize = parseMeasurementNumber(filters.min, parseMeasurementNumber(page.defaults.min, null));
     const maxSize = parseMeasurementNumber(filters.max, parseMeasurementNumber(page.defaults.max, null));
@@ -542,21 +621,12 @@ const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
       };
     };
 
-    payload.bottomsMeasurements = {
-      waist: normalizeMinMax(filters.waistMin, filters.waistMax, page.defaults.waistMin, page.defaults.waistMax),
-      inseamRise: normalizeMinMax(
-        filters.inseamRiseMin,
-        filters.inseamRiseMax,
-        page.defaults.inseamRiseMin,
-        page.defaults.inseamRiseMax,
-      ),
-      legOpening: normalizeMinMax(
-        filters.legOpeningMin,
-        filters.legOpeningMax,
-        page.defaults.legOpeningMin,
-        page.defaults.legOpeningMax,
-      ),
-    };
+    const legacy = isLegacyBottomsSearch(page.id, filters);
+    const ranges = legacy ? LEGACY_BOTTOMS_RANGES : BOTTOMS_RANGES;
+    payload.bottomsMeasurements = Object.fromEntries(ranges.map(({ key, min, max }) => [
+      key,
+      normalizeMinMax(filters[min], filters[max], page.defaults[min] ?? '42', page.defaults[max] ?? '44'),
+    ]));
   }
 
   return payload;
@@ -576,6 +646,95 @@ function ReconnectSearches({ onReconnect }) {
   return null;
 }
 
+function RangeField({ label, min, max, filters, onChange, invalid = false }) {
+  return (
+    <fieldset className="filter-range" data-fit-range={min}>
+      <legend>{label} <span>(in)</span></legend>
+      <div className="filter-range-pair">
+        <label className="range-input">
+          <span>Min</span>
+          <input className="input-dark" aria-label={`${label} minimum`} inputMode="decimal"
+            value={filters[min]} aria-invalid={invalid || undefined}
+            onChange={(event) => onChange(min, event.target.value)} />
+        </label>
+        <span className="range-separator" aria-hidden="true">–</span>
+        <label className="range-input">
+          <span>Max</span>
+          <input className="input-dark" aria-label={`${label} maximum`} inputMode="decimal"
+            value={filters[max]} aria-invalid={invalid || undefined}
+            onChange={(event) => onChange(max, event.target.value)} />
+        </label>
+      </div>
+      {invalid && <p className="range-error" role="alert">Enter a valid min and max, in order.</p>}
+    </fieldset>
+  );
+}
+
+function TopsFitMarks() {
+  return (
+    <>
+      <path className="garment" d="M86 20 66 24 44 45 61 64 73 55 73 109 151 109 151 55 163 64 180 45 158 24 138 20 128 20c-1 9-7 14-16 14s-15-5-16-14Z" />
+      <path className="garment-seam" d="M73 102h78M50 48l15 15m94 0 15-15M96 20c2 7 7 11 16 11s14-4 16-11" />
+      <g data-fit-mark="p2pMin">
+        <path className="fit-mark" d="M75 56h73M75 52v8m73-8v8M80 53l-5 3 5 3m63-6 5 3-5 3" />
+        <text x="112" y="50" textAnchor="middle">P2P</text>
+      </g>
+      <g data-fit-mark="lengthMin">
+        <path className="garment-seam" d="M152 20h31m-30 89h30" />
+        <path className="fit-mark" d="M188 20v89m-5-89h10m-10 89h10m-8-84 3-5 3 5m-6 79 3 5 3-5" />
+        <text x="198" y="68">LEN</text>
+      </g>
+    </>
+  );
+}
+
+function BottomsFitMarks() {
+  return (
+    <>
+      <path className="garment" d="M73 26h78l7 28 2 80h-39l-9-66-9 66H64l2-80Z" />
+      <path className="garment-seam" d="M71 34h82M75 34c0 10 4 16 13 18m61-18c0 10-4 16-13 18m-17-18v16c0 5-3 9-7 10m-47 68h39m16 0h40" />
+      <g data-fit-mark="waistMin">
+        <path className="fit-mark" d="M73 17h78M73 13v8m78-8v8M78 14l-5 3 5 3m68-6 5 3-5 3" />
+        <text x="112" y="10" textAnchor="middle">WAIST &#215;2</text>
+      </g>
+      <g data-fit-mark="riseMin">
+        <path className="garment-seam" d="M63 47h42" />
+        <path className="fit-mark" d="M105 26v42m-4-42h8m-8 42h8m-7-37 3-5 3 5m-6 32 3 5 3-5" />
+        <text x="59" y="50" textAnchor="end">RISE</text>
+      </g>
+      <g data-fit-mark="inseamMin">
+        <path className="garment-seam" d="M132 98h32" />
+        <path className="fit-mark" d="m117 68 10 66m-14-66h8m2 66h8m-17-61 3-5 4 4m2 57 4 5 2-5" />
+        <text x="168" y="101">INSEAM</text>
+      </g>
+      <g data-fit-mark="legOpeningMin">
+        <path className="fit-mark" d="M121 144h39m-39-4v8m39-8v8m-34-7-5 3 5 3m29-6 5 3-5 3" />
+        <text x="140.5" y="159" textAnchor="middle">LEG OPENING</text>
+      </g>
+    </>
+  );
+}
+
+function FitGuide({ category }) {
+  const isBottoms = category === 'bottoms';
+  return (
+    <div className="fit-guide">
+      <svg viewBox={isBottoms ? '0 0 224 164' : '0 0 224 128'} fill="none"
+        className={`fit-diagram${isBottoms ? ' fit-diagram--bottoms' : ''}`}
+        role="img" aria-labelledby="fit-guide-title" aria-describedby="fit-guide-description">
+        <title id="fit-guide-title">{isBottoms ? 'Bottoms measurement guide' : 'Tops measurement guide'}</title>
+        <desc id="fit-guide-description">
+          {isBottoms
+            ? 'Double the flat waistband width for waist size. Measure front rise from waistband to crotch, inseam from crotch to hem, and leg opening flat across one cuff.'
+            : 'Measure pit to pit across the chest and length from the shoulder to the hem.'}
+        </desc>
+        {isBottoms ? <BottomsFitMarks /> : <TopsFitMarks />}
+        <path className="fit-diagram-cross" d="M15 19h12m-6-6v12m-6 84h12m-6-6v12" />
+      </svg>
+    </div>
+  );
+}
+
 function App() {
   const [initialSellerAccounts] = useState(readStoredSellerAccounts);
   const searchRegistryRef = useRef(new Map());
@@ -583,6 +742,10 @@ function App() {
   const batchCounterRef = useRef(0);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [sellerManagerOpen, setSellerManagerOpen] = useState(false);
+  const sellerManagerRef = useRef(null);
+  const [sellerView, setSellerView] = useState('all');
+  const [sellerQuery, setSellerQuery] = useState('');
+  const [expandedResults, setExpandedResults] = useState({});
   const [activePageId, setActivePageId] = useState(() => readInitialPageId());
   const [sellerAccounts, setSellerAccounts] = useState(initialSellerAccounts);
   const [pageFilters, setPageFilters] = useState(() => readStoredPageFilters());
@@ -603,8 +766,11 @@ function App() {
   const sellerAccountsSnapshot = JSON.stringify(sellerAccounts);
   const pageFiltersSnapshot = JSON.stringify(pageFilters);
   const activePage = CATEGORY_PAGE_MAP[activePageId] || CATEGORY_PAGE_MAP[DEFAULT_CATEGORY_PAGE_ID];
+  const hasFitGuide = activePage.id === 'tops' || activePage.id === 'bottoms';
   const currentWorkspace = pageWorkspaces[activePage.id] || { sellerRows: [] };
   const currentFilters = pageFilters[activePage.id] || getDefaultPageFilters(activePage.id);
+  const invalidTopsRanges = activePage.mode === 'measurements'
+    && TOPS_RANGES.some((range) => !getTopsRange(currentFilters, range));
   const sellerCount = sellerAccounts.length;
   const activeSearchCount = currentWorkspace.sellerRows.filter((row) => row.loading).length;
   const queuedCountForPage = currentWorkspace.sellerRows.filter((row) => row.progress?.phase === 'queued').length;
@@ -613,14 +779,13 @@ function App() {
   const queuePositionByKey = new Map(
     queueState.pending.map((task, index) => [task.key, index + 1])
   );
-  let globalQueueStatus = null;
-  if (queueState.active.length > 0 && queueState.pending.length > 0) {
-    globalQueueStatus = `${queueState.active.length} active • ${queueState.pending.length} paused`;
-  } else if (queueState.active.length > 0) {
-    globalQueueStatus = `${queueState.active.length} active`;
-  } else if (queueState.pending.length > 0) {
-    globalQueueStatus = `${queueState.pending.length} queued`;
-  }
+  const sellerSearchQuery = sellerQuery.trim().toLowerCase().replace(/^@/, '');
+  const matchedSellerCount = currentWorkspace.sellerRows.filter((row) => row.results.length > 0).length;
+  const visibleSellerRows = currentWorkspace.sellerRows.filter((row) =>
+    (sellerView === 'all' || row.results.length > 0)
+    && (!sellerSearchQuery || [row.seller, row.displayName].some((value) =>
+      String(value || '').toLowerCase().includes(sellerSearchQuery)))
+  );
 
   useEffect(() => {
     pageWorkspacesRef.current = pageWorkspaces;
@@ -729,18 +894,9 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!sellerManagerOpen || typeof window === 'undefined') {
-      return undefined;
-    }
-
-    const handleKeyDown = (event) => {
-      if (event.key === 'Escape') {
-        setSellerManagerOpen(false);
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    const dialog = sellerManagerRef.current;
+    if (sellerManagerOpen && !dialog.open) dialog.showModal();
+    else if (!sellerManagerOpen && dialog.open) dialog.close();
   }, [sellerManagerOpen]);
 
   useEffect(() => {
@@ -1144,9 +1300,12 @@ function App() {
     };
     const existingRow = getSellerRow(pageId, sellerUsername);
     const day = currentResultDay();
+    const savedFilters = existingRow?.resultsFilters;
     const keepResults = task.resetResults === false || (
       existingRow?.resultsDay === day
-      && JSON.stringify(existingRow?.resultsFilters) === JSON.stringify(filters)
+      && savedFilters
+      && !isLegacyBottomsSearch(pageId, savedFilters)
+      && JSON.stringify(normalizePageFilters(pageId, savedFilters)) === JSON.stringify(filters)
     );
     sellerRowUpdate.resultsDay = day;
     sellerRowUpdate.resultsFilters = filters;
@@ -1316,15 +1475,14 @@ function App() {
         }
 
         const savedTask = row.searchTask || {};
+        const savedFilters = savedTask.filters ?? pageFilters[pageId];
         const task = {
           ...savedTask,
           key: searchKeyFor(pageId, row.seller),
           pageId,
           sellerUsername: row.seller,
-          filters: normalizePageFilters(
-            pageId,
-            savedTask.filters ?? pageFilters[pageId]
-          ),
+          // A registered job keeps its original filters when reconnected.
+          filters: isLegacyBottomsSearch(pageId, savedFilters) ? savedFilters : normalizePageFilters(pageId, savedFilters),
           batchId: savedTask.batchId || `resume-${row.searchId}`,
           source: savedTask.source || 'resume',
           resetResults: false,
@@ -1338,10 +1496,14 @@ function App() {
   };
 
   const startSellerSearch = async (pageId, sellerUsername) => {
+    if (invalidTopsRanges) return;
     queueSellerSearch(pageId, sellerUsername, { source: 'manual' });
   };
 
   const startSearchAllForPage = async (pageId) => {
+    if (invalidTopsRanges) return;
+    setSellerView('all');
+    setSellerQuery('');
     const batchId = nextBatchId('batch');
     const page = CATEGORY_PAGE_MAP[pageId];
     const filters = normalizePageFilters(pageId, pageFilters[pageId]);
@@ -1413,35 +1575,13 @@ function App() {
   };
 
   const renderFilterControls = () => {
-    if (activePage.mode === 'measurements') {
-      return (
-        <>
-          <input
-            className="input-dark"
-            placeholder="P2P (in)"
-            value={currentFilters.first}
-            onChange={(event) => handlePageFilterChange(activePage.id, 'first', event.target.value)}
-          />
-          <input
-            className="input-dark input-small"
-            placeholder="± P2P"
-            value={currentFilters.firstTolerance}
-            onChange={(event) => handlePageFilterChange(activePage.id, 'firstTolerance', event.target.value)}
-          />
-          <input
-            className="input-dark"
-            placeholder="Length (in)"
-            value={currentFilters.second}
-            onChange={(event) => handlePageFilterChange(activePage.id, 'second', event.target.value)}
-          />
-          <input
-            className="input-dark input-small"
-            placeholder="± Len"
-            value={currentFilters.secondTolerance}
-            onChange={(event) => handlePageFilterChange(activePage.id, 'secondTolerance', event.target.value)}
-          />
-        </>
-      );
+    if (['measurements', 'bottomMeasurements'].includes(activePage.mode)) {
+      const isTops = activePage.mode === 'measurements';
+      return (isTops ? TOPS_RANGES : BOTTOMS_RANGES).map((range) => (
+        <RangeField key={range.min} {...range} filters={currentFilters}
+          invalid={isTops && !getTopsRange(currentFilters, range)}
+          onChange={(field, value) => handlePageFilterChange(activePage.id, field, value)} />
+      ));
     }
 
     if (activePage.mode === 'sizeRange') {
@@ -1479,120 +1619,59 @@ function App() {
       );
     }
 
-    if (activePage.mode === 'bottomMeasurements') {
-      return (
-        <>
-          <label className="filter-label">
-            <span>Waist</span>
-            <div className="filter-range-pair">
-              <input
-                className="input-dark input-small"
-                placeholder="Min"
-                value={currentFilters.waistMin}
-                onChange={(event) => handlePageFilterChange(activePage.id, 'waistMin', event.target.value)}
-              />
-              <input
-                className="input-dark input-small"
-                placeholder="Max"
-                value={currentFilters.waistMax}
-                onChange={(event) => handlePageFilterChange(activePage.id, 'waistMax', event.target.value)}
-              />
-            </div>
-          </label>
-          <label className="filter-label">
-            <span>Inseam + Rise</span>
-            <div className="filter-range-pair">
-              <input
-                className="input-dark input-small"
-                placeholder="Min"
-                value={currentFilters.inseamRiseMin}
-                onChange={(event) => handlePageFilterChange(activePage.id, 'inseamRiseMin', event.target.value)}
-              />
-              <input
-                className="input-dark input-small"
-                placeholder="Max"
-                value={currentFilters.inseamRiseMax}
-                onChange={(event) => handlePageFilterChange(activePage.id, 'inseamRiseMax', event.target.value)}
-              />
-            </div>
-          </label>
-          <label className="filter-label">
-            <span>Leg Opening</span>
-            <div className="filter-range-pair">
-              <input
-                className="input-dark input-small"
-                placeholder="Min"
-                value={currentFilters.legOpeningMin}
-                onChange={(event) => handlePageFilterChange(activePage.id, 'legOpeningMin', event.target.value)}
-              />
-              <input
-                className="input-dark input-small"
-                placeholder="Max"
-                value={currentFilters.legOpeningMax}
-                onChange={(event) => handlePageFilterChange(activePage.id, 'legOpeningMax', event.target.value)}
-              />
-            </div>
-          </label>
-        </>
-      );
-    }
-
-    return (
-      <span className="workspace-pill muted">
-        No size filter
-      </span>
-    );
+    return null;
   };
 
   return (
-    <div className="app-dark-ui app-home-shell">
+    <div className="app-home-shell app-frame">
+      <a className="skip-link" href="#workspace" onClick={(event) => {
+        event.preventDefault();
+        document.getElementById('workspace')?.focus();
+      }}>Skip to search</a>
       <ReconnectSearches onReconnect={reconnectPersistedSearches} />
-      <div
-        className={`seller-manager-backdrop ${sellerManagerOpen ? 'open' : ''}`}
-        onClick={() => setSellerManagerOpen(false)}
-      />
 
-      <aside
-        className={`seller-manager-drawer ${sellerManagerOpen ? 'open' : ''}`}
-        aria-hidden={!sellerManagerOpen}
-        inert={!sellerManagerOpen}
+      <dialog
+        ref={sellerManagerRef}
+        className="seller-manager-drawer"
+        aria-labelledby="seller-manager-title"
+        onClose={() => setSellerManagerOpen(false)}
+        onClick={(event) => {
+          if (event.target === event.currentTarget) {
+            const { left, right, top, bottom } = event.currentTarget.getBoundingClientRect();
+            if (event.clientX < left || event.clientX > right || event.clientY < top || event.clientY > bottom) {
+              setSellerManagerOpen(false);
+            }
+          }
+        }}
       >
         <div className="seller-manager-header">
           <div>
-            <div className="seller-manager-kicker">Shared sellers</div>
-            <h2>Manage sellers</h2>
-            <p className="following-description">
-              Add or remove the accounts searched across every category page. Your
-              seller list stays local to this browser.
-            </p>
+            <h2 id="seller-manager-title">Manage sellers</h2>
+            <span className="mono muted">{sellerCount} saved sellers</span>
           </div>
           <button
             type="button"
-            className="seller-manager-close"
+            className="btn search-btn secondary icon-button"
             onClick={() => setSellerManagerOpen(false)}
             aria-label="Close seller manager"
           >
-            ×
+            <X size={18} />
           </button>
         </div>
 
-        <div className="seller-manager-form">
-          <input
-            className="input-dark"
-            placeholder="@username or shop link"
-            value={sellerForm.username}
-            onChange={(event) => handleSellerFormInput('username', event.target.value)}
-          />
-          <input
-            className="input-dark"
-            placeholder="Display name (optional)"
-            value={sellerForm.displayName}
-            onChange={(event) => handleSellerFormInput('displayName', event.target.value)}
-          />
-          <button type="button" className="search-btn" onClick={addSellerAccount}>
-            Add seller
+        <form className="seller-manager-form" onSubmit={(event) => { event.preventDefault(); addSellerAccount(); }}>
+          <label className="filter-label">Username or shop link
+            <input className="input-dark" value={sellerForm.username}
+              onChange={(event) => handleSellerFormInput('username', event.target.value)} />
+          </label>
+          <label className="filter-label">Display name <span className="muted">(optional)</span>
+            <input className="input-dark" value={sellerForm.displayName}
+              onChange={(event) => handleSellerFormInput('displayName', event.target.value)} />
+          </label>
+          <button type="submit" className="btn btn--primary search-btn">
+            <Plus size={16} /> Add seller
           </button>
-        </div>
+        </form>
 
         {sellerForm.error && (
           <div className="row-error seller-manager-error">
@@ -1603,7 +1682,7 @@ function App() {
         <div className="seller-manager-list">
           {sellerAccounts.length === 0 ? (
             <div className="seller-manager-empty">
-              No sellers saved yet. Add one to start building your category pages.
+              No saved sellers.
             </div>
           ) : (
             sellerAccounts.map((account) => (
@@ -1618,7 +1697,7 @@ function App() {
                 </div>
                 <button
                   type="button"
-                  className="search-btn secondary small"
+                  className="btn search-btn secondary small"
                   onClick={() => removeSellerAccount(account.username)}
                 >
                   Remove
@@ -1631,123 +1710,142 @@ function App() {
         <div className="seller-manager-footer">
           <button
             type="button"
-            className="search-btn secondary"
+            className="btn search-btn secondary"
             onClick={resetSellerAccounts}
           >
-            Reset sellers
+            <RotateCcw size={16} /> Reset sellers
           </button>
           <button
             type="button"
-            className="search-btn secondary"
+            className="btn search-btn secondary"
             onClick={() => setSellerManagerOpen(false)}
           >
             Close
           </button>
         </div>
-      </aside>
+      </dialog>
 
       <aside className="sidebar category-sidebar">
-        <div className="sidebar-title">Debot</div>
-        <nav className="sidebar-nav">
+        <div className="sidebar-title">
+          <span className="brand-mark"><ScanLine size={20} strokeWidth={1.9} /></span>
+          <span>Debot</span>
+        </div>
+        <nav className="sidebar-nav" aria-label="Categories">
+          <div className="nav-label mono">Categories</div>
           <ul>
-            {CATEGORY_PAGES.map((page) => (
-              <li key={page.id} className={page.id === activePage.id ? 'active' : ''}>
+            {CATEGORY_PAGES.map((page) => {
+              const Icon = CATEGORY_ICONS[page.id];
+              const isActive = page.id === activePage.id;
+              return (
+              <li key={page.id}>
                 <button
                   type="button"
                   className="sidebar-nav-button"
                   aria-label={page.label}
+                  aria-current={isActive ? 'page' : undefined}
                   onClick={() => switchPage(page.id)}
                 >
-                  <span className="sidebar-icon">{page.shortLabel}</span>
+                  <Icon size={17} strokeWidth={1.75} />
                   <span>{page.label}</span>
                 </button>
               </li>
-            ))}
+              );
+            })}
           </ul>
         </nav>
+        <button type="button" className="btn search-btn secondary sidebar-manage"
+          aria-haspopup="dialog" onClick={() => setSellerManagerOpen(true)}>
+          <UsersRound size={17} /> <span>Manage sellers</span>
+        </button>
       </aside>
 
-      <main className="main-content home-main-content">
-        <div className="following-container home-workspace">
-          <div className="following-header home-header">
+      <main id="workspace" tabIndex={-1} className="main-content">
+        <div className="home-workspace">
+          <header className="home-header">
             <div className="home-header-copy">
-              <div className="home-header-kicker">Depop category workspace</div>
+              <div className="home-header-kicker mono"><span aria-hidden="true">/</span> Depop</div>
               <h1>{activePage.headline}</h1>
-              <p className="following-description">
-                {activePage.description}
-              </p>
             </div>
-
-            <div className="home-header-actions">
-              <button
-                type="button"
-                className="search-btn secondary"
-                onClick={() => setSellerManagerOpen(true)}
-              >
-                Manage sellers
-              </button>
-              <span className="workspace-pill">
-                {sellerCount} sellers • {totalHits} hits
-              </span>
-              {globalQueueStatus && (
-                <span className="workspace-pill muted">
-                  {globalQueueStatus}
-                </span>
+            <dl className="workspace-stats" aria-label="Workspace summary">
+              <div><dt>Sellers</dt><dd>{sellerCount}</dd></div>
+              <div><dt>Matches</dt><dd>{totalHits}</dd></div>
+              {queueState.active.length + queueState.pending.length > 0 && (
+                <div><dt>In queue</dt><dd>{queueState.active.length + queueState.pending.length}</dd></div>
               )}
+            </dl>
+          </header>
+
+          <section className={`home-controls${hasFitGuide ? ' has-fit-guide' : ''}`} aria-labelledby="fit-filters-title">
+            <div className="home-controls-content">
+              <div className="home-controls-heading">
+                <h2 id="fit-filters-title"><ListFilter size={17} /> {activePage.mode === 'all' ? 'Accessories' : 'Fit filters'}</h2>
+                {activePage.mode !== 'all' && (
+                  <button type="button" className="btn search-btn secondary reset-filters"
+                    onClick={() => resetPageFilters(activePage.id)}>
+                    <RotateCcw size={15} /> Reset filters
+                  </button>
+                )}
+              </div>
+              <div className="home-controls-fields">
+                {renderFilterControls()}
+              </div>
+
+              <div className="home-controls-actions">
+                {pageIsLoading ? (
+                  <button
+                    type="button"
+                    className="btn search-btn stop"
+                    onClick={() => cancelPageSearches(activePage.id)}
+                  >
+                    <Square size={15} /> Stop page
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn btn--primary search-btn"
+                    onClick={() => startSearchAllForPage(activePage.id)}
+                    disabled={currentWorkspace.sellerRows.length === 0 || invalidTopsRanges}
+                  >
+                    <Search size={16} /> Search All Sellers
+                  </button>
+                )}
+              </div>
             </div>
-          </div>
+            {hasFitGuide && <FitGuide category={activePage.id} />}
+          </section>
 
-          <div className="following-inputs home-controls">
-            <div className="home-controls-fields">
-              {renderFilterControls()}
+          <section className="seller-section" aria-labelledby="seller-section-title">
+            <div className="seller-section-heading">
+              <h2 id="seller-section-title">Seller queue</h2>
+              <div className="seller-list-tools">
+                <div className="segmented" role="group" aria-label="Show sellers">
+                  <button type="button" aria-pressed={sellerView === 'all'} onClick={() => setSellerView('all')}>All sellers</button>
+                  <button type="button" aria-pressed={sellerView === 'matched'} onClick={() => setSellerView('matched')}>With matches <span>{matchedSellerCount}</span></button>
+                </div>
+                <label className="seller-query">
+                  <Search size={16} aria-hidden="true" />
+                  <input aria-label="Filter sellers" placeholder="Filter sellers" value={sellerQuery}
+                    onChange={(event) => setSellerQuery(event.target.value)} />
+                </label>
+              </div>
             </div>
-
-            <div className="home-controls-actions">
-              <button
-                type="button"
-                className="search-btn secondary"
-                onClick={() => resetPageFilters(activePage.id)}
-              >
-                Reset filters
-              </button>
-
-              {pageIsLoading ? (
-                <button
-                  type="button"
-                  className="search-btn stop"
-                  onClick={() => cancelPageSearches(activePage.id)}
-                >
-                  Stop Page
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="search-btn"
-                  onClick={() => startSearchAllForPage(activePage.id)}
-                  disabled={currentWorkspace.sellerRows.length === 0}
-                >
-                  Search All Sellers
-                </button>
-              )}
-            </div>
-          </div>
-
-          {currentWorkspace.sellerRows.length === 0 ? (
+          {visibleSellerRows.length === 0 ? (
             <div className="empty-state-card">
-              <h3>No sellers saved</h3>
-              <p>
-                Open Manage sellers to add your first account, or reset back to the
-                curated default list.
-              </p>
+              <UsersRound size={22} />
+              <h3>{sellerCount === 0 ? 'No saved sellers' : sellerSearchQuery ? 'No sellers found' : 'No matching listings'}</h3>
             </div>
           ) : (
             <div className="following-sellers">
-              {currentWorkspace.sellerRows.map((sellerRow) => (
-                (() => {
+              <div className="seller-table-head" aria-hidden="true">
+                <span>Seller</span><span>Status</span><span>Action</span>
+              </div>
+              {visibleSellerRows.map((sellerRow) => {
                   const sellerKey = searchKeyFor(activePage.id, sellerRow.seller);
                   const queuePosition = queuePositionByKey.get(sellerKey) || null;
                   const progressDetails = getSellerProgressDetails(sellerRow, nowMs, queuePosition);
+                  const stateTone = getSellerStateTone(sellerRow);
                   const isQueued = sellerRow.progress?.phase === 'queued';
+                  const rowExpanded = Boolean(expandedResults[sellerKey]);
 
                   return (
                     <div
@@ -1763,6 +1861,7 @@ function App() {
                         className="seller-name"
                       >
                         {sellerRow.displayName || sellerRow.seller}
+                        <ArrowUpRight size={13} aria-hidden="true" />
                       </a>
                       <span className="seller-username">@{sellerRow.seller}</span>
                     </div>
@@ -1771,28 +1870,31 @@ function App() {
                       {sellerRow.loading || isQueued ? (
                         <button
                           type="button"
-                          className="search-btn stop small"
+                          className="btn search-btn stop small"
                           onClick={() => cancelSellerSearch(activePage.id, sellerRow.seller)}
                         >
-                          {sellerRow.loading ? 'Stop' : 'Remove'}
+                          <Square size={13} /> {sellerRow.loading ? 'Stop' : 'Remove'}
                         </button>
                       ) : (
                         <button
                           type="button"
-                          className="search-btn small"
+                          className="btn search-btn secondary small"
                           onClick={() => startSellerSearch(activePage.id, sellerRow.seller)}
+                          disabled={invalidTopsRanges}
                         >
-                          Search
+                          <Search size={14} /> Search
                         </button>
                       )}
 
                       <div className="seller-status-stack">
-                        <span className={`seller-status-badge ${getSellerStateTone(sellerRow)}`}>
+                        <span className={`seller-status-badge ${stateTone}`}>
                           {getSellerStateLabel(sellerRow)}
                         </span>
-                        <span className="seller-status">
-                          {formatSellerStatusLabel(sellerRow, queuePosition)}
-                        </span>
+                        {stateTone !== 'idle' && (
+                          <span className="seller-status">
+                            {formatSellerStatusLabel(sellerRow, queuePosition)}
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -1817,94 +1919,33 @@ function App() {
                   )}
 
                   {sellerRow.results.length > 0 && (
-                    <div className="results-scroll">
-                      {sellerRow.results.map((result, index) => {
-                        const metaParts = [];
-
-                        if (result.sizeLabel) {
-                          metaParts.push(`Size ${result.sizeLabel}`);
-                        }
-                        if (activePage.id === 'bottoms') {
-                          const waistLabel = formatResultMeasurement(result.waist, 'waist');
-                          if (waistLabel) {
-                            metaParts.push(waistLabel);
-                          }
-                          const inseamLabel = formatResultMeasurement(result.inseam, 'inseam');
-                          if (inseamLabel) {
-                            metaParts.push(inseamLabel);
-                          }
-                          const inseamRiseLabel = formatResultMeasurement(result.inseamRise, 'inseam + rise');
-                          if (inseamRiseLabel) {
-                            metaParts.push(inseamRiseLabel);
-                          }
-                          const riseLabel = formatResultMeasurement(result.rise, 'rise');
-                          if (riseLabel) {
-                            metaParts.push(riseLabel);
-                          }
-                          const legOpeningLabel = formatResultMeasurement(result.legOpening, 'leg opening');
-                          if (legOpeningLabel) {
-                            metaParts.push(legOpeningLabel);
-                          }
-                        }
-                        if (
-                          result.p2p !== undefined &&
-                          result.p2p !== null &&
-                          result.p2p !== ''
-                        ) {
-                          metaParts.push(
-                            `${result.p2p.toFixed ? result.p2p.toFixed(2) : result.p2p}" P2P`
-                          );
-                        }
-                        if (
-                          result.length !== undefined &&
-                          result.length !== null &&
-                          result.length !== ''
-                        ) {
-                          metaParts.push(
-                            `${result.length.toFixed ? result.length.toFixed(2) : result.length}" Len`
-                          );
-                        }
-                        const ageDays = getResultAgeDays(result);
-                        if (ageDays !== null) {
-                          metaParts.push(`${Math.round(ageDays)}d old`);
-                        }
-
-                        return (
-                          <a
-                            className="result-card"
-                            key={`${result.url}-${index}`}
-                            href={result.url || '#'}
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            {result.image ? (
-                              <img className="result-img" src={result.image} alt="item" />
-                            ) : (
-                              <div className="result-img placeholder" />
-                            )}
-                            <div className="result-price">{result.price || ''}</div>
-                            {metaParts.length > 0 && (
-                              <div className="result-meta">
-                                {metaParts.join(' · ')}
-                              </div>
-                            )}
-                          </a>
-                        );
-                      })}
+                    <div className="seller-results">
+                      <div className="results-scroll" id={`results-${sellerRow.seller}`}>
+                        {(rowExpanded ? sellerRow.results : sellerRow.results.slice(0, 6)).map((result, index) => (
+                          <ResultCard key={`${result.url}-${index}`} result={result} category={activePage.id} />
+                        ))}
+                      </div>
+                      {sellerRow.results.length > 6 && (
+                        <button type="button" className="btn search-btn secondary all-results"
+                          aria-expanded={rowExpanded} aria-controls={`results-${sellerRow.seller}`}
+                          onClick={() => setExpandedResults((previous) => ({ ...previous, [sellerKey]: !rowExpanded }))}>
+                          <ChevronDown size={16} /> {rowExpanded ? 'Show fewer' : `Show all ${sellerRow.results.length} matches`}
+                        </button>
+                      )}
                     </div>
                   )}
 
                   {sellerRow.results.length === 0 && sellerRow.processed && !sellerRow.loading && !sellerRow.error && (
                     <div className="seller-empty-results">
-                      No matching items found in the latest listings.
+                      No matching listings.
                     </div>
                   )}
                     </div>
                   );
-                })()
-              ))}
+              })}
             </div>
           )}
+          </section>
         </div>
       </main>
     </div>

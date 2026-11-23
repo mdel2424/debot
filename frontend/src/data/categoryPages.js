@@ -1,8 +1,8 @@
 const MEASUREMENT_DEFAULTS = Object.freeze({
-  first: '20.875',
-  second: '26.875',
-  firstTolerance: '0.375',
-  secondTolerance: '0.375',
+  p2pMin: '20.5',
+  p2pMax: '21.25',
+  lengthMin: '26.5',
+  lengthMax: '27.25',
 });
 
 const FOOTWEAR_SIZE_OPTIONS = [
@@ -25,26 +25,24 @@ export const CATEGORY_PAGES = [
   {
     id: 'tops',
     label: 'Tops',
-    shortLabel: 'T',
     group: ['tops', 'coats-jackets'],
     mode: 'measurements',
     headline: 'Tops Search',
-    description: 'Search your shared seller list for tops, tees, and jackets that match your saved P2P and length range.',
     defaults: MEASUREMENT_DEFAULTS,
   },
   {
     id: 'bottoms',
     label: 'Bottoms',
-    shortLabel: 'B',
     group: 'bottoms',
     mode: 'bottomMeasurements',
     headline: 'Bottoms Search',
-    description: 'Search seller listings by waist, inseam plus rise, and leg-opening ranges from your closet fit.',
     defaults: {
       waistMin: '32',
       waistMax: '36',
-      inseamRiseMin: '42',
-      inseamRiseMax: '44',
+      inseamMin: '31',
+      inseamMax: '33',
+      riseMin: '11',
+      riseMax: '13',
       legOpeningMin: '9.5',
       legOpeningMax: '10.5',
     },
@@ -52,11 +50,9 @@ export const CATEGORY_PAGES = [
   {
     id: 'footwear',
     label: 'Footwear',
-    shortLabel: 'F',
     group: 'footwear',
     mode: 'sizeRange',
     headline: 'Footwear Search',
-    description: 'Filter seller listings by Depop shoe sizing with a saved US range.',
     defaults: {
       min: '10',
       max: '11',
@@ -68,11 +64,9 @@ export const CATEGORY_PAGES = [
   {
     id: 'accessories',
     label: 'Accessories',
-    shortLabel: 'A',
     group: 'accessories',
     mode: 'all',
     headline: 'Accessories Search',
-    description: 'Browse every accessory listing from your saved sellers without any size filter.',
     defaults: {},
   },
 ];

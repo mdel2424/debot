@@ -1008,6 +1008,37 @@ class StreamHelpersTest(unittest.TestCase):
         self.assertIsNone(match["rise"])
         self.assertIsNone(match["legOpening"])
 
+    def test_bottoms_inseam_and_rise_filter_independently(self):
+        payload = main.validate_search_payload({
+            "category": "bottoms",
+            "bottomsMeasurements": {
+                "waist": {"min": 32, "max": 36},
+                "inseam": {"min": 31, "max": 33},
+                "rise": {"min": 11, "max": 13},
+                "legOpening": {"min": 9.5, "max": 10.5},
+            },
+        })
+        filters = main._normalize_bottoms_measurements(payload["bottomsMeasurements"])
+        self.assertEqual(filters, payload["bottomsMeasurements"])
+        for description, expected in (
+            ("Inseam 31", (31, None, None)),
+            ("Inseam 33\nRise 13", (33, 13, 46)),
+            ("Inseam 30\nRise 13", None),
+            ("Inseam 33\nRise 10", None),
+            ("Waist 34\nInseam 34", None),
+            ("Vintage denim", None),
+        ):
+            with self.subTest(description=description):
+                match = _process_item(
+                    {"description": description}, None, None, 0.5, 1.25,
+                    "bottoms", bottoms_measurements=filters,
+                )
+                if expected is None:
+                    self.assertIsNone(match)
+                else:
+                    self.assertIsNotNone(match)
+                    self.assertEqual(tuple(match[key] for key in ("inseam", "rise", "inseamRise")), expected)
+
     def test_process_item_matches_tops_when_one_measurement_is_missing(self):
         item = {
             "url": "https://www.depop.com/products/example-tops-partial/",

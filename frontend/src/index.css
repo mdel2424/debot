@@ -1,82 +1,45 @@
-@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=Manrope:wght@400;500;600;700;800&family=Newsreader:opsz,wght@6..72,500;6..72,600;6..72,700&display=swap");
 @import "tailwindcss";
 
 :root {
-  --font-body: "Manrope", "Segoe UI", sans-serif;
-  --font-display: "Newsreader", Georgia, serif;
-  --font-mono: "IBM Plex Mono", "SFMono-Regular", monospace;
-  --color-background: #0f0d0b;
-  --color-panel: #141210;
-  --color-panel-elevated: #1a1714;
-  --color-panel-muted: #201d19;
-  --color-border: rgba(236, 228, 214, 0.09);
-  --color-border-strong: rgba(236, 228, 214, 0.16);
-  --color-text-primary: #f2ece2;
-  --color-text-secondary: #b9b0a2;
-  --color-text-muted: #857b6f;
-  --color-accent-soft: #e4d6c4;
-  --color-accent-ink: #14110d;
-  --shadow-panel:
-    0 10px 30px rgba(0, 0, 0, 0.24),
-    inset 0 1px 0 rgba(255, 255, 255, 0.02);
-  color: var(--color-text-primary);
+  --p-bg: #0f0f0f;
+  --p-surface: #1a1a1a;
+  --p-ink: #ffffff;
+  --p-muted: #8f8f8f;
+  --p-accent: #dddddd;
+  --p-accent-ink: #0f0f0f;
+  --p-action: #e4e4e4;
+  --p-action-ink: #0f0f0f;
+  --p-inv-bg: #ffffff;
+  --p-inv-surface: #ececec;
+  --p-inv-ink: #0f0f0f;
+  --p-inv-muted: #5f5f5f;
+  --p-inv-accent: #0f0f0f;
+  --p-inv-accent-ink: #ffffff;
+  --p-inv-action: #0f0f0f;
+  --p-inv-action-ink: #ffffff;
+  --font-display: "Manrope", system-ui, sans-serif;
+  --font-text: "Manrope", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --display-weight: 500;
+  --ly-scale: 0.97;
+  --ink: #ededed;
+  --action: var(--p-action);
+  --surface: #151515;
+  --line: #303030;
+  --muted: #a3a3a3;
+  --radius: 6px;
   color-scheme: dark;
-  font-family: var(--font-body);
-  font-feature-settings: "liga" 1, "calt" 1;
+  color: var(--ink);
+  background: var(--p-bg);
+  font: 500 14px/1.5 var(--font-text);
   font-synthesis: none;
-  font-weight: 500;
-  line-height: 1.5;
-  text-rendering: optimizeLegibility;
-  -moz-osx-font-smoothing: grayscale;
   -webkit-font-smoothing: antialiased;
 }
 
-html,
-body,
-#root {
-  background: var(--color-background);
-  height: 100%;
-  margin: 0;
-}
-
-html {
-  scrollbar-gutter: stable;
-}
-
-body {
-  min-height: 100vh;
-  min-width: 320px;
-}
-
-body,
-button,
-input,
-select,
-textarea {
-  font-family: inherit;
-}
-
-a {
-  color: inherit;
-}
-
-button,
-input,
-select,
-textarea {
-  outline: none;
-}
-
-button:focus-visible,
-input:focus-visible,
-select:focus-visible,
-textarea:focus-visible,
-a:focus-visible {
-  box-shadow: 0 0 0 4px rgba(228, 214, 196, 0.12);
-  outline: none;
-}
-
-::selection {
-  background: rgba(228, 214, 196, 0.22);
-  color: #fffdf8;
-}
+body { margin: 0; min-width: 320px; }
+html { scrollbar-color: #454545 var(--p-bg); }
+button, input, select { font: inherit; }
+button:not(:disabled), select { cursor: pointer; }
+svg { flex-shrink: 0; }
+:focus-visible { outline: 2px solid var(--p-accent); outline-offset: 3px; }
+::selection { color: var(--p-accent-ink); background: var(--p-accent); }

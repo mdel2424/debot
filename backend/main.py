@@ -248,7 +248,7 @@ def _normalize_bottoms_measurements(bottoms_measurements_value: Any) -> Dict[str
             return None
 
     normalized: Dict[str, Dict[str, float]] = {}
-    for key in ("waist", "inseamRise", "legOpening"):
+    for key in ("waist", "inseam", "rise", "inseamRise", "legOpening"):
         raw_bounds = bottoms_measurements_value.get(key)
         if not isinstance(raw_bounds, dict):
             continue

@@ -30,6 +30,8 @@ class SizeRange(MeasurementBounds):
 
 class BottomsMeasurements(SearchModel):
     waist: MeasurementBounds | None = None
+    inseam: MeasurementBounds | None = None
+    rise: MeasurementBounds | None = None
     inseamRise: MeasurementBounds | None = None
     legOpening: MeasurementBounds | None = None
 

@@ -6,7 +6,7 @@ import os
 import re
 import unittest
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import expect, sync_playwright
 
 
 @unittest.skipUnless(os.getenv('DEBOT_FRONTEND_URL'), 'Set DEBOT_FRONTEND_URL to run browser regressions.')
@@ -106,6 +106,10 @@ class FrontendSmokeTest(unittest.TestCase):
 
         self.context.route('**/api/search/stream', stream)
         self.page.goto(self.url + '#tops')
+        expect(self.page.get_by_role('textbox', name='Pit to pit minimum')).to_have_value('20.5')
+        expect(self.page.get_by_role('textbox', name='Pit to pit maximum')).to_have_value('21.25')
+        expect(self.page.get_by_role('textbox', name='Length minimum')).to_have_value('26.5')
+        expect(self.page.get_by_role('textbox', name='Length maximum')).to_have_value('27.25')
         with self.page.expect_request('**/api/search/stream'):
             self.page.get_by_role('button', name='Search', exact=True).first.click()
         self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].processed")
@@ -115,6 +119,152 @@ class FrontendSmokeTest(unittest.TestCase):
         p2p_tolerance, length_tolerance = payload['p2pTolerance'], payload['lengthTolerance']
         self.assertEqual((first - p2p_tolerance, first + p2p_tolerance), (20.5, 21.25))
         self.assertEqual((second - length_tolerance, second + length_tolerance), (26.5, 27.25))
+
+    def test_custom_tops_range_migrates_validates_and_resets(self):
+        self.context.add_init_script("""
+            if (!localStorage.getItem('debot.categoryFilters.v1')) {
+                localStorage.setItem('debot.categoryFilters.defaults.v1', JSON.stringify([
+                    {id: 'tops', defaults: {first: '20.875', second: '26.875', firstTolerance: '0.375', secondTolerance: '0.375'}}
+                ]));
+                localStorage.setItem('debot.categoryFilters.v1', JSON.stringify({
+                    tops: {first: '22', second: '28', firstTolerance: '0.5', secondTolerance: '1'},
+                    footwear: {min: '8', max: '9'}
+                }));
+            }
+        """)
+        self.page.goto(self.url + '#tops')
+        minimum = self.page.get_by_role('textbox', name='Pit to pit minimum')
+        maximum = self.page.get_by_role('textbox', name='Pit to pit maximum')
+        expect(minimum).to_have_value('21.5')
+        expect(maximum).to_have_value('22.5')
+        expect(self.page.get_by_role('textbox', name='Length minimum')).to_have_value('27')
+        minimum.fill('23')
+        expect(self.page.get_by_role('alert')).to_have_text('Enter a valid min and max, in order.')
+        expect(self.page.get_by_role('button', name='Search All Sellers')).to_be_disabled()
+        self.page.get_by_role('button', name='Reset filters').click()
+        expect(minimum).to_have_value('20.5')
+        expect(maximum).to_have_value('21.25')
+        expect(self.page.get_by_role('button', name='Search All Sellers')).to_be_enabled()
+        self.page.get_by_role('button', name='Footwear', exact=True).click()
+        expect(self.page.get_by_role('combobox', name='US min')).to_have_value('8')
+        self.page.get_by_role('link', name='Skip to search').focus()
+        self.page.keyboard.press('Enter')
+        expect(self.page.get_by_role('main')).to_be_focused()
+        self.assertTrue(self.page.url.endswith('#footwear'))
+
+    def test_bottoms_guide_tracks_measurement_focus(self):
+        self.page.goto(self.url + '#bottoms')
+        guide = self.page.get_by_role('img', name='Bottoms measurement guide')
+        expect(guide).to_be_visible()
+        for label, key in (
+            ('Waist', 'waistMin'),
+            ('Inseam', 'inseamMin'),
+            ('Rise', 'riseMin'),
+            ('Leg opening', 'legOpeningMin'),
+        ):
+            self.page.get_by_role('textbox', name=f'{label} minimum').focus()
+            expect(guide.locator(f'[data-fit-mark="{key}"]')).to_have_css('opacity', '1')
+            for other in guide.locator(f'[data-fit-mark]:not([data-fit-mark="{key}"])').all():
+                expect(other).to_have_css('opacity', '0.38')
+
+        for width in (320, 390, 768, 1024, 1440):
+            self.page.set_viewport_size({'width': width, 'height': 900})
+            box = guide.bounding_box()
+            self.assertGreater(box['width'], 0)
+            self.assertGreater(box['height'], 0)
+            self.assertGreaterEqual(box['x'], 0)
+            self.assertLessEqual(box['x'] + box['width'], width)
+            self.assertLessEqual(self.page.evaluate('document.documentElement.scrollWidth'), width)
+
+        self.page.get_by_role('button', name='Tops', exact=True).click()
+        expect(self.page.get_by_role('img', name='Tops measurement guide')).to_be_visible()
+        expect(guide).to_have_count(0)
+        self.assertEqual(self.errors, [])
+
+    def test_bottoms_sends_separate_ranges_and_displays_measurements_in_cards(self):
+        searches = []
+        self.context.add_init_script("""
+            if (!localStorage.getItem('debot.pageWorkspaces.v1')) {
+                localStorage.setItem('debot.pageWorkspaces.v1', JSON.stringify({bottoms: {sellerRows: [{
+                    seller: 'fixture_one', searchId: 'legacy-bottoms',
+                    searchTask: {filters: {waistMin: '32', waistMax: '36', inseamRiseMin: '42',
+                        inseamRiseMax: '44', legOpeningMin: '9.5', legOpeningMax: '10.5'}}
+                }]}}));
+            }
+        """)
+
+        def stream(route):
+            payload = route.request.post_data_json
+            searches.append(payload)
+            if payload['searchId'] == 'legacy-bottoms':
+                events = [
+                    {'type': 'match', 'item': {
+                        'url': 'https://www.depop.com/products/legacy-bottoms/', 'price': '$25',
+                        'inseam': 30, 'rise': 13,
+                    }},
+                    {'type': 'done', 'processed': 1, 'total': 1, 'matches': 1},
+                ]
+                route.fulfill(content_type='text/event-stream', body=''.join(self.event(e) for e in events))
+                return
+            events = [
+                {'type': 'match', 'item': {
+                    'url': 'https://www.depop.com/products/full-measurements/',
+                    'price': '$45', 'sizeLabel': '34', 'ageDays': 4, 'waist': 34,
+                    'inseam': 32.25, 'rise': 12, 'legOpening': 9.75,
+                }},
+                {'type': 'match', 'item': {
+                    'url': 'https://www.depop.com/products/missing-rise/', 'price': '$30', 'inseam': 31,
+                }},
+                {'type': 'done', 'processed': 2, 'total': 2, 'matches': 2},
+            ]
+            route.fulfill(content_type='text/event-stream', body=''.join(self.event(e) for e in events))
+
+        self.context.route('**/api/search/stream', stream)
+        self.page.goto(self.url + '#bottoms')
+        for field, value in (('Inseam minimum', '31'), ('Inseam maximum', '33'),
+                             ('Rise minimum', '11'), ('Rise maximum', '13')):
+            expect(self.page.get_by_role('textbox', name=field)).to_have_value(value)
+        expect(self.page.get_by_text('$25', exact=True)).to_be_visible()
+        self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).bottoms.sellerRows[0].processed")
+        self.page.get_by_role('button', name='Search', exact=True).first.click()
+        cards = self.page.locator('.result-card')
+        expect(cards).to_have_count(2)
+        self.assertEqual(len(searches), 2)
+        self.assertEqual(searches[0]['bottomsMeasurements']['inseamRise'], {'min': 42, 'max': 44})
+        self.assertNotIn('inseam', searches[0]['bottomsMeasurements'])
+        self.assertEqual(searches[1]['bottomsMeasurements'], {
+            'waist': {'min': 32, 'max': 36},
+            'inseam': {'min': 31, 'max': 33},
+            'rise': {'min': 11, 'max': 13},
+            'legOpening': {'min': 9.5, 'max': 10.5},
+        })
+        full = cards.first.locator('.result-measurements')
+        expect(full.locator('dt')).to_have_text(['Waist', 'Inseam', 'Rise', 'Leg opening', 'Inseam + rise'])
+        expect(full.locator('dd')).to_have_text(['34\u2033', '32.25\u2033', '12\u2033', '9.75\u2033', '44.25\u2033'])
+        partial = cards.nth(1).locator('.result-measurements')
+        expect(partial.locator('dt')).to_have_text(['Inseam'])
+        expect(partial.locator('dd')).to_have_text(['31\u2033'])
+        self.page.set_viewport_size({'width': 320, 'height': 800})
+        self.assertLessEqual(self.page.evaluate('document.documentElement.scrollWidth'), 320)
+        self.assertEqual(self.errors, [])
+
+    def test_workspace_filters_and_seller_dialog_work_on_phone(self):
+        self.page.set_viewport_size({'width': 390, 'height': 844})
+        self.page.goto(self.url + '#tops')
+        self.page.get_by_role('textbox', name='Filter sellers').fill('fixture_two')
+        expect(self.page.locator('.seller-row-card')).to_have_count(1)
+        expect(self.page.get_by_role('link', name='Fixture Two')).to_be_visible()
+        self.page.get_by_role('button', name='With matches').click()
+        expect(self.page.get_by_role('heading', name='No sellers found')).to_be_visible()
+        self.page.get_by_role('button', name='Manage sellers').click()
+        dialog = self.page.get_by_role('dialog', name='Manage sellers')
+        expect(dialog).to_be_visible()
+        self.page.keyboard.press('Escape')
+        expect(dialog).not_to_be_visible()
+        for width in (320, 390, 768, 1024, 1440):
+            self.page.set_viewport_size({'width': width, 'height': 900})
+            self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'))
+        self.assertEqual(self.errors, [])
 
     def test_new_sellers_are_added_once_without_resetting_a_custom_list(self):
         self.context.add_init_script("""
@@ -266,6 +416,15 @@ class FrontendSmokeTest(unittest.TestCase):
         search = self.page.get_by_role('button', name='Search', exact=True).first
         search.click()
         self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].processed")
+        self.page.evaluate("""() => {
+            const key = 'debot.pageWorkspaces.v1';
+            const state = JSON.parse(localStorage.getItem(key));
+            state.tops.sellerRows[0].resultsFilters = {
+                first: '20.875', firstTolerance: '0.375', second: '26.875', secondTolerance: '0.375'
+            };
+            localStorage.setItem(key, JSON.stringify(state));
+        }""")
+        self.page.reload()
         search.click()
         self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].results.some(item => item.price === '$45')")
         self.page.reload()
@@ -315,7 +474,7 @@ class FrontendSmokeTest(unittest.TestCase):
                 const row = state.tops.sellerRows[0];
                 row.results.push({url: 'https://www.depop.com/products/stale/', price: '$10'});
                 if (expired) row.resultsDay = '1990-1-1';
-                else row.resultsFilters = {...row.resultsFilters, first: '999'};
+                else row.resultsFilters = {...row.resultsFilters, p2pMin: '999'};
                 localStorage.setItem(key, JSON.stringify(state));
             }""", expired)
             self.page.reload()
