@@ -97,6 +97,25 @@ class FrontendSmokeTest(unittest.TestCase):
         self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'))
         self.assertEqual(self.errors, [])
 
+    def test_tops_search_sends_exact_default_measurement_ranges(self):
+        searches = []
+
+        def stream(route):
+            searches.append(route.request.post_data_json)
+            route.fulfill(content_type='text/event-stream', body=self.event({'type': 'done'}))
+
+        self.context.route('**/api/search/stream', stream)
+        self.page.goto(self.url + '#tops')
+        with self.page.expect_request('**/api/search/stream'):
+            self.page.get_by_role('button', name='Search', exact=True).first.click()
+        self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].processed")
+        self.assertEqual(len(searches), 1)
+        payload = searches[0]
+        first, second = (payload['measurements'][key] for key in ('first', 'second'))
+        p2p_tolerance, length_tolerance = payload['p2pTolerance'], payload['lengthTolerance']
+        self.assertEqual((first - p2p_tolerance, first + p2p_tolerance), (20.5, 21.25))
+        self.assertEqual((second - length_tolerance, second + length_tolerance), (26.5, 27.25))
+
     def test_new_sellers_are_added_once_without_resetting_a_custom_list(self):
         self.context.add_init_script("""
             if (!localStorage.getItem('fixture_migration_seeded')) {
