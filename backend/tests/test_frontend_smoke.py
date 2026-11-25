@@ -40,6 +40,74 @@ class FrontendSmokeTest(unittest.TestCase):
     def event(value):
         return f'data: {json.dumps(value)}\n\n'
 
+    def test_retailers_respect_availability_send_fit_and_restore_results(self):
+        searches = []
+        registered = []
+        depop_routes = []
+
+        def batch(route):
+            registered.extend(route.request.post_data_json["searches"])
+            route.fulfill(json={"ok": True, "count": 1, "jobs": []})
+
+        def stream(route):
+            payload = route.request.post_data_json
+            if payload.get("seller"):
+                depop_routes.append(route)
+                return
+            searches.append(payload)
+            route.fulfill(content_type="text/event-stream", body="".join(map(self.event, [
+                {"type": "match", "item": {
+                    "url": "https://www.peoplesthrift.ca/product-page/fixture",
+                    "seller": "retail:peoples-thrift", "title": "Measured graphic T-shirt",
+                    "p2p": 21, "length": 27, "price": "$15.00 CAD",
+                }},
+                {"type": "done", "processed": 1, "total": 1, "matches": 1},
+            ])))
+
+        self.context.route("**/api/search/retailers", lambda route: route.fulfill(json=[
+            {"id": "wildrose", "enabled": False}, {"id": "la-penderie", "enabled": False},
+            {"id": "peoples-thrift", "enabled": True},
+        ]))
+        self.context.route("**/api/search/batch/start", batch)
+        self.context.route("**/api/search/stream", stream)
+        self.page.goto(self.url + "#tops")
+        with self.page.expect_request("**/api/search/stream"):
+            self.page.get_by_role("button", name="Search", exact=True).first.click()
+        self.page.get_by_role("button", name="Retailers", exact=True).click()
+        for name in ("Wildrose Vintage", "La Penderie du Paradis"):
+            row = self.page.locator(".seller-row-card").filter(has_text=name)
+            expect(row.get_by_role("button", name="Search", exact=True)).to_be_disabled()
+            expect(row.get_by_text("Permission required", exact=True)).to_be_visible()
+        expect(self.page.get_by_role("link", name="People's Thrift")).to_be_visible()
+        self.page.get_by_role("button", name="Search retailers", exact=True).click()
+        expect(self.page.get_by_text("Measured graphic T-shirt", exact=True)).to_be_visible()
+        self.page.wait_for_function("""
+            JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1'))?.tops.retailerRows
+                ?.some(row => row.seller === 'retail:peoples-thrift' && row.processed && row.results.length === 1)
+        """)
+        self.assertEqual(registered, searches)
+        self.assertEqual(len(searches), 1)
+        self.assertEqual(searches[0]["retailSource"], "peoples-thrift")
+        self.assertNotIn("seller", searches[0])
+        self.assertEqual(searches[0]["measurements"], {"first": 20.875, "second": 26.875})
+        self.assertEqual(searches[0]["maxPriceCad"], 35)
+        depop_routes[0].fulfill(content_type="text/event-stream", body=self.event({"type": "done"}))
+        self.page.wait_for_function("""
+            JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1'))?.tops.sellerRows[0].processed
+        """)
+        self.page.reload()
+        self.page.get_by_role("button", name="Retailers", exact=True).click()
+        expect(self.page.get_by_text("Measured graphic T-shirt", exact=True)).to_be_visible()
+        self.page.set_viewport_size({"width": 320, "height": 840})
+        self.assertTrue(self.page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"))
+        self.page.get_by_role("button", name="With matches").click()
+        expect(self.page.get_by_text("Measured graphic T-shirt", exact=True)).to_be_visible()
+        expect(self.page.get_by_role("link", name="Wildrose Vintage")).to_have_count(0)
+        self.page.get_by_role("button", name="All sellers", exact=True).click()
+        expect(self.page.get_by_role("link", name="Fixture One")).to_be_visible()
+        expect(self.page.get_by_text("Measured graphic T-shirt", exact=True)).to_have_count(0)
+        self.assertEqual(self.errors, [])
+
     def test_close_and_reopen_restores_matches_and_reconnects_same_job(self):
         resumed = False
         search_ids = []

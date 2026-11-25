@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { ArrowDownUp, ArrowUpRight, ChevronDown, Footprints, ImageOff, ListFilter, Plus, RotateCcw, ScanLine, Search, Shapes, Shirt, Square, UsersRound, X } from 'lucide-react';
 import {
   cancelSearch,
+  loadRetailSources,
   makeSearchId,
   startSearchBatch,
   streamSearch,
@@ -20,6 +21,7 @@ import {
   getDefaultPageFilters,
   isCategoryPageId,
 } from './data/categoryPages';
+import { RETAIL_ACCOUNTS, RETAIL_BY_USERNAME } from './data/retailSources';
 import './App.css';
 import './index.css';
 
@@ -271,7 +273,10 @@ const buildPageWorkspaces = (accounts, existingWorkspaces = {}) =>
     CATEGORY_PAGES.map((page) => [
       page.id,
       {
-        sellerRows: buildSellerRows(accounts, existingWorkspaces[page.id]?.sellerRows || []),
+        sellerRows: buildSellerRows(
+          page.id === 'tops' ? [...accounts, ...RETAIL_ACCOUNTS] : accounts,
+          existingWorkspaces[page.id]?.sellerRows || [],
+        ),
       },
     ])
   );
@@ -293,10 +298,13 @@ const readStoredPageWorkspaces = (accounts) => {
         const rows = Array.isArray(parsed[page.id]?.sellerRows)
           ? parsed[page.id].sellerRows
           : [];
+        const retailerRows = page.id === 'tops' && Array.isArray(parsed[page.id]?.retailerRows)
+          ? parsed[page.id].retailerRows
+          : [];
         return [
           page.id,
           {
-            sellerRows: rows.map((row) => ({
+            sellerRows: [...rows, ...retailerRows].map((row) => ({
               ...row,
               results: Array.isArray(row?.results) ? row.results : [],
               loading: Boolean(row?.searchId) || Boolean(row?.loading),
@@ -321,25 +329,26 @@ const readStoredPageWorkspaces = (accounts) => {
 
 const serializePageWorkspaces = (workspaces) => JSON.stringify(
   Object.fromEntries(
-    CATEGORY_PAGES.map((page) => [
-      page.id,
-      {
-        sellerRows: (workspaces[page.id]?.sellerRows || []).map((row) => ({
-          seller: row.seller,
-          displayName: row.displayName,
-          results: row.results,
-          resultsDay: row.resultsDay,
-          resultsFilters: row.resultsFilters,
-          loading: row.loading,
-          processed: row.processed,
-          error: row.error,
-          errorCode: row.errorCode,
-          searchId: row.searchId,
-          progress: row.progress,
-          searchTask: row.searchTask,
-        })),
-      },
-    ])
+    CATEGORY_PAGES.map((page) => {
+      const rows = (workspaces[page.id]?.sellerRows || []).map((row) => ({
+        seller: row.seller,
+        displayName: row.displayName,
+        results: row.results,
+        resultsDay: row.resultsDay,
+        resultsFilters: row.resultsFilters,
+        loading: row.loading,
+        processed: row.processed,
+        error: row.error,
+        errorCode: row.errorCode,
+        searchId: row.searchId,
+        progress: row.progress,
+        searchTask: row.searchTask,
+      }));
+      return [page.id, {
+        sellerRows: rows.filter((row) => !RETAIL_BY_USERNAME.has(row.seller)),
+        ...(page.id === 'tops' ? { retailerRows: rows.filter((row) => RETAIL_BY_USERNAME.has(row.seller)) } : {}),
+      }];
+    })
   )
 );
 
@@ -563,13 +572,14 @@ function ResultCard({ result, category }) {
     <a className="result-card card m-zoom" href={result.url || undefined} target="_blank" rel="noreferrer">
       <div className="result-media">
         {result.image ? (
-          <img className="result-img frame__img" src={result.image} alt="Depop listing photo" loading="lazy" />
+          <img className="result-img frame__img" src={result.image} alt={result.title ? '' : 'Depop listing photo'} loading="lazy" />
         ) : (
           <div className="result-img placeholder" aria-hidden="true"><ImageOff size={24} /></div>
         )}
       </div>
       <div className="result-info">
         {result.price && <div className="result-price">{result.price}</div>}
+        {result.title && <div className="result-title">{result.title}</div>}
         {(result.sizeLabel || age !== null) && (
           <div className="result-details">
             {result.sizeLabel && <span>Size {result.sizeLabel}</span>}
@@ -592,13 +602,13 @@ function ResultCard({ result, category }) {
 }
 
 const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
+  const retailer = RETAIL_BY_USERNAME.get(sellerUsername);
   const payload = {
     category: page.id,
-    seller: sellerUsername,
-    groups: page.group,
+    ...(retailer ? { retailSource: retailer.id, groups: 'tops' } : { seller: sellerUsername, groups: page.group }),
     gender: 'male',
     maxItems: 40,
-    maxLinks: 1000,
+    maxLinks: retailer ? 36 : 1000,
     maxScrolls: 16,
     parseWorkers: 4,
     searchId,
@@ -758,6 +768,7 @@ function App() {
   const [sellerManagerOpen, setSellerManagerOpen] = useState(false);
   const sellerManagerRef = useRef(null);
   const [sellerView, setSellerView] = useState('all');
+  const [retailSources, setRetailSources] = useState(null);
   const [sellerQuery, setSellerQuery] = useState('');
   const [expandedResults, setExpandedResults] = useState({});
   const [activePageId, setActivePageId] = useState(() => readInitialPageId());
@@ -787,21 +798,39 @@ function App() {
     && TOPS_RANGES.some((range) => !getTopsRange(currentFilters, range));
   const invalidPriceCap = Boolean(currentFilters.maxPriceCad.trim()) && readPriceCap(currentFilters.maxPriceCad) === null;
   const invalidSearchFilters = invalidTopsRanges || invalidPriceCap;
-  const sellerCount = sellerAccounts.length;
-  const activeSearchCount = currentWorkspace.sellerRows.filter((row) => row.loading).length;
-  const queuedCountForPage = currentWorkspace.sellerRows.filter((row) => row.progress?.phase === 'queued').length;
-  const totalHits = currentWorkspace.sellerRows.reduce((sum, row) => sum + row.results.length, 0);
+  const retailView = activePage.id === 'tops' && sellerView.startsWith('retail');
+  const matchView = sellerView === 'matched' || (retailView && sellerView === 'retail-matched');
+  const sellerRowsForView = currentWorkspace.sellerRows.filter((row) => RETAIL_BY_USERNAME.has(row.seller) === retailView);
+  const canSearchRow = (username) => {
+    const retailer = RETAIL_BY_USERNAME.get(username);
+    return !retailer || retailSources?.[retailer.id] === true;
+  };
+  const sellerCount = sellerRowsForView.length;
+  const activeSearchCount = sellerRowsForView.filter((row) => row.loading).length;
+  const queuedCountForPage = sellerRowsForView.filter((row) => row.progress?.phase === 'queued').length;
+  const totalHits = sellerRowsForView.reduce((sum, row) => sum + row.results.length, 0);
   const pageIsLoading = activeSearchCount > 0 || queuedCountForPage > 0;
   const queuePositionByKey = new Map(
     queueState.pending.map((task, index) => [task.key, index + 1])
   );
   const sellerSearchQuery = sellerQuery.trim().toLowerCase().replace(/^@/, '');
-  const matchedSellerCount = currentWorkspace.sellerRows.filter((row) => row.results.length > 0).length;
-  const visibleSellerRows = currentWorkspace.sellerRows.filter((row) =>
-    (sellerView === 'all' || row.results.length > 0)
+  const matchedSellerCount = sellerRowsForView.filter((row) => row.results.length > 0).length;
+  const visibleSellerRows = sellerRowsForView.filter((row) =>
+    (!matchView || row.results.length > 0)
     && (!sellerSearchQuery || [row.seller, row.displayName].some((value) =>
       String(value || '').toLowerCase().includes(sellerSearchQuery)))
   );
+
+  useEffect(() => {
+    if (!retailView) return undefined;
+    const controller = new AbortController();
+    loadRetailSources(controller.signal)
+      .then((sources) => setRetailSources(Object.fromEntries(sources.map(({ id, enabled }) => [id, enabled]))))
+      .catch(() => {
+        if (!controller.signal.aborted) setRetailSources({});
+      });
+    return () => controller.abort();
+  }, [retailView]);
 
   useEffect(() => {
     pageWorkspacesRef.current = pageWorkspaces;
@@ -937,7 +966,7 @@ function App() {
   const searchKeyFor = (pageId, sellerUsername) => `${pageId}::${sellerUsername}`;
 
   const shouldRetryLowParse = (task, summary) => {
-    if (!task || task.source !== 'batch') {
+    if (!task || task.source !== 'batch' || RETAIL_BY_USERNAME.has(task.sellerUsername)) {
       return false;
     }
 
@@ -1143,7 +1172,7 @@ function App() {
     const username = normalizeSellerUsername(sellerForm.username);
     const displayName = normalizeSellerDisplayName(sellerForm.displayName);
 
-    if (!username) {
+    if (!/^[a-z0-9._-]+$/.test(username)) {
       setSellerForm((prev) => ({
         ...prev,
         error: 'Enter a seller username to add.',
@@ -1265,16 +1294,16 @@ function App() {
   };
 
   const resumePendingTasks = () => {
-    if (
-      searchRegistryRef.current.size > 0 ||
-      searchQueueRef.current.length === 0
-    ) {
+    const activeKinds = new Set(Array.from(searchRegistryRef.current.values(), ({ task }) =>
+      RETAIL_BY_USERNAME.has(task.sellerUsername)));
+    const nextIndex = searchQueueRef.current.findIndex((task) =>
+      !activeKinds.has(RETAIL_BY_USERNAME.has(task.sellerUsername)));
+    if (nextIndex === -1) {
       syncQueueState();
       return;
     }
 
-    const [nextTask, ...remainingTasks] = searchQueueRef.current;
-    searchQueueRef.current = remainingTasks;
+    const [nextTask] = searchQueueRef.current.splice(nextIndex, 1);
     syncQueueState();
     void executeSellerSearch(nextTask).then((outcome) => handleSearchCompletion(nextTask, outcome));
   };
@@ -1517,20 +1546,20 @@ function App() {
   };
 
   const startSellerSearch = async (pageId, sellerUsername) => {
-    if (invalidSearchFilters) return;
+    if (invalidSearchFilters || !canSearchRow(sellerUsername)) return;
     queueSellerSearch(pageId, sellerUsername, { source: 'manual' });
   };
 
   const startSearchAllForPage = async (pageId) => {
     if (invalidSearchFilters) return;
-    setSellerView('all');
+    setSellerView(retailView ? 'retail' : 'all');
     setSellerQuery('');
     const batchId = nextBatchId('batch');
     const page = CATEGORY_PAGE_MAP[pageId];
     const filters = normalizePageFilters(pageId, pageFilters[pageId]);
-    const searchesToStart = pageWorkspaces[pageId].sellerRows
+    const searchesToStart = sellerRowsForView
       .map((row) => row.seller)
-      .filter((sellerUsername) => !isSellerScheduled(pageId, sellerUsername))
+      .filter((sellerUsername) => canSearchRow(sellerUsername) && !isSellerScheduled(pageId, sellerUsername))
       .map((sellerUsername) => {
         const searchId = makeSearchId();
         return {
@@ -1579,9 +1608,9 @@ function App() {
   };
 
   const cancelPageSearches = async (pageId) => {
-    removeQueuedTasks((task) => task.pageId === pageId);
+    removeQueuedTasks((task) => task.pageId === pageId && RETAIL_BY_USERNAME.has(task.sellerUsername) === retailView);
 
-    const activeSellers = pageWorkspaces[pageId].sellerRows
+    const activeSellers = sellerRowsForView
       .filter((row) => row.loading)
       .map((row) => row.seller);
 
@@ -1784,11 +1813,11 @@ function App() {
         <div className="home-workspace">
           <header className="home-header">
             <div className="home-header-copy">
-              <div className="home-header-kicker mono"><span aria-hidden="true">/</span> Depop</div>
+              <div className="home-header-kicker mono"><span aria-hidden="true">/</span> {retailView ? 'Retailers' : 'Depop'}</div>
               <h1>{activePage.headline}</h1>
             </div>
             <dl className="workspace-stats" aria-label="Workspace summary">
-              <div><dt>Sellers</dt><dd>{sellerCount}</dd></div>
+              <div><dt>{retailView ? 'Retailers' : 'Sellers'}</dt><dd>{sellerCount}</dd></div>
               <div><dt>Matches</dt><dd>{totalHits}</dd></div>
               {queueState.active.length + queueState.pending.length > 0 && (
                 <div><dt>In queue</dt><dd>{queueState.active.length + queueState.pending.length}</dd></div>
@@ -1830,9 +1859,9 @@ function App() {
                     type="button"
                     className="btn btn--primary search-btn"
                     onClick={() => startSearchAllForPage(activePage.id)}
-                    disabled={currentWorkspace.sellerRows.length === 0 || invalidSearchFilters}
+                    disabled={!sellerRowsForView.some((row) => canSearchRow(row.seller)) || invalidSearchFilters}
                   >
-                    <Search size={16} /> Search All Sellers
+                    <Search size={16} /> {retailView ? 'Search retailers' : 'Search All Sellers'}
                   </button>
                 )}
               </div>
@@ -1845,15 +1874,22 @@ function App() {
 
           <section className="seller-section" aria-labelledby="seller-section-title">
             <div className="seller-section-heading">
-              <h2 id="seller-section-title">Seller queue</h2>
+              <h2 id="seller-section-title">{retailView ? 'Retailer queue' : 'Seller queue'}</h2>
               <div className="seller-list-tools">
                 <div className="segmented" role="group" aria-label="Show sellers">
-                  <button type="button" aria-pressed={sellerView === 'all'} onClick={() => setSellerView('all')}>All sellers</button>
-                  <button type="button" aria-pressed={sellerView === 'matched'} onClick={() => setSellerView('matched')}>With matches <span>{matchedSellerCount}</span></button>
+                  <button type="button" aria-pressed={!retailView && !matchView}
+                    onClick={() => { setSellerView('all'); setSellerQuery(''); }}>All sellers</button>
+                  <button type="button" aria-pressed={matchView}
+                    onClick={() => setSellerView(retailView ? 'retail-matched' : 'matched')}>With matches <span>{matchedSellerCount}</span></button>
+                  {activePage.id === 'tops' && (
+                    <button type="button" aria-pressed={retailView && !matchView}
+                      onClick={() => { setSellerView('retail'); setSellerQuery(''); }}>Retailers</button>
+                  )}
                 </div>
                 <label className="seller-query">
                   <Search size={16} aria-hidden="true" />
-                  <input aria-label="Filter sellers" placeholder="Filter sellers" value={sellerQuery}
+                  <input aria-label={retailView ? 'Filter retailers' : 'Filter sellers'}
+                    placeholder={retailView ? 'Filter retailers' : 'Filter sellers'} value={sellerQuery}
                     onChange={(event) => setSellerQuery(event.target.value)} />
                 </label>
               </div>
@@ -1861,14 +1897,19 @@ function App() {
           {visibleSellerRows.length === 0 ? (
             <div className="empty-state-card">
               <UsersRound size={22} />
-              <h3>{sellerCount === 0 ? 'No saved sellers' : sellerSearchQuery ? 'No sellers found' : 'No matching listings'}</h3>
+              <h3>{sellerCount === 0 ? 'No saved sellers' : sellerSearchQuery
+                ? (retailView ? 'No retailers found' : 'No sellers found') : 'No matching listings'}</h3>
             </div>
           ) : (
             <div className="following-sellers">
               <div className="seller-table-head" aria-hidden="true">
-                <span>Seller</span><span>Status</span><span>Action</span>
+                <span>{retailView ? 'Retailer' : 'Seller'}</span><span>Status</span><span>Action</span>
               </div>
               {visibleSellerRows.map((sellerRow) => {
+                  const retailer = RETAIL_BY_USERNAME.get(sellerRow.seller);
+                  const unavailable = retailer && !canSearchRow(sellerRow.seller);
+                  const availabilityLabel = retailSources?.[retailer?.id] === false ? 'Permission required'
+                    : retailSources ? 'Unavailable' : 'Checking availability';
                   const sellerKey = searchKeyFor(activePage.id, sellerRow.seller);
                   const queuePosition = queuePositionByKey.get(sellerKey) || null;
                   const progressDetails = getSellerProgressDetails(sellerRow, nowMs, queuePosition);
@@ -1884,7 +1925,7 @@ function App() {
                       <div className="seller-header">
                     <div className="seller-info">
                       <a
-                        href={buildSellerPageHref(sellerRow.seller, activePage)}
+                        href={retailer?.url || buildSellerPageHref(sellerRow.seller, activePage)}
                         target="_blank"
                         rel="noreferrer"
                         className="seller-name"
@@ -1892,7 +1933,7 @@ function App() {
                         {sellerRow.displayName || sellerRow.seller}
                         <ArrowUpRight size={13} aria-hidden="true" />
                       </a>
-                      <span className="seller-username">@{sellerRow.seller}</span>
+                      <span className="seller-username">{retailer?.domain || `@${sellerRow.seller}`}</span>
                     </div>
 
                     <div className="seller-controls">
@@ -1909,7 +1950,8 @@ function App() {
                           type="button"
                           className="btn search-btn secondary small"
                           onClick={() => startSellerSearch(activePage.id, sellerRow.seller)}
-                          disabled={invalidSearchFilters}
+                          disabled={invalidSearchFilters || Boolean(unavailable)}
+                          title={unavailable ? availabilityLabel : undefined}
                         >
                           <Search size={14} /> Search
                         </button>
@@ -1917,7 +1959,7 @@ function App() {
 
                       <div className="seller-status-stack">
                         <span className={`seller-status-badge ${stateTone}`}>
-                          {getSellerStateLabel(sellerRow)}
+                          {unavailable && !sellerRow.loading && !isQueued ? availabilityLabel : getSellerStateLabel(sellerRow)}
                         </span>
                         {stateTone !== 'idle' && (
                           <span className="seller-status">

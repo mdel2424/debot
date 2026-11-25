@@ -4,6 +4,12 @@
 
 const API_BASE = import.meta.env?.VITE_API_BASE || '';
 
+export async function loadRetailSources(signal) {
+  const response = await fetch(`${API_BASE}/api/search/retailers`, { signal });
+  if (!response.ok) throw new Error('Retailer availability could not be loaded.');
+  return response.json();
+}
+
 /**
  * Generate a unique search ID
  */

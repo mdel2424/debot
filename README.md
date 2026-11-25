@@ -32,6 +32,15 @@ A production frontend needs an `/api` reverse proxy or an explicit API base.
 
 ## Search Behavior
 
+- **Tops > Retailers** searches up to 36 T-shirts per store with the same fit and
+  CAD price filters. Listings need an individual photo and both listed
+  measurements. Prices are before shipping and tax.
+- People's Thrift uses its public product sitemap. Only after obtaining written
+  permission, enable Wildrose Vintage or La Penderie du Paradis with
+  `DEBOT_AUTHORIZED_RETAIL_SOURCES=wildrose,la-penderie` (include only stores that
+  granted permission). Retail searches respect robots.txt, cache recent responses,
+  and stop on access blocks.
+
 - Shop collection reads the current `objects` / `page_info` responses and follows
   the supplied cursor. DOM scrolling is the fallback. Failed requests surface as
   errors rather than successful partial scans.

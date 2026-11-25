@@ -3,11 +3,12 @@
 from typing import Annotated, Literal
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 Category = Literal["tops", "coats-jackets", "bottoms", "footwear", "accessories"]
 Measurement = Annotated[float, Field(ge=0, le=1000)]
+RetailSource = Literal["wildrose", "la-penderie", "peoples-thrift"]
 
 
 class SearchModel(BaseModel):
@@ -39,6 +40,7 @@ class BottomsMeasurements(SearchModel):
 class SearchRequest(SearchModel):
     searchId: str = Field(default="", max_length=128)
     seller: str = Field(default="", max_length=64, pattern=r"^[A-Za-z0-9._-]*$")
+    retailSource: RetailSource | None = None
     category: Category = "tops"
     groups: Category | list[Category] = "tops"
     gender: Literal["male", "female", ""] = "male"
@@ -62,6 +64,12 @@ class SearchRequest(SearchModel):
         if isinstance(value, str):
             return value.strip().lstrip("@").strip("/").lower()
         return value
+
+    @model_validator(mode="after")
+    def validate_retail_search(self):
+        if self.retailSource and (self.seller or self.category != "tops"):
+            raise ValueError("Retailer searches support tops without a Depop seller")
+        return self
 
 
 def validate_search_payload(payload) -> dict:

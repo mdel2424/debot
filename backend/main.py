@@ -2,6 +2,7 @@
 
 import sys
 import asyncio
+import contextlib
 import datetime as dt
 import json
 import math
@@ -23,6 +24,7 @@ from parser import parser
 from listing_pool import ParallelListingParser
 from search_jobs import SearchJob, SearchJobRegistry
 from search_models import validate_search_payload
+from retail_sources import RETAILERS, RetailAccessError, search_catalogue, source_enabled
 from scraper import (
     build_seller_url,
     build_browse_url,
@@ -94,6 +96,7 @@ SEARCH_JOBS = SearchJobRegistry(
 SEARCH_JOB_SLOTS = threading.Semaphore(
     _positive_int_env("DEBOT_CONCURRENT_SEARCH_JOBS", 1),
 )
+RETAIL_JOB_SLOTS = threading.Semaphore(1)
 SEARCH_STREAM_POLL_SECONDS = 0.05
 SEARCH_STREAM_HEARTBEAT_SECONDS = 15.0
 DEFAULT_P2P_TOL = 0.5
@@ -280,7 +283,7 @@ def _error_payload_for_exception(exc: Exception, search_id: str) -> Dict[str, An
         "message": str(exc) or "Stream error",
         "searchId": search_id or None,
     }
-    if isinstance(exc, (RateLimitError, FetchError)):
+    if isinstance(exc, (RateLimitError, FetchError, RetailAccessError)):
         payload["code"] = exc.code
     return payload
 
@@ -817,6 +820,44 @@ def _cached_seller_collections(payload):
     return snapshots
 
 
+def _search_retailer(source_id, search_id, max_items, max_links, max_price_cad,
+                     target_p2p, target_length, p2p_tol, length_tol):
+    """Run a catalogue search through the same persistent event stream as Depop."""
+    seller = f"retail:{source_id}"
+    processed = matches = 0
+    yield _sse({
+        "type": "progress", "phase": "collecting", "processed": 0, "total": 0,
+        "matches": 0, "searchId": search_id,
+    })
+    catalogue = search_catalogue(source_id, max_links, _cancel_check(search_id))
+    with contextlib.closing(catalogue):
+        total = next(catalogue)
+        yield _sse({"type": "meta", "links": total, "seller": seller, "searchId": search_id})
+        for url, listing in catalogue:
+            processed += 1
+            if (listing and (max_price_cad is None or listing["price"] <= max_price_cad)
+                    and parser.within(listing["p2p"], target_p2p, p2p_tol)
+                    and parser.within(listing["length"], target_length, length_tol)):
+                matches += 1
+                item = _build_match_payload(
+                    {**listing, "price": f'${listing["price"]:.2f} CAD', "seller": seller},
+                    p2p=listing["p2p"], length=listing["length"],
+                )
+                yield _sse({"type": "match", "item": {**item, "title": listing["title"]}, "searchId": search_id})
+            else:
+                yield _sse({"type": "remove", "url": url, "searchId": search_id})
+            yield _sse({
+                "type": "progress", "phase": "parsing", "processed": processed, "total": total,
+                "matches": matches, "searchId": search_id,
+            })
+            if matches >= max_items:
+                break
+    yield _sse({
+        "type": "done", "processed": processed, "total": total, "matches": matches,
+        "stopReason": "match_limit" if matches >= max_items else "completed", "searchId": search_id,
+    })
+
+
 def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
     """Start or retrieve a console-owned search job."""
     if isinstance(payload, dict) and isinstance(payload.get("searchId"), str):
@@ -852,6 +893,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
     max_price_cad = payload.get("maxPriceCad")
 
     seller = (payload.get("seller") or "").strip()
+    retail_source = payload.get("retailSource")
     max_items = int(payload.get("maxItems") or 40)
     max_links = int(payload.get("maxLinks") or 1000)
     max_scrolls = int(payload.get("maxScrolls", 8))
@@ -869,6 +911,13 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
         """Synchronous search generator."""
         try:
             yield _sse({"type": "hello", "searchId": search_id, "ts": dt.datetime.now(dt.timezone.utc).isoformat()})
+
+            if retail_source:
+                yield from _search_retailer(
+                    retail_source, search_id, max_items, max_links, max_price_cad,
+                    target_p2p, target_length, p2p_tol, length_tol,
+                )
+                return
 
             if cached_collections is not None:
                 yield from _search_seller(
@@ -960,17 +1009,20 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
                 del CANCEL_FLAGS[search_id]
 
     def worker() -> None:
+        slots = RETAIL_JOB_SLOTS if retail_source else SEARCH_JOB_SLOTS
         acquired_slot = False
         waiting_state = None
         try:
-            cached_collections = _cached_seller_collections(payload)
+            cached_collections = None if retail_source else _cached_seller_collections(payload)
             if cached_collections is not None:
                 for chunk in run_search(cached_collections):
                     job.publish(chunk)
                 return
             while not _is_cancelled(search_id):
-                with RATE_LIMIT_STATE_LOCK:
-                    blocked_until = RATE_LIMIT_BLOCKED_UNTIL_TS
+                blocked_until = 0
+                if not retail_source:
+                    with RATE_LIMIT_STATE_LOCK:
+                        blocked_until = RATE_LIMIT_BLOCKED_UNTIL_TS
                 remaining = blocked_until - time.time()
                 if remaining > 0:
                     state = ("waiting_rate_limit", blocked_until)
@@ -987,7 +1039,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
                     sleep_with_cancel(min(remaining, 0.1), _cancel_check(search_id))
                     continue
 
-                acquired_slot = SEARCH_JOB_SLOTS.acquire(timeout=0.1)
+                acquired_slot = slots.acquire(timeout=0.1)
                 if acquired_slot:
                     break
                 if waiting_state != ("queued", None):
@@ -1011,7 +1063,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
             job.publish(_sse(_error_payload_for_exception(exc, search_id)))
         finally:
             if acquired_slot:
-                SEARCH_JOB_SLOTS.release()
+                slots.release()
             CANCEL_FLAGS.pop(search_id, None)
             job.finish()
 
@@ -1023,6 +1075,15 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
         ).start()
 
     return job
+
+
+@app.get("/api/search/retailers")
+async def search_retailers():
+    """Expose configured retailer availability without making external requests."""
+    return [
+        {"id": source_id, "enabled": source_enabled(source_id)}
+        for source_id in RETAILERS
+    ]
 
 
 @app.post("/api/search/stream")
