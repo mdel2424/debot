@@ -274,7 +274,7 @@ const buildPageWorkspaces = (accounts, existingWorkspaces = {}) =>
       page.id,
       {
         sellerRows: buildSellerRows(
-          page.id === 'tops' ? [...accounts, ...RETAIL_ACCOUNTS] : accounts,
+          page.id === 'tops' ? [...RETAIL_ACCOUNTS, ...accounts] : accounts,
           existingWorkspaces[page.id]?.sellerRows || [],
         ),
       },
@@ -608,7 +608,7 @@ const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
     ...(retailer ? { retailSource: retailer.id, groups: 'tops' } : { seller: sellerUsername, groups: page.group }),
     gender: 'male',
     maxItems: 40,
-    maxLinks: retailer ? 36 : 1000,
+    maxLinks: 1000,
     maxScrolls: 16,
     parseWorkers: 4,
     searchId,
@@ -791,38 +791,38 @@ function App() {
   const sellerAccountsSnapshot = JSON.stringify(sellerAccounts);
   const pageFiltersSnapshot = JSON.stringify(pageFilters);
   const activePage = CATEGORY_PAGE_MAP[activePageId] || CATEGORY_PAGE_MAP[DEFAULT_CATEGORY_PAGE_ID];
+  const hasRetailers = activePage.id === 'tops';
   const hasFitGuide = activePage.id === 'tops' || activePage.id === 'bottoms';
-  const currentWorkspace = pageWorkspaces[activePage.id] || { sellerRows: [] };
+  const sellerRows = pageWorkspaces[activePage.id]?.sellerRows || [];
   const currentFilters = pageFilters[activePage.id] || getDefaultPageFilters(activePage.id);
   const invalidTopsRanges = activePage.mode === 'measurements'
     && TOPS_RANGES.some((range) => !getTopsRange(currentFilters, range));
   const invalidPriceCap = Boolean(currentFilters.maxPriceCad.trim()) && readPriceCap(currentFilters.maxPriceCad) === null;
   const invalidSearchFilters = invalidTopsRanges || invalidPriceCap;
-  const retailView = activePage.id === 'tops' && sellerView.startsWith('retail');
-  const matchView = sellerView === 'matched' || (retailView && sellerView === 'retail-matched');
-  const sellerRowsForView = currentWorkspace.sellerRows.filter((row) => RETAIL_BY_USERNAME.has(row.seller) === retailView);
+  const matchView = sellerView === 'matched';
+  const checkingRetailers = hasRetailers && retailSources === null;
   const canSearchRow = (username) => {
     const retailer = RETAIL_BY_USERNAME.get(username);
     return !retailer || retailSources?.[retailer.id] === true;
   };
-  const sellerCount = sellerRowsForView.length;
-  const activeSearchCount = sellerRowsForView.filter((row) => row.loading).length;
-  const queuedCountForPage = sellerRowsForView.filter((row) => row.progress?.phase === 'queued').length;
-  const totalHits = sellerRowsForView.reduce((sum, row) => sum + row.results.length, 0);
+  const sellerCount = sellerRows.length;
+  const activeSearchCount = sellerRows.filter((row) => row.loading).length;
+  const queuedCountForPage = sellerRows.filter((row) => row.progress?.phase === 'queued').length;
+  const totalHits = sellerRows.reduce((sum, row) => sum + row.results.length, 0);
   const pageIsLoading = activeSearchCount > 0 || queuedCountForPage > 0;
   const queuePositionByKey = new Map(
     queueState.pending.map((task, index) => [task.key, index + 1])
   );
   const sellerSearchQuery = sellerQuery.trim().toLowerCase().replace(/^@/, '');
-  const matchedSellerCount = sellerRowsForView.filter((row) => row.results.length > 0).length;
-  const visibleSellerRows = sellerRowsForView.filter((row) =>
+  const matchedSellerCount = sellerRows.filter((row) => row.results.length > 0).length;
+  const visibleSellerRows = sellerRows.filter((row) =>
     (!matchView || row.results.length > 0)
     && (!sellerSearchQuery || [row.seller, row.displayName].some((value) =>
       String(value || '').toLowerCase().includes(sellerSearchQuery)))
   );
 
   useEffect(() => {
-    if (!retailView) return undefined;
+    if (!hasRetailers) return undefined;
     const controller = new AbortController();
     loadRetailSources(controller.signal)
       .then((sources) => setRetailSources(Object.fromEntries(sources.map(({ id, enabled }) => [id, enabled]))))
@@ -830,7 +830,7 @@ function App() {
         if (!controller.signal.aborted) setRetailSources({});
       });
     return () => controller.abort();
-  }, [retailView]);
+  }, [hasRetailers]);
 
   useEffect(() => {
     pageWorkspacesRef.current = pageWorkspaces;
@@ -1551,13 +1551,13 @@ function App() {
   };
 
   const startSearchAllForPage = async (pageId) => {
-    if (invalidSearchFilters) return;
-    setSellerView(retailView ? 'retail' : 'all');
+    if (invalidSearchFilters || checkingRetailers) return;
+    setSellerView('all');
     setSellerQuery('');
     const batchId = nextBatchId('batch');
     const page = CATEGORY_PAGE_MAP[pageId];
     const filters = normalizePageFilters(pageId, pageFilters[pageId]);
-    const searchesToStart = sellerRowsForView
+    const searchesToStart = sellerRows
       .map((row) => row.seller)
       .filter((sellerUsername) => canSearchRow(sellerUsername) && !isSellerScheduled(pageId, sellerUsername))
       .map((sellerUsername) => {
@@ -1608,9 +1608,9 @@ function App() {
   };
 
   const cancelPageSearches = async (pageId) => {
-    removeQueuedTasks((task) => task.pageId === pageId && RETAIL_BY_USERNAME.has(task.sellerUsername) === retailView);
+    removeQueuedTasks((task) => task.pageId === pageId);
 
-    const activeSellers = sellerRowsForView
+    const activeSellers = sellerRows
       .filter((row) => row.loading)
       .map((row) => row.seller);
 
@@ -1697,7 +1697,7 @@ function App() {
         <div className="seller-manager-header">
           <div>
             <h2 id="seller-manager-title">Manage sellers</h2>
-            <span className="mono muted">{sellerCount} saved sellers</span>
+            <span className="mono muted">{sellerAccounts.length} saved sellers</span>
           </div>
           <button
             type="button"
@@ -1813,11 +1813,11 @@ function App() {
         <div className="home-workspace">
           <header className="home-header">
             <div className="home-header-copy">
-              <div className="home-header-kicker mono"><span aria-hidden="true">/</span> {retailView ? 'Retailers' : 'Depop'}</div>
+              <div className="home-header-kicker mono"><span aria-hidden="true">/</span> {hasRetailers ? 'Depop + retailers' : 'Depop'}</div>
               <h1>{activePage.headline}</h1>
             </div>
             <dl className="workspace-stats" aria-label="Workspace summary">
-              <div><dt>{retailView ? 'Retailers' : 'Sellers'}</dt><dd>{sellerCount}</dd></div>
+              <div><dt>Sellers</dt><dd>{sellerCount}</dd></div>
               <div><dt>Matches</dt><dd>{totalHits}</dd></div>
               {queueState.active.length + queueState.pending.length > 0 && (
                 <div><dt>In queue</dt><dd>{queueState.active.length + queueState.pending.length}</dd></div>
@@ -1859,9 +1859,9 @@ function App() {
                     type="button"
                     className="btn btn--primary search-btn"
                     onClick={() => startSearchAllForPage(activePage.id)}
-                    disabled={!sellerRowsForView.some((row) => canSearchRow(row.seller)) || invalidSearchFilters}
+                    disabled={checkingRetailers || invalidSearchFilters || !sellerRows.some((row) => canSearchRow(row.seller))}
                   >
-                    <Search size={16} /> {retailView ? 'Search retailers' : 'Search All Sellers'}
+                    <Search size={16} /> Search All Sellers
                   </button>
                 )}
               </div>
@@ -1874,22 +1874,18 @@ function App() {
 
           <section className="seller-section" aria-labelledby="seller-section-title">
             <div className="seller-section-heading">
-              <h2 id="seller-section-title">{retailView ? 'Retailer queue' : 'Seller queue'}</h2>
+              <h2 id="seller-section-title">Seller queue</h2>
               <div className="seller-list-tools">
                 <div className="segmented" role="group" aria-label="Show sellers">
-                  <button type="button" aria-pressed={!retailView && !matchView}
+                  <button type="button" aria-pressed={!matchView}
                     onClick={() => { setSellerView('all'); setSellerQuery(''); }}>All sellers</button>
                   <button type="button" aria-pressed={matchView}
-                    onClick={() => setSellerView(retailView ? 'retail-matched' : 'matched')}>With matches <span>{matchedSellerCount}</span></button>
-                  {activePage.id === 'tops' && (
-                    <button type="button" aria-pressed={retailView && !matchView}
-                      onClick={() => { setSellerView('retail'); setSellerQuery(''); }}>Retailers</button>
-                  )}
+                    onClick={() => setSellerView('matched')}>With matches <span>{matchedSellerCount}</span></button>
                 </div>
                 <label className="seller-query">
                   <Search size={16} aria-hidden="true" />
-                  <input aria-label={retailView ? 'Filter retailers' : 'Filter sellers'}
-                    placeholder={retailView ? 'Filter retailers' : 'Filter sellers'} value={sellerQuery}
+                  <input aria-label="Filter sellers"
+                    placeholder="Filter sellers" value={sellerQuery}
                     onChange={(event) => setSellerQuery(event.target.value)} />
                 </label>
               </div>
@@ -1897,13 +1893,12 @@ function App() {
           {visibleSellerRows.length === 0 ? (
             <div className="empty-state-card">
               <UsersRound size={22} />
-              <h3>{sellerCount === 0 ? 'No saved sellers' : sellerSearchQuery
-                ? (retailView ? 'No retailers found' : 'No sellers found') : 'No matching listings'}</h3>
+              <h3>{sellerCount === 0 ? 'No saved sellers' : sellerSearchQuery ? 'No sellers found' : 'No matching listings'}</h3>
             </div>
           ) : (
             <div className="following-sellers">
               <div className="seller-table-head" aria-hidden="true">
-                <span>{retailView ? 'Retailer' : 'Seller'}</span><span>Status</span><span>Action</span>
+                <span>Seller</span><span>Status</span><span>Action</span>
               </div>
               {visibleSellerRows.map((sellerRow) => {
                   const retailer = RETAIL_BY_USERNAME.get(sellerRow.seller);

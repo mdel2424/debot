@@ -9,6 +9,10 @@ import unittest
 from playwright.sync_api import expect, sync_playwright
 
 
+RETAILER_NAMES = ["Wildrose Vintage", "La Penderie du Paradis", "People's Thrift"]
+RETAILER_IDS = ["wildrose", "la-penderie", "peoples-thrift"]
+
+
 @unittest.skipUnless(os.getenv('DEBOT_FRONTEND_URL'), 'Set DEBOT_FRONTEND_URL to run browser regressions.')
 class FrontendSmokeTest(unittest.TestCase):
     def setUp(self):
@@ -26,6 +30,9 @@ class FrontendSmokeTest(unittest.TestCase):
             }
         """)
         self.context.route('https://fonts.googleapis.com/**', lambda route: route.abort())
+        self.context.route("**/api/search/retailers", lambda route: route.fulfill(json=[
+            {"id": source_id, "enabled": True} for source_id in RETAILER_IDS
+        ]))
         self.page = self.context.new_page()
         self.errors = []
         self.page.on('pageerror', lambda error: self.errors.append(str(error)))
@@ -40,14 +47,15 @@ class FrontendSmokeTest(unittest.TestCase):
     def event(value):
         return f'data: {json.dumps(value)}\n\n'
 
-    def test_retailers_respect_availability_send_fit_and_restore_results(self):
-        searches = []
-        registered = []
-        depop_routes = []
+    def seller_row(self, name):
+        return self.page.locator(".seller-row-card").filter(has=self.page.get_by_role("link", name=name, exact=True))
 
-        def batch(route):
-            registered.extend(route.request.post_data_json["searches"])
-            route.fulfill(json={"ok": True, "count": 1, "jobs": []})
+    def search_seller(self, name="Fixture One"):
+        return self.seller_row(name).get_by_role("button", name="Search", exact=True)
+
+    def test_retailers_are_first_and_restore_matches_in_the_shared_queue(self):
+        searches = []
+        depop_routes = []
 
         def stream(route):
             payload = route.request.post_data_json
@@ -64,28 +72,19 @@ class FrontendSmokeTest(unittest.TestCase):
                 {"type": "done", "processed": 1, "total": 1, "matches": 1},
             ])))
 
-        self.context.route("**/api/search/retailers", lambda route: route.fulfill(json=[
-            {"id": "wildrose", "enabled": False}, {"id": "la-penderie", "enabled": False},
-            {"id": "peoples-thrift", "enabled": True},
-        ]))
-        self.context.route("**/api/search/batch/start", batch)
         self.context.route("**/api/search/stream", stream)
         self.page.goto(self.url + "#tops")
+        expect(self.page.locator(".seller-name")).to_have_text([*RETAILER_NAMES, "Fixture One", "Fixture Two"])
+        for name in RETAILER_NAMES:
+            expect(self.search_seller(name)).to_be_enabled()
         with self.page.expect_request("**/api/search/stream"):
-            self.page.get_by_role("button", name="Search", exact=True).first.click()
-        self.page.get_by_role("button", name="Retailers", exact=True).click()
-        for name in ("Wildrose Vintage", "La Penderie du Paradis"):
-            row = self.page.locator(".seller-row-card").filter(has_text=name)
-            expect(row.get_by_role("button", name="Search", exact=True)).to_be_disabled()
-            expect(row.get_by_text("Permission required", exact=True)).to_be_visible()
-        expect(self.page.get_by_role("link", name="People's Thrift")).to_be_visible()
-        self.page.get_by_role("button", name="Search retailers", exact=True).click()
+            self.search_seller().click()
+        self.search_seller("People's Thrift").click()
         expect(self.page.get_by_text("Measured graphic T-shirt", exact=True)).to_be_visible()
         self.page.wait_for_function("""
             JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1'))?.tops.retailerRows
                 ?.some(row => row.seller === 'retail:peoples-thrift' && row.processed && row.results.length === 1)
         """)
-        self.assertEqual(registered, searches)
         self.assertEqual(len(searches), 1)
         self.assertEqual(searches[0]["retailSource"], "peoples-thrift")
         self.assertNotIn("seller", searches[0])
@@ -96,7 +95,6 @@ class FrontendSmokeTest(unittest.TestCase):
             JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1'))?.tops.sellerRows[0].processed
         """)
         self.page.reload()
-        self.page.get_by_role("button", name="Retailers", exact=True).click()
         expect(self.page.get_by_text("Measured graphic T-shirt", exact=True)).to_be_visible()
         self.page.set_viewport_size({"width": 320, "height": 840})
         self.assertTrue(self.page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"))
@@ -105,7 +103,9 @@ class FrontendSmokeTest(unittest.TestCase):
         expect(self.page.get_by_role("link", name="Wildrose Vintage")).to_have_count(0)
         self.page.get_by_role("button", name="All sellers", exact=True).click()
         expect(self.page.get_by_role("link", name="Fixture One")).to_be_visible()
-        expect(self.page.get_by_text("Measured graphic T-shirt", exact=True)).to_have_count(0)
+        expect(self.page.get_by_text("Measured graphic T-shirt", exact=True)).to_be_visible()
+        self.page.get_by_role("button", name="Bottoms", exact=True).click()
+        expect(self.page.locator(".seller-name")).to_have_text(["Fixture One", "Fixture Two"])
         self.assertEqual(self.errors, [])
 
     def test_close_and_reopen_restores_matches_and_reconnects_same_job(self):
@@ -128,7 +128,7 @@ class FrontendSmokeTest(unittest.TestCase):
 
         self.context.route('**/api/search/stream', stream)
         self.page.goto(self.url)
-        self.page.get_by_role('button', name='Search', exact=True).first.click()
+        self.search_seller().click()
         self.page.wait_for_function("document.querySelectorAll('.result-card').length === 1")
         self.page.close()
         resumed = True
@@ -147,9 +147,12 @@ class FrontendSmokeTest(unittest.TestCase):
 
         def batch(route):
             payloads = route.request.post_data_json['searches']
-            saved = self.page.evaluate("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows")
-            saved_before_request.extend(row['searchId'] for row in saved)
-            registered.extend(payload['searchId'] for payload in payloads)
+            saved = self.page.evaluate("""() => {
+                const { sellerRows, retailerRows } = JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops;
+                return [...retailerRows, ...sellerRows];
+            }""")
+            saved_before_request.extend(saved)
+            registered.extend(payloads)
             route.fulfill(json={'ok': True, 'count': len(payloads), 'jobs': []})
 
         self.context.route('**/api/search/batch/start', batch)
@@ -158,9 +161,14 @@ class FrontendSmokeTest(unittest.TestCase):
         ))
         self.page.goto(self.url)
         self.page.get_by_role('button', name='Search All Sellers').click()
-        self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows.every(row => row.processed)")
-        self.assertEqual(len(registered), 2)
-        self.assertEqual(set(registered), set(saved_before_request))
+        self.page.wait_for_function("""() => {
+            const { sellerRows, retailerRows } = JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops;
+            return [...retailerRows, ...sellerRows].every(row => row.processed);
+        }""")
+        self.assertEqual([payload.get('retailSource') or payload.get('seller') for payload in registered],
+                         [*RETAILER_IDS, 'fixture_one', 'fixture_two'])
+        self.assertEqual([payload['searchId'] for payload in registered],
+                         [row['searchId'] for row in saved_before_request])
         self.page.set_viewport_size({'width': 390, 'height': 844})
         self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'))
         self.assertEqual(self.errors, [])
@@ -179,7 +187,7 @@ class FrontendSmokeTest(unittest.TestCase):
         expect(self.page.get_by_role('textbox', name='Length minimum')).to_have_value('26.5')
         expect(self.page.get_by_role('textbox', name='Length maximum')).to_have_value('27.25')
         with self.page.expect_request('**/api/search/stream'):
-            self.page.get_by_role('button', name='Search', exact=True).first.click()
+            self.search_seller().click()
         self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].processed")
         self.assertEqual(len(searches), 1)
         payload = searches[0]
@@ -391,7 +399,7 @@ class FrontendSmokeTest(unittest.TestCase):
         ))""")
         self.page.reload()
         self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.followingAccounts.v1')).length === 4")
-        self.assertEqual(self.page.locator('.seller-row-card').count(), 4)
+        self.assertEqual(self.page.locator('.seller-row-card').count(), 4 + len(RETAILER_NAMES))
         self.assertEqual(self.errors, [])
 
     def test_second_seller_update_preserves_removals_and_existing_custom_names(self):
@@ -413,7 +421,7 @@ class FrontendSmokeTest(unittest.TestCase):
             {'username': 'secondlifeinc', 'name': 'My Second Life Name'},
             {'username': 'vintagebysherman', 'name': 'Vintage by Sherman'},
         ])
-        self.assertEqual(self.page.locator('.seller-row-card').count(), 3)
+        self.assertEqual(self.page.locator('.seller-row-card').count(), 3 + len(RETAILER_NAMES))
         self.assertEqual(self.errors, [])
 
     def test_removed_sellers_leave_saved_lists_and_workspaces_without_resetting_other_results(self):
@@ -455,7 +463,7 @@ class FrontendSmokeTest(unittest.TestCase):
             self.assertEqual([row['seller'] for row in workspace['sellerRows']], ['fixture_one', 'secondlifeinc'])
         self.assertEqual(workspaces['tops']['sellerRows'][0]['results'][0]['url'], 'https://www.depop.com/products/keep/')
         self.assertEqual(requests, [])
-        self.assertEqual(self.page.locator('.seller-row-card').count(), 2)
+        self.assertEqual(self.page.locator('.seller-row-card').count(), 2 + len(RETAILER_NAMES))
         self.assertEqual(self.errors, [])
 
     def test_queued_seller_shows_the_shared_rate_limit_countdown(self):
@@ -469,7 +477,7 @@ class FrontendSmokeTest(unittest.TestCase):
             }),
         ))
         self.page.goto(self.url)
-        self.page.get_by_role('button', name='Search', exact=True).first.click()
+        self.search_seller().click()
         self.page.get_by_text('Waiting for Depop cooldown', exact=True).wait_for()
         self.page.get_by_text('Depop has paused requests. This search will start after the shared cooldown.', exact=True).wait_for()
         self.assertIn('Cooldown 59m', self.page.locator('.seller-progress-primary').first.inner_text())
@@ -486,7 +494,7 @@ class FrontendSmokeTest(unittest.TestCase):
             ]),
         ))
         self.page.goto(self.url)
-        self.page.get_by_role('button', name='Search', exact=True).first.click()
+        self.search_seller().click()
         self.page.get_by_text(re.compile(r'1 matches.*12 parsed / 24 collected')).wait_for()
         self.assertEqual(self.errors, [])
 
@@ -511,7 +519,7 @@ class FrontendSmokeTest(unittest.TestCase):
 
         self.context.route('**/api/search/stream', stream)
         self.page.goto(self.url)
-        search = self.page.get_by_role('button', name='Search', exact=True).first
+        search = self.search_seller()
         search.click()
         self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].processed")
         self.page.evaluate("""() => {
@@ -563,7 +571,7 @@ class FrontendSmokeTest(unittest.TestCase):
             ]),
         ))
         self.page.goto(self.url)
-        search = self.page.get_by_role('button', name='Search', exact=True).first
+        search = self.search_seller()
         search.click()
         self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].processed")
         for change in ('date', 'fit', 'price', 'legacy-price'):

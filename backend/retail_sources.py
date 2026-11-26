@@ -5,16 +5,17 @@ import math
 import os
 import re
 import time
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from threading import Lock
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import parse_qsl, unquote, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.robotparser import RobotFileParser
 
-from scraper import extract_retry_after_seconds, raise_if_cancelled, sleep_with_cancel
+from playwright.sync_api import Error as PlaywrightError, sync_playwright
+
+from scraper import SearchCancelled, extract_retry_after_seconds, raise_if_cancelled, sleep_with_cancel
 
 
 @dataclass(frozen=True)
@@ -24,22 +25,26 @@ class Retailer:
     catalogue: str
     product_prefix: str
     permission_required: bool = True
+    scroll_collection: bool = False
 
 
 RETAILERS = {
-    "wildrose": Retailer("Wildrose Vintage", "https://www.wildrosevintage.ca", "/collections/all", "/products/"),
+    "wildrose": Retailer(
+        "Wildrose Vintage", "https://www.wildrosevintage.ca", "/collections/all", "/products/", scroll_collection=True,
+    ),
     "la-penderie": Retailer(
         "La Penderie du Paradis", "https://lapenderieduparadis.com",
-        "/collections/homme-friperie-en-ligne", "/products/",
+        "/en/collections/secondhand-men-tees-sweaters-pullovers", "/en/products/", scroll_collection=True,
     ),
     "peoples-thrift": Retailer(
-        "People's Thrift", "https://www.peoplesthrift.ca", "/store-products-sitemap.xml", "/product-page/", False,
+        "People's Thrift", "https://www.peoplesthrift.ca", "/category/men%E2%80%99s-tops", "/product-page/", False,
     ),
 }
 USER_AGENT = "Debot/1.0"
-MAX_PRODUCTS = 36
-MAX_COLLECTION_PAGES = 4
+MAX_COLLECTION_PAGES = 100
+MAX_COLLECTION_SCROLLS = 450
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+REQUEST_INTERVAL = 1.5
 CATALOGUE_TTL = 180
 MAX_CACHED_PRODUCTS = 160
 TEE = re.compile(r"\b(?:t[ -]?shirts?|tees?|chandails? à manches courtes)\b", re.I)
@@ -64,7 +69,7 @@ class RetailAccessError(Exception):
 
 def source_enabled(source_id):
     authorized = {
-        entry.strip() for entry in os.getenv("DEBOT_AUTHORIZED_RETAIL_SOURCES", "").split(",")
+        entry.strip() for entry in os.getenv("DEBOT_AUTHORIZED_RETAIL_SOURCES", "wildrose,la-penderie").split(",")
     }
     return not RETAILERS[source_id].permission_required or source_id in authorized
 
@@ -74,8 +79,11 @@ def _product_url(store, link):
         return None
     url = urlsplit(urljoin(store.origin, link))
     path = url.path
-    if store.product_prefix == "/products/":
-        path = re.sub(r"^/collections/[A-Za-z0-9-]+(?=/products/)", "", path)
+    if store.product_prefix.endswith("/products/"):
+        locale = store.product_prefix.removesuffix("/products/")
+        path = re.sub(rf"^{re.escape(locale)}/collections/[A-Za-z0-9-]+(?=/products/)", locale, path)
+        if locale and path.startswith("/products/"):
+            path = locale + path
     slug = path.removeprefix(store.product_prefix).strip("/")
     if (f"{url.scheme}://{url.netloc}" == store.origin
             and path.startswith(store.product_prefix)
@@ -106,8 +114,9 @@ class _Page(HTMLParser):
         elif not self._hidden:
             if tag == "div" and (self._price_depth or "wixui-product-prices-wrapper" in attrs.get("class", "").split()):
                 self._price_depth += 1
-            if tag == "a" and attrs.get("href"):
-                self.links.append(attrs["href"])
+            if tag == "a" or (tag == "link" and "next" in (attrs.get("rel") or "").lower().split()):
+                if href := attrs.get("href"):
+                    self.links.append(href)
             if tag in {"br", "p", "div", "li", "td", "th", "h2", "h3", "h4"}:
                 self.text.append("\n")
 
@@ -264,12 +273,20 @@ class _OriginState:
     blocked_until: float = 0
     catalogues: dict = field(default_factory=dict)
     products: dict = field(default_factory=dict)
+    scroll_cache: tuple | None = None
 
 
 _ORIGINS = {source_id: _OriginState() for source_id in RETAILERS}
+_ACCESS_BLOCKS = {401, 403, 429}
 
 
-def _read(store, state, path, should_cancel, delay=1.5):
+def _pause_origin(store, state, status, response):
+    retry_after = extract_retry_after_seconds(response)
+    state.blocked_until = time.monotonic() + max(retry_after or 0, 600)
+    return RetailAccessError("retailer_paused", f"{store.name} declined catalogue access (HTTP {status}).")
+
+
+def _read(store, state, path, should_cancel, delay=REQUEST_INTERVAL):
     """Read one fixed catalogue route, sharing pacing and a small cache across jobs."""
     raise_if_cancelled(should_cancel)
     if state.blocked_until > time.monotonic():
@@ -289,10 +306,8 @@ def _read(store, state, path, should_cancel, delay=1.5):
             body = data.decode("utf-8", errors="replace")
     except HTTPError as exc:
         exc.close()
-        if exc.code in {401, 403, 429}:
-            retry_after = extract_retry_after_seconds(exc)
-            state.blocked_until = time.monotonic() + max(retry_after or 0, 600)
-            raise RetailAccessError("retailer_paused", f"{store.name} declined catalogue access (HTTP {exc.code}).") from exc
+        if exc.code in _ACCESS_BLOCKS:
+            raise _pause_origin(store, state, exc.code, exc) from exc
         if exc.code in {404, 410} and path.startswith(store.product_prefix):
             body = ""
         else:
@@ -318,6 +333,7 @@ def _allowed(robots, url):
     entries = [entry for length, entry in groups if length == specificity] or [robots.default_entry]
     route = urlsplit(url)
     target = route.path + ("?" + route.query if route.query else "")
+    target = unquote(target)
     matches = []
     for entry in filter(None, entries):
         for rule in entry.rulelines:
@@ -329,18 +345,142 @@ def _allowed(robots, url):
     return max(matches, default=(0, True))[1]
 
 
-def _sitemap_links(html):
+def _add_candidates(store, links, candidates, limit):
+    for link in links:
+        url = _product_url(store, link)
+        if not url:
+            continue
+        slug = urlsplit(url).path.rsplit("/", 1)[-1].replace("-", " ")
+        if TEE.search(slug) and not NON_TEE.search(slug):
+            candidates[url] = None
+            if len(candidates) >= limit:
+                break
+
+
+def _next_collection_path(store, links, page_number):
+    for link in links:
+        next_url = urlsplit(urljoin(store.origin + store.catalogue, link))
+        if (f"{next_url.scheme}://{next_url.netloc}" != store.origin
+                or unquote(next_url.path) != unquote(store.catalogue)):
+            continue
+        page_values = [value for key, value in parse_qsl(next_url.query, keep_blank_values=True) if key == "page"]
+        if page_values == [str(page_number + 1)]:
+            return f"{store.catalogue}?{next_url.query}"
+    return None
+
+
+def _scroll_for_links(page, store, candidates, limit, check, delay):
+    previous = None
+    stable = 0
+    for _ in range(MAX_COLLECTION_SCROLLS):
+        check()
+        links, height, bottom, busy = page.evaluate("""() => {
+            const root = document.querySelector('main, [role=main]') || document.body;
+            const links = Array.from(root.querySelectorAll('a[href]'), a => a.href);
+            links.push(...Array.from(document.querySelectorAll('[rel~=next][href]'), a => a.href));
+            const height = document.documentElement.scrollHeight;
+            const busy = '[aria-busy="true"]';
+            return [links, height, window.scrollY + window.innerHeight >= height - 4,
+                root.matches(busy) || !!root.querySelector(busy)];
+        }""")
+        _add_candidates(store, links, candidates, limit)
+        if len(candidates) >= limit:
+            return links
+        # A viewport without new cards isn't the end unless the page is at the bottom.
+        signature = (height, tuple(links))
+        stable = stable + 1 if bottom and not busy and signature == previous else 0
+        if stable >= 3:
+            return links
+        previous = signature
+        if not busy:
+            page.evaluate("window.scrollBy(0, Math.floor(window.innerHeight * 0.85))")
+        for _ in range(max(1, math.ceil(delay * 4))):
+            check()
+            page.wait_for_timeout(250)
+    raise RetailAccessError("retailer_unavailable", f"{store.name}'s collection did not finish scrolling.")
+
+
+def _browser_candidates(store, state, robots, limit, should_cancel, delay):
+    cached = state.scroll_cache
+    if cached and cached[0] > time.monotonic() and cached[1] == limit:
+        return cached[2]
+    candidates = {}
+    failure = None
+
+    def check():
+        raise_if_cancelled(should_cancel)
+        if failure:
+            raise failure
+
+    def route_request(route):
+        nonlocal failure
+        request = route.request
+        url = urlsplit(request.url)
+        same_origin = f"{url.scheme}://{url.netloc}" == store.origin
+        data_request = request.resource_type in {"document", "xhr", "fetch"}
+        collection_request = url.path.rstrip("/") == store.catalogue
+        if failure or (should_cancel and should_cancel()) or request.method != "GET":
+            return route.abort()
+        if not same_origin:
+            shopify_asset = url.scheme == "https" and url.netloc == "cdn.shopify.com"
+            if shopify_asset and request.resource_type in {"script", "stylesheet"}:
+                return route.continue_()
+            return route.abort()
+        if not _allowed(robots, request.url):
+            if data_request and collection_request:
+                failure = RetailAccessError("retailer_restricted", f"{store.name}'s robots.txt restricts this catalogue path.")
+            return route.abort()
+        if data_request:
+            if not collection_request:
+                return route.abort()
+            try:
+                sleep_with_cancel(state.last_request + delay - time.monotonic(), should_cancel)
+            except SearchCancelled:
+                return route.abort()
+            state.last_request = time.monotonic()
+            # Do not follow redirects from catalogue requests, including redirects to login pages.
+            try:
+                response = route.fetch(max_redirects=0, timeout=20000)
+            except PlaywrightError:
+                failure = RetailAccessError("retailer_unavailable", f"Could not reach {store.name}'s collection.")
+                return route.abort()
+            try:
+                if response.status in _ACCESS_BLOCKS:
+                    failure = _pause_origin(store, state, response.status, response)
+                elif response.status >= 300 and response.status != 304:
+                    failure = RetailAccessError("retailer_unavailable", f"{store.name} returned HTTP {response.status}.")
+                if failure:
+                    return route.abort()
+                return route.fulfill(response=response)
+            finally:
+                response.dispose()
+        elif request.resource_type not in {"script", "stylesheet"}:
+            return route.abort()
+        route.continue_()
+
     try:
-        root = ET.fromstring(html)
-    except ET.ParseError as exc:
-        raise RetailAccessError("retailer_unavailable", "The retailer's product sitemap could not be read.") from exc
-    if root.tag.rsplit("}", 1)[-1] != "urlset":
-        raise RetailAccessError("retailer_unavailable", "The retailer's product sitemap format changed.")
-    entries = [
-        (node.findtext("{*}lastmod", ""), node.findtext("{*}loc", ""))
-        for node in root.findall("{*}url")
-    ]
-    return [link for _, link in sorted(entries, key=lambda entry: entry[0], reverse=True)]
+        with sync_playwright() as playwright, playwright.firefox.launch() as browser:
+            with browser.new_context(user_agent=USER_AGENT, service_workers="block") as context:
+                page = context.new_page()
+                page.route("**/*", route_request)
+                current = store.catalogue
+                for number in range(1, MAX_COLLECTION_PAGES + 1):
+                    check()
+                    response = page.goto(store.origin + current, wait_until="domcontentloaded", timeout=20000)
+                    check()
+                    if not response or page.url != store.origin + current:
+                        raise RetailAccessError("retailer_unavailable", f"{store.name} did not return the expected collection.")
+                    links = _scroll_for_links(page, store, candidates, limit, check, delay)
+                    current = _next_collection_path(store, links, number)
+                    if len(candidates) >= limit or current is None:
+                        break
+                else:
+                    raise RetailAccessError("retailer_unavailable", f"{store.name}'s collection exceeded the page limit.")
+    except PlaywrightError as exc:
+        check()
+        raise RetailAccessError("retailer_unavailable", f"Could not load {store.name}'s collection in Firefox.") from exc
+    state.scroll_cache = (time.monotonic() + CATALOGUE_TTL, limit, candidates)
+    return candidates
 
 
 def search_catalogue(source_id, max_links, should_cancel):
@@ -358,7 +498,7 @@ def search_catalogue(source_id, max_links, should_cancel):
         if not re.search(r"^\s*User-agent\s*:", robots_text, re.I | re.M):
             raise RetailAccessError("retailer_unavailable", f"{store.name}'s robots.txt could not be verified.")
         robots.parse(robots_text.splitlines())
-        delay = max(1.5, robots.crawl_delay(USER_AGENT) or 0)
+        delay = max(REQUEST_INTERVAL, robots.crawl_delay(USER_AGENT) or 0)
         rate = robots.request_rate(USER_AGENT)
         if rate and rate.requests:
             delay = max(delay, rate.seconds / rate.requests)
@@ -371,28 +511,20 @@ def search_catalogue(source_id, max_links, should_cancel):
             validate_path(path)
             return _read(store, state, path, should_cancel, delay)
 
-        limit = min(max_links, MAX_PRODUCTS)
-        candidates = {}
-        for number in range(1, MAX_COLLECTION_PAGES + 1):
-            suffix = "" if number == 1 else f"?page={number}"
-            body = read(store.catalogue + suffix)
-            sitemap = store.catalogue.endswith(".xml")
-            page = None if sitemap else _Page(body)
-            links = _sitemap_links(body) if sitemap else page.links
-            for link in links:
-                url = _product_url(store, link)
-                if not url:
-                    continue
-                slug = urlsplit(url).path.rsplit("/", 1)[-1].replace("-", " ")
-                if TEE.search(slug) and not NON_TEE.search(slug):
-                    candidates[url] = None
-                    if len(candidates) == limit:
-                        break
-            if sitemap or len(candidates) == limit:
-                break
-            next_path = f"{store.catalogue}?page={number + 1}"
-            if next_path not in {urljoin(store.origin, link).removeprefix(store.origin) for link in page.links}:
-                break
+        if store.scroll_collection:
+            validate_path(store.catalogue)
+            candidates = _browser_candidates(store, state, robots, max_links, should_cancel, delay)
+        else:
+            candidates = {}
+            current = store.catalogue
+            for number in range(1, MAX_COLLECTION_PAGES + 1):
+                links = _Page(read(current)).links
+                _add_candidates(store, links, candidates, max_links)
+                current = _next_collection_path(store, links, number)
+                if len(candidates) >= max_links or current is None:
+                    break
+            else:
+                raise RetailAccessError("retailer_unavailable", f"{store.name}'s collection exceeded the page limit.")
         yield len(candidates)
         for url in candidates:
             raise_if_cancelled(should_cancel)

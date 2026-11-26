@@ -1,6 +1,6 @@
 # Debot
 
-Search public Depop seller listings by clothing measurements or shoe size.
+Search Depop and retailer listings by clothing measurements or shoe size.
 The React workspace saves sellers, filters, and results locally. Seller searches
 continue in the Python backend when the browser tab closes.
 
@@ -32,14 +32,14 @@ A production frontend needs an `/api` reverse proxy or an explicit API base.
 
 ## Search Behavior
 
-- **Tops > Retailers** searches up to 36 T-shirts per store with the same fit and
-  CAD price filters. Listings need an individual photo and both listed
-  measurements. Prices are before shipping and tax.
-- People's Thrift uses its public product sitemap. Only after obtaining written
-  permission, enable Wildrose Vintage or La Penderie du Paradis with
-  `DEBOT_AUTHORIZED_RETAIL_SOURCES=wildrose,la-penderie` (include only stores that
-  granted permission). Retail searches respect robots.txt, cache recent responses,
-  and stop on access blocks.
+- Wildrose Vintage, La Penderie du Paradis, and People's Thrift appear first in
+  **Tops** and are included in **Search All Sellers**. People's Thrift follows the
+  numbered Men's Tops pages; the other two stores use paced scrolling in Firefox.
+  Searches check up to 1,000 T-shirts per store for both listed measurements, an
+  individual photo, and the same CAD price cap (before shipping and tax).
+- All three stores are enabled. Set `DEBOT_AUTHORIZED_RETAIL_SOURCES` to override
+  which of `wildrose` and `la-penderie` are enabled. Retail searches still respect
+  robots.txt, cache recent responses, and stop on access blocks.
 
 - Shop collection reads the current `objects` / `page_info` responses and follows
   the supplied cursor. DOM scrolling is the fallback. Failed requests surface as
