@@ -829,7 +829,7 @@ def _search_retailer(source_id, search_id, max_items, max_links, max_price_cad,
         "type": "progress", "phase": "collecting", "processed": 0, "total": 0,
         "matches": 0, "searchId": search_id,
     })
-    catalogue = search_catalogue(source_id, max_links, _cancel_check(search_id))
+    catalogue = search_catalogue(source_id, max_links, _cancel_check(search_id), max_price_cad)
     with contextlib.closing(catalogue):
         total = next(catalogue)
         yield _sse({"type": "meta", "links": total, "seller": seller, "searchId": search_id})

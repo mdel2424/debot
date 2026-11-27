@@ -75,11 +75,107 @@ class RetailParseTest(unittest.TestCase):
         item = retail.parse_product(retail.RETAILERS["wildrose"], url, body)
         self.assertEqual((item["p2p"], item["length"]), (20.75, 27))
 
+    def test_wildrose_omitted_quote_inherits_sibling_unit(self):
+        store = retail.RETAILERS["wildrose"]
+        url, body = make_product(
+            "wildrose",
+            "Measurements:\nPit to Pit - 20”\nLength (Top of Shoulder to Bottom) - 25.25\nFits like: M",
+        )
+        item = retail.parse_product(store, url, body)
+        self.assertEqual((item["p2p"], item["length"]), (20, 25.25))
+
+        url2, body2 = make_product(
+            "wildrose",
+            "Measurements:\nPit to Pit - 17\nLength (Top of Shoulder to Bottom) - 26.50”\nFits like: S",
+        )
+        item2 = retail.parse_product(store, url2, body2)
+        self.assertEqual((item2["p2p"], item2["length"]), (17, 26.5))
+
+        url3, body3 = make_product(
+            "wildrose",
+            'Full length 100% cotton. Pit to Pit - 21". Length (Top of Shoulder to Bottom) - 27".',
+        )
+        item3 = retail.parse_product(store, url3, body3)
+        self.assertEqual((item3["p2p"], item3["length"]), (21, 27))
+
+        url4, body4 = make_product("wildrose", "Pit to Pit - 21\nLength - 27")
+        self.assertIsNone(retail.parse_product(store, url4, body4))
+
     def test_la_penderie_uses_listed_metric_measurements(self):
         url, body = make_product("la-penderie", '<p>Aisselle à aisselle : 53 cm</p><p>Longueur : 68,5 cm</p>')
         item = retail.parse_product(retail.RETAILERS["la-penderie"], url, body)
         self.assertAlmostEqual(item["p2p"], 53 / 2.54, places=3)
         self.assertAlmostEqual(item["length"], 68.5 / 2.54, places=3)
+
+    def test_la_penderie_live_chest_width_and_submit_button_availability(self):
+        store = retail.RETAILERS["la-penderie"]
+        active_btn = (
+            '<div class="mb20 product-single__description rte">'
+            '<p><strong>Size</strong>: Large</p><p>Chest: 21"<br>Sleeves: 8"<br>Length: 27"</p></div>'
+            '<button id="ProductSubmitButton-main" type="submit" name="add" class="btn pr_btn product-form__submit">'
+            '<span class="txt">Add to cart</span></button>'
+        )
+        url, body = make_product(
+            "la-penderie",
+            'Size: LargeChest: 21&quot;Sleeves: 8&quot;Length: 27&quot;100% Cotton',
+            extra_html=active_btn,
+            offers=[{"price": "6.3", "priceCurrency": "CAD", "availability": "http://schema.org/OutOfStock"}],
+        )
+        item = retail.parse_product(store, url, body)
+        self.assertEqual((item["p2p"], item["length"], item["price"]), (21, 27, 6.3))
+
+        # Truly sold-out La Penderie item with active upsell buttons below must still be rejected.
+        sold_html = (
+            '<button id="ProductSubmitButton-main" type="submit" name="add" class="btn pr_btn product-form__submit" disabled>'
+            '<span class="txt">Sold out</span></button>'
+            '<button type="submit" name="add" id="AddToCart-upsell" class="cartBtn">Add to cart</button>'
+        )
+        url_sold, body_sold = make_product(
+            "la-penderie",
+            'Size: LargeChest: 21&quot;Length: 27&quot;',
+            extra_html=sold_html,
+            offers=[{"price": "6.3", "priceCurrency": "CAD", "availability": "http://schema.org/OutOfStock"}],
+        )
+        self.assertIsNone(retail.parse_product(store, url_sold, body_sold))
+
+        # Full-chest circumference values (> 32") must still be rejected on La Penderie.
+        btn_only = (
+            '<button id="ProductSubmitButton-main" type="submit" name="add" class="btn pr_btn product-form__submit">'
+            '<span class="txt">Add to cart</span></button>'
+        )
+        url_circ, body_circ = make_product("la-penderie", 'Chest: 42" Length: 27"', extra_html=btn_only)
+        self.assertIsNone(retail.parse_product(store, url_circ, body_circ))
+
+    def test_underscore_slug_and_anchor_title_discovery(self):
+        store = retail.RETAILERS["wildrose"]
+        url = store.origin + "/products/untitled-feb1_12-56"
+        hoodie_url = store.origin + "/products/varsity-women-s-lacrosse-russell"
+        polo_url = store.origin + "/products/sunice-navy-polo-shirt"
+        self.assertEqual(retail._product_url(store, "/products/untitled-feb1_12-56"), url)
+        candidates = {}
+        retail._add_candidates(
+            store,
+            [
+                ("/products/untitled-feb1_12-56", "Vintage 90s Disney Blue Tee Shirt", 15.0),
+                ("/products/varsity-women-s-lacrosse-russell", "Vintage Pullover Hoodie", 32.0),
+                ("/products/sunice-navy-polo-shirt", "Navy Polo Shirt - Men", 22.5),
+                ("/products/vintage-1983-levi-s-orange-tab-dark-wash-jeans", "Dark Wash Jeans", 25.0),
+                ("/products/graphic-t-shirt", "Bundle of T-shirts", 10.0),
+                ("/products/rw-co-men-s-slim-fit-miles-2-piece-black-suit-34-m", "2-Piece Black Suit", 30.0),
+            ],
+            candidates,
+            10,
+        )
+        self.assertEqual(candidates, {url: 15.0, hoodie_url: 32.0, polo_url: 22.5})
+        parsed_url, html = make_product(
+            "wildrose",
+            'Pit to Pit - 21”\nLength (Top of Shoulder to Bottom) - 27”',
+            slug="untitled-feb1_12-56",
+            name="Vintage 90s Disney Blue Tee Shirt",
+            offers={"price": "15.00", "priceCurrency": "CAD", "availability": "http://schema.org/InStock"},
+        )
+        item = retail.parse_product(store, parsed_url, html)
+        self.assertEqual((item["url"], item["p2p"], item["length"], item["price"]), (url, 21, 27, 15.0))
 
     def test_peoples_thrift_uses_size_section_and_actual_sale_price(self):
         url, body = make_product(
@@ -319,6 +415,136 @@ class RetailCatalogueTest(unittest.TestCase):
         for number, slug in enumerate(slugs[1:], 2):
             routes[f"{store.catalogue}?page={number}"] = (200, card(slug))
         return routes
+
+    @unittest.skipUnless(os.getenv("DEBOT_PLAYWRIGHT_TESTS") == "1", "Enable Firefox fixture tests.")
+    def test_shopify_scrollerpro_deduplicates_fetches_and_skips_recrawling_next_link(self):
+        routes = {}
+        with serve_catalogue(routes) as (origin, requested):
+            store = replace(retail.RETAILERS["wildrose"], origin=origin)
+            with mock.patch.dict(retail.RETAILERS, {"wildrose": store}), \
+                    mock.patch.dict("os.environ", {"DEBOT_AUTHORIZED_RETAIL_SOURCES": "wildrose,la-penderie"}), \
+                    mock.patch.object(retail, "REQUEST_INTERVAL", .15):
+                routes["/robots.txt"] = (200, "User-agent: *\nAllow: /")
+                _, expensive_html = make_product(
+                    "wildrose", 'Pit to Pit - 21”\nLength (Top of Shoulder to Bottom) - 27”',
+                    slug="expensive-tee",
+                    offers={"price": "45.00", "priceCurrency": "CAD", "availability": "http://schema.org/InStock"},
+                )
+                _, sale_html = make_product(
+                    "wildrose", 'Pit to Pit - 21”\nLength (Top of Shoulder to Bottom) - 27',
+                    slug="untitled-feb1_12-56",
+                    name="Vintage 90s Blue Tee Shirt",
+                    offers={"price": "15.00", "priceCurrency": "CAD", "availability": "http://schema.org/InStock"},
+                )
+                routes["/products/expensive-tee"] = (200, expensive_html)
+                routes["/products/untitled-feb1_12-56"] = (200, sale_html)
+
+                def card(slug, title, price_html):
+                    return (
+                        f'<li class="grid__item" style="height:1200px"><div class="card-wrapper">'
+                        f'<a href="/products/{slug}">{title}</a>'
+                        f'<div class="price__container">{price_html}</div></div></li>'
+                    )
+
+                routes[store.catalogue] = (200, f"""<!doctype html>
+                    <head><link rel="next" href="/collections/all?page=2"></head>
+                    <main>
+                      <ul class="product-grid">{card("expensive-tee", "Expensive Tee Shirt", "$45.00 CAD")}</ul>
+                      <div class="pagination-wrapper" style="display:none"><a href="/collections/all?page=2">2</a></div>
+                    </main>
+                    <script>
+                      const grid = document.querySelector('.product-grid');
+                      const pag = document.querySelector('.pagination-wrapper');
+                      let page = 1, loading = false, done = false;
+                      async function probe(n) {{
+                        const r = await fetch('/collections/all?page=' + n);
+                        const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+                        return doc.querySelectorAll('.product-grid > .grid__item').length;
+                      }}
+                      async function append(n) {{
+                        const r = await fetch('/collections/all?page=' + n);
+                        const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+                        doc.querySelectorAll('.product-grid > .grid__item').forEach(el => grid.appendChild(el.cloneNode(true)));
+                      }}
+                      window.addEventListener('scroll', async () => {{
+                        if (loading || done) return;
+                        if (grid.getBoundingClientRect().bottom - window.innerHeight > 30) return;
+                        loading = true;
+                        const loader = document.createElement('div');
+                        loader.className = 'custom-loader';
+                        pag.appendChild(loader);
+                        try {{
+                          const count = await probe(page + 1);
+                          if (count > 0) {{
+                            page += 1;
+                            await append(page);
+                          }} else {{
+                            done = true;
+                          }}
+                        }} finally {{
+                          loader.remove();
+                          loading = false;
+                        }}
+                      }});
+                    </script>""")
+                routes[store.catalogue + "?page=2"] = (
+                    200,
+                    f'<ul class="product-grid">{card("vintage-dark-wash-jeans", "Dark Wash Jeans", "$40.00 CAD")}</ul>',
+                )
+                routes[store.catalogue + "?page=3"] = (
+                    200,
+                    f'<ul class="product-grid">{card("untitled-feb1_12-56", "Vintage 90s Blue Tee Shirt", "<s>$38.00 CAD</s><span>$15.00 CAD</span>")}</ul>',
+                )
+                routes[store.catalogue + "?page=4"] = (200, '<ul class="product-grid"></ul>')
+                events = self.search_events("wildrose", timeout=20)
+        self.assert_last_listing_matched(events, store.origin + "/products/untitled-feb1_12-56", 2)
+        self.assertEqual(requested, [
+            "/robots.txt",
+            store.catalogue,
+            store.catalogue + "?page=2",
+            store.catalogue + "?page=3",
+            store.catalogue + "?page=4",
+            "/products/untitled-feb1_12-56",
+        ])
+
+    @unittest.skipUnless(os.getenv("DEBOT_PLAYWRIGHT_TESTS") == "1", "Enable Firefox fixture tests.")
+    def test_shopify_numbered_pagination_follows_next_when_scroll_does_not_fetch(self):
+        routes = {}
+        with serve_catalogue(routes) as (origin, requested):
+            store = replace(retail.RETAILERS["la-penderie"], origin=origin)
+            with mock.patch.dict(retail.RETAILERS, {"la-penderie": store}), \
+                    mock.patch.dict("os.environ", {"DEBOT_AUTHORIZED_RETAIL_SOURCES": "wildrose,la-penderie"}), \
+                    mock.patch.object(retail, "REQUEST_INTERVAL", .15):
+                routes["/robots.txt"] = (200, "User-agent: *\nAllow: /")
+                active_btn = (
+                    '<button id="ProductSubmitButton-p" type="submit" name="add" class="btn product-form__submit">'
+                    'Add to cart</button>'
+                )
+                _, html = make_product(
+                    "la-penderie",
+                    'Size: LargeChest: 21&quot;Length: 27&quot;',
+                    extra_html=active_btn,
+                    slug="page-two-t-shirt",
+                    offers=[{"price": "9.0", "priceCurrency": "CAD", "availability": "http://schema.org/OutOfStock"}],
+                )
+                routes[store.product_prefix + "page-two-t-shirt"] = (200, html)
+                routes[store.catalogue] = (
+                    200,
+                    f'<!doctype html><main><a href="{store.product_prefix}blue-jeans">Blue Jeans</a>'
+                    f'<div class="pagination"><a href="{store.catalogue}?page=2">2</a></div></main>',
+                )
+                routes[store.catalogue + "?page=2"] = (
+                    200,
+                    f'<!doctype html><main><a href="{store.product_prefix}page-two-t-shirt">Graphic T-shirt</a></main>',
+                )
+                events = self.search_events("la-penderie", timeout=20)
+        self.assert_last_listing_matched(events, store.origin + store.product_prefix + "page-two-t-shirt", 1)
+        self.assertEqual(requested, [
+            "/robots.txt",
+            store.catalogue,
+            store.catalogue + "?page=2",
+            store.product_prefix + "page-two-t-shirt",
+        ])
 
     @unittest.skipUnless(os.getenv("DEBOT_PLAYWRIGHT_TESTS") == "1", "Enable Firefox fixture tests.")
     def test_browser_scroll_collects_deferred_links_beyond_old_cap(self):
