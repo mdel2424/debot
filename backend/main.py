@@ -820,8 +820,40 @@ def _cached_seller_collections(payload):
     return snapshots
 
 
+def _match_retail_bottoms(listing, bottoms_measurements):
+    """Apply active bottoms measurement bounds to a parsed retailer listing."""
+    if not listing or listing.get("waist") is None:
+        return None
+    inseam = listing.get("inseam")
+    rise = listing.get("rise")
+    inseam_rise = (float(inseam) + float(rise)) if (inseam is not None and rise is not None) else None
+    if bottoms_measurements:
+        matched_any = False
+        for key, bounds in bottoms_measurements.items():
+            current_value = inseam_rise if key == "inseamRise" else listing.get(key)
+            if current_value is None:
+                continue
+            matched_any = True
+            lower = bounds.get("min")
+            upper = bounds.get("max")
+            if lower is not None and current_value < float(lower):
+                return None
+            if upper is not None and current_value > float(upper):
+                return None
+        if not matched_any:
+            return None
+    return {
+        "waist": listing.get("waist"),
+        "inseam": inseam,
+        "rise": rise,
+        "inseam_rise": inseam_rise,
+        "leg_opening": listing.get("legOpening"),
+    }
+
+
 def _search_retailer(source_id, search_id, max_items, max_links, max_price_cad,
-                     target_p2p, target_length, p2p_tol, length_tol):
+                     target_p2p, target_length, p2p_tol, length_tol,
+                     category="tops", bottoms_measurements=None):
     """Run a catalogue search through the same persistent event stream as Depop."""
     seller = f"retail:{source_id}"
     processed = matches = 0
@@ -829,21 +861,30 @@ def _search_retailer(source_id, search_id, max_items, max_links, max_price_cad,
         "type": "progress", "phase": "collecting", "processed": 0, "total": 0,
         "matches": 0, "searchId": search_id,
     })
-    catalogue = search_catalogue(source_id, max_links, _cancel_check(search_id), max_price_cad)
+    catalogue = search_catalogue(source_id, max_links, _cancel_check(search_id), max_price_cad, category)
     with contextlib.closing(catalogue):
         total = next(catalogue)
         yield _sse({"type": "meta", "links": total, "seller": seller, "searchId": search_id})
         for url, listing in catalogue:
             processed += 1
-            if (listing and (max_price_cad is None or listing["price"] <= max_price_cad)
-                    and parser.within(listing["p2p"], target_p2p, p2p_tol)
-                    and parser.within(listing["length"], target_length, length_tol)):
+            matched_payload = None
+            if listing and (max_price_cad is None or listing["price"] <= max_price_cad):
+                if category == "bottoms":
+                    dims = _match_retail_bottoms(listing, bottoms_measurements)
+                    if dims is not None:
+                        matched_payload = _build_match_payload(
+                            {**listing, "price": f'${listing["price"]:.2f} CAD', "seller": seller},
+                            **dims,
+                        )
+                elif (parser.within(listing["p2p"], target_p2p, p2p_tol)
+                        and parser.within(listing["length"], target_length, length_tol)):
+                    matched_payload = _build_match_payload(
+                        {**listing, "price": f'${listing["price"]:.2f} CAD', "seller": seller},
+                        p2p=listing["p2p"], length=listing["length"],
+                    )
+            if matched_payload is not None:
                 matches += 1
-                item = _build_match_payload(
-                    {**listing, "price": f'${listing["price"]:.2f} CAD', "seller": seller},
-                    p2p=listing["p2p"], length=listing["length"],
-                )
-                yield _sse({"type": "match", "item": {**item, "title": listing["title"]}, "searchId": search_id})
+                yield _sse({"type": "match", "item": {**matched_payload, "title": listing["title"]}, "searchId": search_id})
             else:
                 yield _sse({"type": "remove", "url": url, "searchId": search_id})
             yield _sse({
@@ -916,6 +957,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
                 yield from _search_retailer(
                     retail_source, search_id, max_items, max_links, max_price_cad,
                     target_p2p, target_length, p2p_tol, length_tol,
+                    category=category, bottoms_measurements=bottoms_measurements,
                 )
                 return
 

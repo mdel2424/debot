@@ -1,4 +1,4 @@
-"""Read-only catalogue adapters for independently measured secondhand tops."""
+"""Read-only catalogue adapters for independently measured secondhand tops and bottoms."""
 
 import json
 import math
@@ -26,18 +26,22 @@ class Retailer:
     product_prefix: str
     permission_required: bool = True
     scroll_collection: bool = False
+    bottoms_catalogues: tuple[str, ...] = ()
 
 
 RETAILERS = {
     "wildrose": Retailer(
-        "Wildrose Vintage", "https://www.wildrosevintage.ca", "/collections/all", "/products/", scroll_collection=True,
+        "Wildrose Vintage", "https://www.wildrosevintage.ca", "/collections/all", "/products/",
+        scroll_collection=True, bottoms_catalogues=("/collections/bottoms-1",),
     ),
     "la-penderie": Retailer(
         "La Penderie du Paradis", "https://lapenderieduparadis.com",
-        "/en/collections/secondhand-men-tees-sweaters-pullovers", "/en/products/", scroll_collection=True,
+        "/en/collections/secondhand-men-tees-sweaters-pullovers", "/en/products/",
+        scroll_collection=True, bottoms_catalogues=("/en/collections/secondhand-men-pants-shorts",),
     ),
     "peoples-thrift": Retailer(
-        "People's Thrift", "https://www.peoplesthrift.ca", "/category/men%E2%80%99s-tops", "/product-page/", False,
+        "People's Thrift", "https://www.peoplesthrift.ca", "/category/men%E2%80%99s-tops", "/product-page/",
+        False, bottoms_catalogues=("/category/men%E2%80%99s-casual-pants", "/category/men%E2%80%99s-shorts"),
     ),
 }
 USER_AGENT = "Debot/1.0"
@@ -68,12 +72,36 @@ NON_TOP = re.compile(
     r")\b",
     re.I,
 )
+BOTTOM = re.compile(
+    r"\b(?:"
+    r"jeans?|pants?|trousers?|shorts?|chinos?|cargos?|denims?|khakis?|slacks?|"
+    r"joggers?|sweatpants?|track[ -]?pants?|carpenter|overalls?|corduroys?|"
+    r"capris?|culottes?|leggings?|trunks?|swim[ -]?shorts?|swimsuits?|boardshorts?|"
+    r"pantalons?|bermudas?"
+    r")\b",
+    re.I,
+)
+NON_BOTTOM = re.compile(
+    r"\b(?:"
+    r"bundles?|lots? (?:de|of)|(?:packs?|sets?) of|\d+[ -]+packs?|multipack|deadstock lot|mystery|"
+    r"gift[ -]?cards?|carte[ -]?cadeau|"
+    r"(?:denim|jean|corduroy)[ -]+(?:jacket|shirt|vest|coat|trucker)|"
+    r"skirts?|jupes?|dresses?|robes?|"
+    r"[23][ -]+piece\b.*\bsuits?|suit[ -]+sets?"
+    r")\b",
+    re.I,
+)
 WIDTH_LABEL = (
     r"pit[ -]+to[ -]+pit|p2p|aisselles?\s*[àa-]\s*(?:l['’])?aisselles?|"
     r"largeur(?:\s+(?:à plat|sous (?:les )?aisselles|(?:de )?poitrine))?"
 )
 FLAT_CHEST_LABEL = r"chest|poitrine"
 LENGTH_LABEL = r"body length|length|longueur(?:\s+(?:totale|du corps|du dos))?"
+WAIST_LABEL = r"waistband|waist|tour de taille|taille(?:\s+[àa]\s+plat)?"
+INSEAM_LABEL = r"inseam|entrejambe"
+RISE_LABEL = r"front[ -]+rise|rise|fourche"
+OUTSEAM_LABEL = r"outseam|total length|length|longueur(?:\s+totale)?"
+LEG_OPENING_LABEL = r"leg[ -]+opening|hem[ -]+opening|bottom[ -]+opening|ankle[ -]+opening|ouverture(?:\s+de)?\s+jambe"
 NUMBER = r"(\d{1,3}(?:[.,]\d{1,2}|\s+[13]/[24]|[¼½¾])?)"
 UNIT = r'(cm\b|inches\b|inch\b|in\b|pouces?\b|po\b|["″”])'
 
@@ -217,7 +245,7 @@ def _schema_products(value):
         yield from _schema_products(value.get("hasVariant"))
 
 
-def _dimension(value, unit):
+def _dimension(value, unit, *, min_in=8, max_in=60):
     fractions = {"¼": .25, "½": .5, "¾": .75}
     if value[-1] in fractions:
         amount = int(value[:-1]) + fractions[value[-1]]
@@ -228,7 +256,7 @@ def _dimension(value, unit):
     else:
         amount = float(value.replace(",", "."))
     inches = amount / (2.54 if unit.lower() == "cm" else 1)
-    return round(inches, 3) if 8 <= inches <= 60 else None
+    return round(inches, 3) if min_in <= inches <= max_in else None
 
 
 def _labeled_dimension_match(text, label, *, require_unit=True):
@@ -244,13 +272,14 @@ def _labeled_dimension(text, label):
     return _dimension(value, unit) if value and unit else None
 
 
-def _measurements(store, page, product):
+def _description_and_fit(store, page, product):
     description = product.get("description", "")
     text = "".join(_Page(description).text) if isinstance(description, str) else ""
     if store.product_prefix == "/en/products/":
-        # Shopify's strip_html can concatenate block lines (e.g. "Size: LargeChest: 22\"").
+        # Shopify's strip_html can concatenate block lines (e.g. "Size: LargeChest: 22\"", "newSize: 18.5\"Rise: 10\"").
         text = re.sub(
-            r"(?<=\S)(?=(?:Chest|Length|Sleeves?|Poitrine|Longueur|Manches?)\s*:)",
+            r"(?<=\S)(?=(?:Chest|Length|Sleeves?|Waist|Size|Rise|Inseam|Outseam|Leg\s*Opening|"
+            r"Poitrine|Longueur|Manches?|Taille|Entrejambe|Fourche)\s*:)",
             "\n", text, flags=re.I,
         )
         if page.description_text:
@@ -269,7 +298,11 @@ def _measurements(store, page, product):
             heading = re.search(r"\bSIZE\s*&\s*FIT\b", visible, re.I)
             if heading:
                 fit = visible[heading.end():heading.end() + 160]
-    text += f"\n{fit}"
+    return f"{text}\n{fit}", fit
+
+
+def _measurements(store, page, product):
+    text, fit = _description_and_fit(store, page, product)
 
     w_val, w_unit = _labeled_dimension_match(text, WIDTH_LABEL, require_unit=True)
     used_flat_chest = False
@@ -307,6 +340,73 @@ def _measurements(store, page, product):
     return width, length
 
 
+def _bottoms_measurements(store, page, product):
+    text, fit = _description_and_fit(store, page, product)
+
+    w_val, w_unit = _labeled_dimension_match(text, WAIST_LABEL, require_unit=True)
+    # La Penderie translates French "Taille: 18.5\"" (laid-flat waist) to "Size: 18.5\"" with an explicit unit.
+    if w_val is None and store.product_prefix == "/en/products/":
+        w_val, w_unit = _labeled_dimension_match(text, r"size", require_unit=True)
+    i_val, i_unit = _labeled_dimension_match(text, INSEAM_LABEL, require_unit=True)
+    r_val, r_unit = _labeled_dimension_match(text, RISE_LABEL, require_unit=True)
+    o_val, o_unit = _labeled_dimension_match(text, OUTSEAM_LABEL, require_unit=True)
+    lo_val, lo_unit = _labeled_dimension_match(text, LEG_OPENING_LABEL, require_unit=True)
+
+    sibling_unit = next((u for u in (w_unit, i_unit, r_unit, o_unit, lo_unit) if u), None)
+    if sibling_unit:
+        if w_val is None:
+            w_val, _ = _labeled_dimension_match(text, WAIST_LABEL, require_unit=False)
+            if w_val is not None:
+                w_unit = sibling_unit
+        if i_val is None:
+            i_val, _ = _labeled_dimension_match(text, INSEAM_LABEL, require_unit=False)
+            if i_val is not None:
+                i_unit = sibling_unit
+        if r_val is None:
+            r_val, _ = _labeled_dimension_match(text, RISE_LABEL, require_unit=False)
+            if r_val is not None:
+                r_unit = sibling_unit
+        if o_val is None:
+            o_val, _ = _labeled_dimension_match(text, OUTSEAM_LABEL, require_unit=False)
+            if o_val is not None:
+                o_unit = sibling_unit
+        if lo_val is None:
+            lo_val, _ = _labeled_dimension_match(text, LEG_OPENING_LABEL, require_unit=False)
+            if lo_val is not None:
+                lo_unit = sibling_unit
+
+    waist = _dimension(w_val, w_unit, min_in=10, max_in=60) if w_val and w_unit else None
+    inseam = _dimension(i_val, i_unit, min_in=4, max_in=42) if i_val and i_unit else None
+    rise = _dimension(r_val, r_unit, min_in=6, max_in=20) if r_val and r_unit else None
+    outseam = _dimension(o_val, o_unit, min_in=12, max_in=54) if o_val and o_unit else None
+    leg_opening = _dimension(lo_val, lo_unit, min_in=4, max_in=16) if lo_val and lo_unit else None
+
+    if fit:
+        if inseam is None and (m := re.search(rf"{NUMBER}\s*{UNIT}\s*inseam\b", fit, re.I)):
+            inseam = _dimension(*m.groups(), min_in=4, max_in=42)
+        if rise is None and (m := re.search(rf"{NUMBER}\s*{UNIT}\s*(?:H\s+)?(?:front\s+)?rise\b", fit, re.I)):
+            rise = _dimension(*m.groups(), min_in=6, max_in=20)
+        if waist is None:
+            m = re.search(rf"{NUMBER}\s*{UNIT}\s*(?:W\s+)?waist\b", fit, re.I) or re.search(
+                rf"{NUMBER}\s*{UNIT}\s*W\b", fit, re.I,
+            )
+            if m:
+                waist = _dimension(*m.groups(), min_in=10, max_in=60)
+        if leg_opening is None and (m := re.search(rf"{NUMBER}\s*{UNIT}\s*(?:W\s+)?(?:leg\s+opening|hem)\b", fit, re.I)):
+            leg_opening = _dimension(*m.groups(), min_in=4, max_in=16)
+
+    if waist is not None and waist < 24:
+        waist = round(waist * 2, 3)
+    if waist is not None and not (20 <= waist <= 60):
+        waist = None
+    if inseam is None and rise is not None and outseam is not None:
+        derived = round(outseam - rise, 3)
+        if 4 <= derived <= 42:
+            inseam = derived
+
+    return {"waist": waist, "inseam": inseam, "rise": rise, "legOpening": leg_opening}
+
+
 def _image_url(store, value):
     if isinstance(value, list):
         return next((url for entry in value if (url := _image_url(store, entry))), None)
@@ -319,22 +419,35 @@ def _image_url(store, value):
     return None
 
 
-def parse_product(store, url, html):
-    """Require a CAD offer, an actual photo, and two unit-bearing dimensions."""
+def _category_patterns(category):
+    return (BOTTOM, NON_BOTTOM) if category == "bottoms" else (TOP, NON_TOP)
+
+
+def parse_product(store, url, html, category="tops"):
+    """Require a CAD offer, an actual photo, and listed garment dimensions."""
     page = _Page(html)
     product_found = False
+    include_re, exclude_re = _category_patterns(category)
     for product in _schema_products(page.schema):
         canonical = product.get("url")
         if canonical and _product_url(store, canonical) != url:
             continue
         product_found = True
         title = product.get("name")
-        if not isinstance(title, str) or not TOP.search(title) or NON_TOP.search(title):
+        if not isinstance(title, str) or not include_re.search(title) or exclude_re.search(title):
             continue
         image = _image_url(store, product.get("image"))
-        width, length = _measurements(store, page, product)
-        if not image or width is None or length is None:
+        if not image:
             continue
+        if category == "bottoms":
+            dims = _bottoms_measurements(store, page, product)
+            if dims["waist"] is None or (dims["inseam"] is None and dims["rise"] is None):
+                continue
+        else:
+            width, length = _measurements(store, page, product)
+            if width is None or length is None:
+                continue
+            dims = {"p2p": width, "length": length}
         offers = product.get("offers")
         for offer in offers if isinstance(offers, list) else [offers]:
             if not isinstance(offer, dict) or offer.get("priceCurrency") != "CAD":
@@ -357,7 +470,7 @@ def parse_product(store, url, html):
                         displayed = {key: float(value) for key, value in amounts}
                         if displayed["Original"] == price and 0 < displayed["Sale"] < price:
                             price = displayed["Sale"]
-                return {"url": url, "title": title, "image": image, "price": price, "p2p": width, "length": length}
+                return {"url": url, "title": title, "image": image, "price": price, **dims}
     if not product_found:
         raise RetailAccessError("retailer_unavailable", f"{store.name} did not return the expected product page.")
     return None
@@ -379,6 +492,7 @@ class _OriginState:
     catalogues: dict = field(default_factory=dict)
     products: dict = field(default_factory=dict)
     scroll_cache: tuple | None = None
+    scroll_caches: dict = field(default_factory=dict)
 
 
 _ORIGINS = {source_id: _OriginState() for source_id in RETAILERS}
@@ -450,7 +564,8 @@ def _allowed(robots, url):
     return max(matches, default=(0, True))[1]
 
 
-def _add_candidates(store, links, candidates, limit):
+def _add_candidates(store, links, candidates, limit, category="tops"):
+    include_re, exclude_re = _category_patterns(category)
     grouped = {}
     for entry in links:
         if isinstance(entry, (tuple, list)) and len(entry) >= 2:
@@ -472,7 +587,7 @@ def _add_candidates(store, links, candidates, limit):
             break
         slug = re.sub(r"[-_]+", " ", urlsplit(url).path.rsplit("/", 1)[-1])
         texts = [slug, *labels]
-        if any(TOP.search(text) for text in texts) and not any(NON_TOP.search(text) for text in texts):
+        if any(include_re.search(text) for text in texts) and not any(exclude_re.search(text) for text in texts):
             existing = candidates.get(url)
             if url not in candidates:
                 candidates[url] = best_price
@@ -480,19 +595,20 @@ def _add_candidates(store, links, candidates, limit):
                 candidates[url] = best_price
 
 
-def _next_collection_path(store, links, page_number):
+def _next_collection_path(store, links, page_number, catalogue=None):
+    base = catalogue or store.catalogue
     for link in links:
-        next_url = urlsplit(urljoin(store.origin + store.catalogue, link))
+        next_url = urlsplit(urljoin(store.origin + base, link))
         if (f"{next_url.scheme}://{next_url.netloc}" != store.origin
-                or unquote(next_url.path) != unquote(store.catalogue)):
+                or unquote(next_url.path) != unquote(base)):
             continue
         page_values = [value for key, value in parse_qsl(next_url.query, keep_blank_values=True) if key == "page"]
         if page_values == [str(page_number + 1)]:
-            return f"{store.catalogue}?{next_url.query}"
+            return f"{base}?{next_url.query}"
     return None
 
 
-def _scroll_for_links(page, store, candidates, limit, check, delay, is_fetching=lambda: False):
+def _scroll_for_links(page, store, candidates, limit, check, delay, is_fetching=lambda: False, category="tops"):
     previous = None
     stable = 0
     for _ in range(MAX_COLLECTION_SCROLLS):
@@ -524,7 +640,7 @@ def _scroll_for_links(page, store, candidates, limit, check, delay, is_fetching=
                 root.matches(busy) || !!root.querySelector(busy)];
         }""")
         busy = dom_busy or is_fetching()
-        _add_candidates(store, anchors, candidates, limit)
+        _add_candidates(store, anchors, candidates, limit, category=category)
         links = [href for href, _, _ in anchors] + next_links
         if len(candidates) >= limit:
             return links
@@ -547,10 +663,13 @@ def _scroll_for_links(page, store, candidates, limit, check, delay, is_fetching=
     raise RetailAccessError("retailer_unavailable", f"{store.name}'s collection did not finish scrolling.")
 
 
-def _browser_candidates(store, state, robots, limit, should_cancel, delay):
-    cached = state.scroll_cache
+def _browser_candidates(store, state, robots, limit, should_cancel, delay, *, category="tops", catalogue=None):
+    base = catalogue or store.catalogue
+    use_default_cache = category == "tops" and base == store.catalogue
+    cache_key = (base, category, limit)
+    cached = state.scroll_cache if use_default_cache else state.scroll_caches.get(cache_key)
     if cached and cached[0] > time.monotonic() and cached[1] == limit:
-        return cached[2]
+        return dict(cached[2])
     candidates = {}
     failure = None
     in_flight = 0
@@ -569,7 +688,7 @@ def _browser_candidates(store, state, robots, limit, should_cancel, delay):
         url = urlsplit(request.url)
         same_origin = f"{url.scheme}://{url.netloc}" == store.origin
         data_request = request.resource_type in {"document", "xhr", "fetch"}
-        collection_request = url.path.rstrip("/") == store.catalogue
+        collection_request = url.path.rstrip("/") == base
         if failure or (should_cancel and should_cancel()) or request.method != "GET":
             return route.abort()
         if not same_origin:
@@ -636,15 +755,17 @@ def _browser_candidates(store, state, robots, limit, should_cancel, delay):
             with browser.new_context(user_agent=USER_AGENT, service_workers="block") as context:
                 page = context.new_page()
                 page.route("**/*", route_request)
-                current = store.catalogue
+                current = base
                 for number in range(1, MAX_COLLECTION_PAGES + 1):
                     check()
                     response = page.goto(store.origin + current, wait_until="domcontentloaded", timeout=20000)
                     check()
                     if not response or unquote(page.url) != unquote(store.origin + current):
                         raise RetailAccessError("retailer_unavailable", f"{store.name} did not return the expected collection.")
-                    links = _scroll_for_links(page, store, candidates, limit, check, delay, lambda: in_flight > 0)
-                    next_path = _next_collection_path(store, links, number)
+                    links = _scroll_for_links(
+                        page, store, candidates, limit, check, delay, lambda: in_flight > 0, category=category,
+                    )
+                    next_path = _next_collection_path(store, links, number, catalogue=base)
                     if (len(candidates) >= limit
                             or next_path is None
                             or next_path in fetched_paths
@@ -656,15 +777,22 @@ def _browser_candidates(store, state, robots, limit, should_cancel, delay):
     except PlaywrightError as exc:
         check()
         raise RetailAccessError("retailer_unavailable", f"Could not load {store.name}'s collection in Firefox.") from exc
-    state.scroll_cache = (time.monotonic() + CATALOGUE_TTL, limit, candidates)
+    cache_entry = (time.monotonic() + CATALOGUE_TTL, limit, dict(candidates))
+    if use_default_cache:
+        state.scroll_cache = cache_entry
+    else:
+        state.scroll_caches[cache_key] = cache_entry
     return candidates
 
 
-def search_catalogue(source_id, max_links, should_cancel, max_price_cad=None):
+def search_catalogue(source_id, max_links, should_cancel, max_price_cad=None, category="tops"):
     """Yield a candidate count followed by (url, parsed listing or None) pairs."""
     store = RETAILERS[source_id]
     if not source_enabled(source_id):
         raise RetailAccessError("retailer_permission_required", f"{store.name} requires permission for automated access.")
+    catalogues = store.bottoms_catalogues if category == "bottoms" else (store.catalogue,)
+    if not catalogues:
+        raise RetailAccessError("retailer_unavailable", f"{store.name} does not have a configured {category} catalogue.")
     state = _ORIGINS[source_id]
     while not state.lock.acquire(timeout=0.1):
         raise_if_cancelled(should_cancel)
@@ -688,26 +816,41 @@ def search_catalogue(source_id, max_links, should_cancel, max_price_cad=None):
             validate_path(path)
             return _read(store, state, path, should_cancel, delay)
 
-        if store.scroll_collection:
-            validate_path(store.catalogue)
-            candidates = _browser_candidates(store, state, robots, max_links, should_cancel, delay)
-        else:
-            candidates = {}
-            current = store.catalogue
-            for number in range(1, MAX_COLLECTION_PAGES + 1):
-                parsed_page = _Page(read(current))
-                _add_candidates(store, parsed_page.link_entries, candidates, max_links)
-                current = _next_collection_path(store, parsed_page.links, number)
-                if len(candidates) >= max_links or current is None:
-                    break
+        candidates = {}
+        for base in catalogues:
+            if len(candidates) >= max_links:
+                break
+            remaining = max_links - len(candidates)
+            if store.scroll_collection:
+                validate_path(base)
+                found = _browser_candidates(
+                    store, state, robots, remaining, should_cancel, delay, category=category, catalogue=base,
+                )
+                for url, card_price in found.items():
+                    if url not in candidates and len(candidates) >= max_links:
+                        break
+                    existing = candidates.get(url)
+                    if url not in candidates:
+                        candidates[url] = card_price
+                    elif card_price is not None and (existing is None or card_price < existing):
+                        candidates[url] = card_price
             else:
-                raise RetailAccessError("retailer_unavailable", f"{store.name}'s collection exceeded the page limit.")
+                current = base
+                for number in range(1, MAX_COLLECTION_PAGES + 1):
+                    parsed_page = _Page(read(current))
+                    _add_candidates(store, parsed_page.link_entries, candidates, max_links, category=category)
+                    current = _next_collection_path(store, parsed_page.links, number, catalogue=base)
+                    if len(candidates) >= max_links or current is None:
+                        break
+                else:
+                    raise RetailAccessError("retailer_unavailable", f"{store.name}'s collection exceeded the page limit.")
         yield len(candidates)
         for url, card_price in candidates.items():
             raise_if_cancelled(should_cancel)
             path = urlsplit(url).path
             validate_path(path)
-            cached = state.products.get(url)
+            cache_key = url if category == "tops" else (category, url)
+            cached = state.products.get(cache_key)
             if cached and cached[0] > time.monotonic():
                 yield url, cached[1]
                 continue
@@ -715,10 +858,10 @@ def search_catalogue(source_id, max_links, should_cancel, max_price_cad=None):
                 yield url, None
                 continue
             html = _read(store, state, path, should_cancel, delay)
-            item = parse_product(store, url, html) if html else None
-            if len(state.products) >= MAX_CACHED_PRODUCTS and url not in state.products:
+            item = parse_product(store, url, html, category=category) if html else None
+            if len(state.products) >= MAX_CACHED_PRODUCTS and cache_key not in state.products:
                 state.products.pop(next(iter(state.products)))
-            state.products[url] = (time.monotonic() + CATALOGUE_TTL, item)
+            state.products[cache_key] = (time.monotonic() + CATALOGUE_TTL, item)
             yield url, item
     finally:
         state.lock.release()

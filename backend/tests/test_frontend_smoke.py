@@ -63,12 +63,20 @@ class FrontendSmokeTest(unittest.TestCase):
                 depop_routes.append(route)
                 return
             searches.append(payload)
-            route.fulfill(content_type="text/event-stream", body="".join(map(self.event, [
-                {"type": "match", "item": {
+            if payload.get("category") == "bottoms":
+                item = {
+                    "url": "https://www.peoplesthrift.ca/product-page/fixture-pants",
+                    "seller": "retail:peoples-thrift", "title": "Measured cotton pants",
+                    "waist": 34, "inseam": 32, "rise": 11.5, "inseamRise": 43.5, "price": "$24.00 CAD",
+                }
+            else:
+                item = {
                     "url": "https://www.peoplesthrift.ca/product-page/fixture",
                     "seller": "retail:peoples-thrift", "title": "Measured graphic T-shirt",
                     "p2p": 21, "length": 27, "price": "$15.00 CAD",
-                }},
+                }
+            route.fulfill(content_type="text/event-stream", body="".join(map(self.event, [
+                {"type": "match", "item": item},
                 {"type": "done", "processed": 1, "total": 1, "matches": 1},
             ])))
 
@@ -105,6 +113,28 @@ class FrontendSmokeTest(unittest.TestCase):
         expect(self.page.get_by_role("link", name="Fixture One")).to_be_visible()
         expect(self.page.get_by_text("Measured graphic T-shirt", exact=True)).to_be_visible()
         self.page.get_by_role("button", name="Bottoms", exact=True).click()
+        expect(self.page.locator(".seller-name")).to_have_text([*RETAILER_NAMES, "Fixture One", "Fixture Two"])
+        expect(self.page.get_by_role("link", name="Wildrose Vintage", exact=True)).to_have_attribute(
+            "href", "https://www.wildrosevintage.ca/collections/bottoms-1",
+        )
+        expect(self.page.get_by_role("link", name="La Penderie du Paradis", exact=True)).to_have_attribute(
+            "href", "https://lapenderieduparadis.com/en/collections/secondhand-men-pants-shorts",
+        )
+        expect(self.page.get_by_role("link", name="People's Thrift", exact=True)).to_have_attribute(
+            "href", "https://www.peoplesthrift.ca/category/men%E2%80%99s-casual-pants",
+        )
+        self.search_seller("People's Thrift").click()
+        expect(self.page.get_by_text("Measured cotton pants", exact=True)).to_be_visible()
+        self.page.wait_for_function("""
+            JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1'))?.bottoms.retailerRows
+                ?.some(row => row.seller === 'retail:peoples-thrift' && row.processed && row.results.length === 1)
+        """)
+        self.assertEqual(len(searches), 2)
+        self.assertEqual((searches[1]["retailSource"], searches[1]["category"], searches[1]["groups"]),
+                         ("peoples-thrift", "bottoms", "bottoms"))
+        self.assertEqual(searches[1]["maxPriceCad"], 45)
+        self.assertIn("waist", searches[1]["bottomsMeasurements"])
+        self.page.get_by_role("button", name="Footwear", exact=True).click()
         expect(self.page.locator(".seller-name")).to_have_text(["Fixture One", "Fixture Two"])
         self.assertEqual(self.errors, [])
 
@@ -241,7 +271,7 @@ class FrontendSmokeTest(unittest.TestCase):
         expect(price).to_have_value('35')
         self.page.get_by_role('button', name='Bottoms', exact=True).click()
         expect(price).to_have_value('45')
-        search = self.page.get_by_role('button', name='Search', exact=True).first
+        search = self.search_seller()
         price.fill('-1')
         expect(search).to_be_disabled()
         expect(self.page.get_by_role('button', name='Search All Sellers')).to_be_disabled()
@@ -332,7 +362,7 @@ class FrontendSmokeTest(unittest.TestCase):
             expect(self.page.get_by_role('textbox', name=field)).to_have_value(value)
         expect(self.page.get_by_text('$25', exact=True)).to_be_visible()
         self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).bottoms.sellerRows[0].processed")
-        self.page.get_by_role('button', name='Search', exact=True).first.click()
+        self.search_seller().click()
         cards = self.page.locator('.result-card')
         expect(cards).to_have_count(2)
         self.assertEqual(len(searches), 2)

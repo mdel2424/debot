@@ -33,9 +33,10 @@ A production frontend needs an `/api` reverse proxy or an explicit API base.
 ## Search Behavior
 
 - Wildrose Vintage, La Penderie du Paradis, and People's Thrift appear first in
-  **Tops** and are included in **Search All Sellers**. People's Thrift follows the
-  numbered Men's Tops pages; the other two stores use paced scrolling in Firefox.
-  Searches check up to 1,000 tops per store for both listed measurements, an
+  **Tops** and **Bottoms** and are included in **Search All Sellers**. People's
+  Thrift follows the numbered Men's Tops, Men's Pants, and Men's Shorts pages;
+  the other two stores use paced scrolling in Firefox.
+  Searches check up to 1,000 tops or bottoms per store for listed measurements, an
   individual photo, and the same CAD price cap (before shipping and tax).
 - All three stores are enabled. Set `DEBOT_AUTHORIZED_RETAIL_SOURCES` to override
   which of `wildrose` and `la-penderie` are enabled. Retail searches still respect

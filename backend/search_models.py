@@ -67,8 +67,8 @@ class SearchRequest(SearchModel):
 
     @model_validator(mode="after")
     def validate_retail_search(self):
-        if self.retailSource and (self.seller or self.category != "tops"):
-            raise ValueError("Retailer searches support tops without a Depop seller")
+        if self.retailSource and (self.seller or self.category not in {"tops", "bottoms"}):
+            raise ValueError("Retailer searches support tops and bottoms without a Depop seller")
         return self
 
 

@@ -203,6 +203,84 @@ class RetailParseTest(unittest.TestCase):
                 url, body = make_product("wildrose", **{"description": 'Pit to pit 21" Length 27"', **changes})
                 self.assertIsNone(retail.parse_product(store, url, body))
 
+    def test_bottoms_parsers_for_all_three_stores(self):
+        wr = retail.RETAILERS["wildrose"]
+        wr_url, wr_body = make_product(
+            "wildrose",
+            "\nTag: Made In Canada 32 x 34\nMeasurments:\nWaist (Unstretched) -\xa0 30”\nInseam - 32.25",
+            slug="vintage-1983-levi-s-orange-tab-dark-wash-jeans",
+            name="Vintage 1983 Levi’s Orange Tab Dark Wash Jeans",
+            offers={"price": "42.00", "priceCurrency": "CAD", "availability": "http://schema.org/InStock"},
+        )
+        wr_item = retail.parse_product(wr, wr_url, wr_body, category="bottoms")
+        self.assertEqual(
+            (wr_item["waist"], wr_item["inseam"], wr_item["rise"], wr_item["legOpening"], wr_item["price"]),
+            (30.0, 32.25, None, None, 42.0),
+        )
+
+        lp = retail.RETAILERS["la-penderie"]
+        active_btn = (
+            '<div class="mb20 product-single__description rte">'
+            '<p>Size: 36 x 32</p><p>Size: 18.5"<br>Rise: 10"<br>Length: 42"</p></div>'
+            '<button id="ProductSubmitButton-p" type="submit" name="add" class="btn pr_btn product-form__submit">'
+            'Add to cart</button>'
+        )
+        lp_url, lp_body = make_product(
+            "la-penderie",
+            'Size: 36 x 32Condition: Like newSize: 18.5&quot;Rise: 10&quot;Length: 42&quot;',
+            extra_html=active_btn,
+            slug="simons-burgundy-straight-leg-pants",
+            name="Burgundy straight leg pants (xl) - Men",
+            offers=[{"price": "18.0", "priceCurrency": "CAD", "availability": "http://schema.org/OutOfStock"}],
+        )
+        lp_item = retail.parse_product(lp, lp_url, lp_body, category="bottoms")
+        self.assertEqual(
+            (lp_item["waist"], lp_item["inseam"], lp_item["rise"], lp_item["price"]),
+            (37.0, 32.0, 10.0, 18.0),
+        )
+
+        # Tag-only bottoms without explicit unit-bearing measurements must be rejected.
+        tag_only_btn = (
+            '<button id="ProductSubmitButton-p" type="submit" name="add" class="btn pr_btn product-form__submit">'
+            'Add to cart</button>'
+        )
+        tag_url, tag_body = make_product(
+            "la-penderie", "Size: 36 x 32 Condition: Like new", extra_html=tag_only_btn,
+            slug="tag-only-jeans", name="Blue straight leg jeans",
+        )
+        self.assertIsNone(retail.parse_product(lp, tag_url, tag_body, category="bottoms"))
+
+        pt = retail.RETAILERS["peoples-thrift"]
+        pt_url, pt_body = make_product(
+            "peoples-thrift", "RW & Co. Men's Grey Pants",
+            '<div class="wixui-product-prices-wrapper"><div>Original price<p>$29.99</p></div>'
+            '<div>Sale price<p>$24.00</p></div></div>'
+            '<h2>SIZE &amp; FIT</h2><p>42" L, 32" inseam, 10" H rise, 17.5" W waist. Tagged 33 x 32.</p>',
+            slug="rw-co-men-s-grey-pants-34",
+            name="RW & Co. Men's Grey Pants (34)",
+            offers={"price": "29.99", "priceCurrency": "CAD", "availability": "https://schema.org/InStock"},
+        )
+        pt_item = retail.parse_product(pt, pt_url, pt_body, category="bottoms")
+        self.assertEqual(
+            (pt_item["waist"], pt_item["inseam"], pt_item["rise"], pt_item["price"]),
+            (35.0, 32.0, 10.0, 24.0),
+        )
+
+        pt_short_url, pt_short_body = make_product(
+            "peoples-thrift", "Shorts",
+            '<h2>SIZE &amp; FIT</h2><p>16" W, 19.5" L, 9" inseam. 98% Cotton.</p>',
+            slug="abercrombie-men-s-shorts-m",
+            name="Abercrombie Men's Brown Shorts (M)",
+        )
+        pt_short = retail.parse_product(pt, pt_short_url, pt_short_body, category="bottoms")
+        self.assertEqual((pt_short["waist"], pt_short["inseam"], pt_short["rise"]), (32.0, 9.0, None))
+
+        # Denim jackets and bundles must not be treated as bottoms.
+        dj_url, dj_body = make_product(
+            "wildrose", 'Waist - 34” Inseam - 32”', slug="vintage-denim-jacket", name="Vintage 90s Denim Jacket",
+        )
+        self.assertIsNone(retail.parse_product(wr, dj_url, dj_body, category="bottoms"))
+
     def test_non_product_html_is_an_error_not_a_sold_listing(self):
         store = retail.RETAILERS["peoples-thrift"]
         with self.assertRaises(retail.RetailAccessError):
@@ -610,14 +688,90 @@ class RetailCatalogueTest(unittest.TestCase):
 
 
 class RetailSearchJobTest(unittest.TestCase):
+    def test_peoples_thrift_bottoms_walks_pants_and_shorts_collections(self):
+        store = retail.RETAILERS["peoples-thrift"]
+        pants_url, pants_body = make_product(
+            "peoples-thrift", extra_html='<h2>SIZE &amp; FIT</h2><p>41" L, 32" inseam, 11.5" H rise, 17" W waist.</p>',
+            slug="men-s-cotton-pants-34", name="Men's Cotton Pants (34)",
+        )
+        shorts_url, shorts_body = make_product(
+            "peoples-thrift", extra_html='<h2>SIZE &amp; FIT</h2><p>16.5" W, 19.5" L, 9" inseam.</p>',
+            slug="men-s-khaki-shorts-33", name="Men's Khaki Shorts (33)",
+        )
+        pants_base, shorts_base = store.bottoms_catalogues
+        with mock.patch.object(retail, "_read", side_effect=[
+            "User-agent: *\nAllow: /",
+            f'<a href="{pants_base}?page=2">2</a><a href="/product-page/blue-t-shirt">T-Shirt</a>',
+            f'<a href="{pants_url}">Cotton Pants</a>',
+            f'<a href="{shorts_url}">Khaki Shorts</a>',
+            pants_body,
+            shorts_body,
+        ]) as read:
+            count, first, second = list(retail.search_catalogue("peoples-thrift", 10, None, category="bottoms"))
+        self.assertEqual(count, 2)
+        self.assertEqual((first[0], first[1]["waist"], first[1]["inseam"], first[1]["rise"]), (pants_url, 34.0, 32.0, 11.5))
+        self.assertEqual((second[0], second[1]["waist"], second[1]["inseam"]), (shorts_url, 33.0, 9.0))
+        self.assertEqual(
+            [call.args[2] for call in read.call_args_list[1:4]],
+            [pants_base, f"{pants_base}?page=2", shorts_base],
+        )
+
     def test_retail_source_is_validated(self):
+        validated = validate_search_payload({
+            "retailSource": "peoples-thrift",
+            "category": "bottoms",
+            "bottomsMeasurements": {"waist": {"min": 32, "max": 36}, "inseam": {"min": 31, "max": 33}},
+        })
+        self.assertEqual((validated["retailSource"], validated["category"]), ("peoples-thrift", "bottoms"))
         for payload in (
             {"retailSource": "https://example.com"},
             {"retailSource": "peoples-thrift", "seller": "sample"},
-            {"retailSource": "peoples-thrift", "category": "bottoms"},
+            {"retailSource": "peoples-thrift", "category": "footwear"},
         ):
             with self.subTest(payload=payload), self.assertRaises(HTTPException):
                 validate_search_payload(payload)
+
+    def test_retail_bottoms_job_filters_by_measurements_and_price(self):
+        rows = [
+            ("wildrose-fit", {"title": "Vintage Jeans", "waist": 34.0, "inseam": 32.0, "rise": None, "legOpening": None, "price": 35.0}),
+            ("full-fit", {"title": "Cotton Pants", "waist": 34.0, "inseam": 32.0, "rise": 11.5, "legOpening": None, "price": 24.0}),
+            ("low-rise", {"title": "Low Rise Pants", "waist": 34.0, "inseam": 32.0, "rise": 10.0, "legOpening": None, "price": 24.0}),
+            ("too-expensive", {"title": "Pricey Jeans", "waist": 34.0, "inseam": 32.0, "rise": 11.5, "legOpening": None, "price": 46.0}),
+            ("unmeasured", None),
+        ]
+
+        def catalogue(*_):
+            yield len(rows)
+            for slug, product in rows:
+                url = f"https://www.peoplesthrift.ca/product-page/{slug}"
+                yield url, {**product, "url": url} if product else None
+
+        payload = {
+            "searchId": uuid4().hex, "retailSource": "peoples-thrift", "category": "bottoms",
+            "bottomsMeasurements": {
+                "waist": {"min": 32, "max": 36},
+                "inseam": {"min": 31, "max": 33},
+                "rise": {"min": 11, "max": 13},
+                "legOpening": {"min": 9.5, "max": 10.5},
+            },
+            "maxPriceCad": 45,
+        }
+        with mock.patch.object(main, "search_catalogue", catalogue):
+            job = main._ensure_search_job(payload)
+            until = time.monotonic() + 2
+            while not job.complete and time.monotonic() < until:
+                time.sleep(.01)
+            self.assertTrue(job.complete)
+        events = [json.loads(event.removeprefix(b"data: ")) for event in job.read_from(0)[0]]
+        matches = [event["item"] for event in events if event["type"] == "match"]
+        self.assertEqual(
+            [(item["title"], item["waist"], item["inseam"], item["rise"], item["inseamRise"], item["price"]) for item in matches],
+            [
+                ("Vintage Jeans", 34.0, 32.0, None, None, "$35.00 CAD"),
+                ("Cotton Pants", 34.0, 32.0, 11.5, 43.5, "$24.00 CAD"),
+            ],
+        )
+        self.assertEqual((events[-1]["type"], events[-1]["processed"], events[-1]["matches"]), ("done", 5, 2))
 
     def test_retail_job_bypasses_depop_cooldown_and_applies_fit_and_price(self):
         base = {"title": "Graphic T-Shirt", "p2p": 21, "length": 27, "price": 15}

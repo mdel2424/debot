@@ -21,7 +21,7 @@ import {
   getDefaultPageFilters,
   isCategoryPageId,
 } from './data/categoryPages';
-import { RETAIL_ACCOUNTS, RETAIL_BY_USERNAME } from './data/retailSources';
+import { RETAIL_ACCOUNTS, RETAIL_BY_USERNAME, RETAIL_CATEGORIES } from './data/retailSources';
 import './App.css';
 import './index.css';
 
@@ -274,7 +274,7 @@ const buildPageWorkspaces = (accounts, existingWorkspaces = {}) =>
       page.id,
       {
         sellerRows: buildSellerRows(
-          page.id === 'tops' ? [...RETAIL_ACCOUNTS, ...accounts] : accounts,
+          RETAIL_CATEGORIES.has(page.id) ? [...RETAIL_ACCOUNTS, ...accounts] : accounts,
           existingWorkspaces[page.id]?.sellerRows || [],
         ),
       },
@@ -298,7 +298,7 @@ const readStoredPageWorkspaces = (accounts) => {
         const rows = Array.isArray(parsed[page.id]?.sellerRows)
           ? parsed[page.id].sellerRows
           : [];
-        const retailerRows = page.id === 'tops' && Array.isArray(parsed[page.id]?.retailerRows)
+        const retailerRows = RETAIL_CATEGORIES.has(page.id) && Array.isArray(parsed[page.id]?.retailerRows)
           ? parsed[page.id].retailerRows
           : [];
         return [
@@ -346,7 +346,7 @@ const serializePageWorkspaces = (workspaces) => JSON.stringify(
       }));
       return [page.id, {
         sellerRows: rows.filter((row) => !RETAIL_BY_USERNAME.has(row.seller)),
-        ...(page.id === 'tops' ? { retailerRows: rows.filter((row) => RETAIL_BY_USERNAME.has(row.seller)) } : {}),
+        ...(RETAIL_CATEGORIES.has(page.id) ? { retailerRows: rows.filter((row) => RETAIL_BY_USERNAME.has(row.seller)) } : {}),
       }];
     })
   )
@@ -605,7 +605,7 @@ const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
   const retailer = RETAIL_BY_USERNAME.get(sellerUsername);
   const payload = {
     category: page.id,
-    ...(retailer ? { retailSource: retailer.id, groups: 'tops' } : { seller: sellerUsername, groups: page.group }),
+    ...(retailer ? { retailSource: retailer.id, groups: page.id } : { seller: sellerUsername, groups: page.group }),
     gender: 'male',
     maxItems: 40,
     maxLinks: 1000,
@@ -791,7 +791,7 @@ function App() {
   const sellerAccountsSnapshot = JSON.stringify(sellerAccounts);
   const pageFiltersSnapshot = JSON.stringify(pageFilters);
   const activePage = CATEGORY_PAGE_MAP[activePageId] || CATEGORY_PAGE_MAP[DEFAULT_CATEGORY_PAGE_ID];
-  const hasRetailers = activePage.id === 'tops';
+  const hasRetailers = RETAIL_CATEGORIES.has(activePage.id);
   const hasFitGuide = activePage.id === 'tops' || activePage.id === 'bottoms';
   const sellerRows = pageWorkspaces[activePage.id]?.sellerRows || [];
   const currentFilters = pageFilters[activePage.id] || getDefaultPageFilters(activePage.id);
@@ -1920,7 +1920,7 @@ function App() {
                       <div className="seller-header">
                     <div className="seller-info">
                       <a
-                        href={retailer?.url || buildSellerPageHref(sellerRow.seller, activePage)}
+                        href={(retailer?.urls?.[activePage.id] || retailer?.url) || buildSellerPageHref(sellerRow.seller, activePage)}
                         target="_blank"
                         rel="noreferrer"
                         className="seller-name"
