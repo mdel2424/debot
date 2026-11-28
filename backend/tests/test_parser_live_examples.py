@@ -146,6 +146,62 @@ class ParserLiveExamplesTest(unittest.TestCase):
                 ),
                 "expected": (22.0, 28.0),
             },
+            {
+                "name": "sleeve length does not shadow garment length",
+                "description": (
+                    "• Measurements\n"
+                    "‣ Chest: 22 in\n"
+                    "‣ Sleeve Length: 7 in\n"
+                    "‣ Shoulders: 17 in\n"
+                    "‣ Length: 24 in\n"
+                    "‣ Hem: 24 in\n"
+                ),
+                "expected": (22.0, 24.0),
+            },
+            {
+                "name": "sleeve from pit does not shadow pit to pit",
+                "description": (
+                    "sleeve from pit: 5\"\n"
+                    "p2p: 20\"\n"
+                    "front length (from neckline): 26\"\n"
+                ),
+                "expected": (20.0, 26.0),
+            },
+            {
+                "name": "inline number-before-label separated by word by",
+                "description": (
+                    "Y2K Aeropostale Striped Polo Shirt\n"
+                    "Size L 20 pit to pit by 27 length\n"
+                    "Bleach stain by the logo"
+                ),
+                "expected": (20.0, 27.0),
+            },
+            {
+                "name": "inline number-before-label separated by x",
+                "description": (
+                    "Vintage 90s Guess USA Varsity Spellout Crewneck Sweatshirt\n"
+                    "21\u201d chest x 24\u201d length\n"
+                    "Flaws shown"
+                ),
+                "expected": (21.0, 24.0),
+            },
+            {
+                "name": "pair followed by parenthetical pit to pit and length legend",
+                "description": (
+                    "Vintage Y2K Hollister Faux Fur Lined Zip Hoodie\n"
+                    "22\u201d x 25\u201d inches (pit to pit and length)"
+                ),
+                "expected": (22.0, 25.0),
+            },
+            {
+                "name": "trailing length keyword does not steal claimed p2p number",
+                "description": (
+                    "Grey hoodie with a relaxed fit\n"
+                    "P2P 22 inches Length\n"
+                    "Length 24 inches"
+                ),
+                "expected": (22.0, 24.0),
+            },
         ]
 
         for case in cases:
@@ -327,6 +383,44 @@ class ParserLiveExamplesTest(unittest.TestCase):
                 ),
                 "expected": {"waist": 34.0, "inseam": 30.5, "rise": 12.5, "legOpening": 9.5},
             },
+            {
+                "name": "wide leg 90s title does not produce bogus leg opening",
+                "description": (
+                    "Vintage Karl Kani Jeans Mens 32 Blue Wide Leg Baggy 90s Y2K Hip Hop\n"
+                    "Measurements:\n"
+                    "• Waist: 32\"\n"
+                    "• Inseam: 30\""
+                ),
+                "expected": {"waist": 32.0, "inseam": 30.0},
+                "expected_none": ("legOpening",),
+            },
+            {
+                "name": "bare opening label on bottoms measurement line",
+                "description": (
+                    "*FLAT MEASUREMENTS*\n"
+                    "Waist: 14\u201d\n"
+                    "Rise: 12.5\u201d\n"
+                    "Inseam: 31\u201d\n"
+                    "Opening: 8\u201d"
+                ),
+                "expected": {"waist": 28.0, "inseam": 31.0, "rise": 12.5, "legOpening": 8.0},
+            },
+            {
+                "name": "inline x-separated parenthetical bottoms measurements",
+                "description": (
+                    "Vintage 90s Wrangler Workwear Carpenter Canvas Jorts Baggy Wide Leg 36W\n"
+                    "33\u201dW x 12\u201d (leg opening) x 21 x 7.5\u201d (inseam)"
+                ),
+                "expected": {"waist": 33.0, "inseam": 7.5, "legOpening": 12.0},
+            },
+            {
+                "name": "inline x-separated waist inseam leg opening",
+                "description": (
+                    "Stone Island Type RE-T Washed Black Denim Jeans W36 L34\n"
+                    "36\u201dW x 26\u201d (inseam) x 7\u201d (leg opening)"
+                ),
+                "expected": {"waist": 36.0, "inseam": 26.0, "legOpening": 7.0},
+            },
         ]
 
         for case in cases:
@@ -335,6 +429,8 @@ class ParserLiveExamplesTest(unittest.TestCase):
                 for key, expected_value in case["expected"].items():
                     self.assertIsNotNone(measurements.get(key))
                     self.assertAlmostEqual(measurements[key], expected_value)
+                for key in case.get("expected_none", ()):
+                    self.assertIsNone(measurements.get(key))
 
 
 if __name__ == "__main__":

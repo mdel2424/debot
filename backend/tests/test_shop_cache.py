@@ -148,6 +148,50 @@ class ShopCacheTest(unittest.TestCase):
         cache.get('old-scope', max_links=100)
         self.assertEqual(cache.find_listing(url)['price'], '$35')
 
+    def test_list_snapshots_returns_todays_cached_shops_without_leaking_references(self):
+        day = ['2026-11-27']
+        cache = ShopCache(ttl_seconds=86400, day_key=lambda: day[0])
+        snap = self.snapshot(2)
+        cache.put('https://www.depop.com/sample/?groups=tops&gender=male', snap)
+        listed = cache.list_snapshots()
+        self.assertEqual(len(listed), 1)
+        key, restored = listed[0]
+        self.assertIn('sample', key)
+        self.assertTrue(restored.fresh)
+        self.assertEqual(len(restored.links), 2)
+        day[0] = '2026-11-28'
+        self.assertEqual(cache.list_snapshots(), [])
+
+    def test_retail_daily_cache_persists_for_same_day_and_expires_at_midnight(self):
+        from retail_sources import RetailDailyCache
+
+        day = ['2026-11-27']
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / 'retail.sqlite3'
+            store = RetailDailyCache(path=cache_path, day_key=lambda: day[0])
+            store.put('wildrose', 'tops', {
+                'origin': 'https://www.wildrosevintage.ca',
+                'source_id': 'wildrose',
+                'category': 'tops',
+                'candidates': {'https://www.wildrosevintage.ca/products/tee': 25.0},
+                'products': {
+                    'https://www.wildrosevintage.ca/products/tee': {
+                        'url': 'https://www.wildrosevintage.ca/products/tee',
+                        'title': 'Vintage Tee', 'price': 25.0, 'p2p': 21.0, 'length': 27.0,
+                    },
+                },
+                'scanned_max_price_cad': 35.0,
+                'complete': True,
+            })
+            reopened = RetailDailyCache(path=cache_path, day_key=lambda: day[0])
+            loaded = reopened.get('wildrose', 'tops', expected_origin='https://www.wildrosevintage.ca')
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded['scanned_max_price_cad'], 35.0)
+            self.assertEqual(len(reopened.list_for_category('tops')), 1)
+            day[0] = '2026-11-28'
+            self.assertIsNone(reopened.get('wildrose', 'tops'))
+            self.assertEqual(reopened.list_for_category('tops'), {})
+
 
 if __name__ == '__main__':
     unittest.main()

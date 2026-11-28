@@ -10,6 +10,16 @@ export async function loadRetailSources(signal) {
   return response.json();
 }
 
+export async function loadDailyCache(category, signal) {
+  const params = new URLSearchParams({ category: category || 'tops' });
+  const response = await fetch(`${API_BASE}/api/cache/daily?${params.toString()}`, {
+    signal,
+    cache: 'no-store',
+  });
+  if (!response.ok) return null;
+  return response.json();
+}
+
 /**
  * Generate a unique search ID
  */
@@ -110,6 +120,11 @@ const dispatchSearchEvent = (evt, callbacks) => {
         processed: evt.processed, total: evt.total, error: evt.error,
       });
       return false;
+    case 'catalog':
+      if (evt.item) {
+        callbacks.onCatalogItem?.(evt);
+      }
+      return false;
     case 'match':
       if (evt.item) {
         callbacks.onMatch?.(evt);
@@ -148,6 +163,7 @@ const dispatchSearchEvent = (evt, callbacks) => {
         processed: evt.processed,
         total: evt.total,
         matches: evt.matches,
+        scannedMaxPriceCad: evt.scannedMaxPriceCad ?? null,
         stopReason: evt.stopReason || null,
       });
       return true;

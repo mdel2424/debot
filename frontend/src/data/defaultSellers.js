@@ -1,4 +1,4 @@
-export const DEFAULT_SELLER_ADDITIONS_VERSION = 3;
+export const DEFAULT_SELLER_ADDITIONS_VERSION = 4;
 const SELLER_UPDATE_BATCHES = [
   {
     version: 1,
@@ -19,6 +19,30 @@ const SELLER_UPDATE_BATCHES = [
     version: 3,
     sellers: [],
     removals: ['former_vintage', 'gwoodsgear', 'jizzypantthrifts'],
+  },
+  {
+    version: 4,
+    sellers: [
+      { name: 'Great Lakes Grails', username: 'greatlakesgrails' },
+      { name: 'The Good Sale', username: 'thegoodsale' },
+      { name: 'Jimmy Vntg', username: 'jimmyvntg' },
+      { name: 'AGF Thrifts', username: 'agfthrifts' },
+      { name: 'Remainder', username: 'remainder' },
+      { name: 'Davos Wrld', username: 'davos_wrld' },
+      { name: 'Blue Angel Vintage', username: 'blueangelvtg' },
+      { name: 'Mr Swag 4 Life', username: 'mr_swag4life' },
+      { name: 'Lil Eggy Vintage', username: 'lileggyvintage' },
+      { name: 'Easy Eddies Vintage', username: 'easyeddiesvintage' },
+      { name: 'Rudra 19', username: 'rudra_19' },
+      { name: 'Jpaz Closet', username: 'jpazcloset' },
+      { name: 'MTL Fine Pieces', username: 'mtl_finepieces' },
+      { name: 'Kitty Closet', username: 'kittycloset05' },
+      { name: 'SJ Thrifts', username: 'sjthr1fts' },
+      { name: 'Hidden Rags', username: 'hiddenrags' },
+      { name: 'Spot Marked X', username: 'spotmarkedx' },
+      { name: 'Inkloom', username: 'inkloom' },
+      { name: 'Width', username: 'width' },
+    ],
   },
 ];
 

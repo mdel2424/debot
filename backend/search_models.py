@@ -57,6 +57,7 @@ class SearchRequest(SearchModel):
     parseWorkers: int | None = Field(default=None, ge=1, le=6)
     headless: bool = True
     slowmo: int = Field(default=0, ge=0, le=1000)
+    forceRefresh: bool = False
 
     @field_validator("seller", mode="before")
     @classmethod

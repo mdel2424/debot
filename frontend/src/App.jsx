@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
-import { ArrowDownUp, ArrowUpRight, ChevronDown, Footprints, ImageOff, ListFilter, Plus, RotateCcw, ScanLine, Search, Shapes, Shirt, Square, UsersRound, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowDownUp, ArrowUpRight, ChevronDown, Database, Footprints, ImageOff, LayoutGrid, ListFilter, Plus, RefreshCw, RotateCcw, ScanLine, Search, Shapes, Shirt, Square, UsersRound, X } from 'lucide-react';
 import {
   cancelSearch,
+  loadDailyCache,
   loadRetailSources,
   makeSearchId,
   startSearchBatch,
@@ -22,6 +23,12 @@ import {
   isCategoryPageId,
 } from './data/categoryPages';
 import { RETAIL_ACCOUNTS, RETAIL_BY_USERNAME, RETAIL_CATEGORIES } from './data/retailSources';
+import {
+  filterRowResults,
+  readPriceCapValue,
+  sortResultsList,
+  sortSellerEntriesByHits,
+} from './utils/itemFilters';
 import './App.css';
 import './index.css';
 
@@ -31,8 +38,10 @@ const ACTIVE_PAGE_STORAGE_KEY = 'debot.categoryPage.v1';
 const PAGE_FILTERS_STORAGE_KEY = 'debot.categoryFilters.v1';
 const PAGE_FILTERS_VERSION_STORAGE_KEY = 'debot.categoryFilters.defaults.v1';
 const PAGE_WORKSPACES_STORAGE_KEY = 'debot.pageWorkspaces.v1';
+const DAILY_CATALOG_STORAGE_KEY = 'debot.dailyCatalog.v1';
 const LOW_PARSE_RETRY_RATIO = 0.9;
 const MAX_LOW_PARSE_RETRIES = 1;
+const INITIAL_VISIBLE_RESULTS = 8;
 
 const CATEGORY_ICONS = { tops: Shirt, bottoms: ArrowDownUp, footwear: Footprints, accessories: Shapes };
 const TOPS_RANGES = [
@@ -89,14 +98,14 @@ const getSellerStateTone = (sellerRow) => {
     return 'error';
   }
 
-  if (sellerRow?.processed) {
+  if (sellerRow?.processed || (sellerRow?.hasCatalog && sellerRow?.catalogDay === currentResultDay())) {
     return 'complete';
   }
 
   return 'idle';
 };
 
-const getSellerStateLabel = (sellerRow) => {
+const getSellerStateLabel = (sellerRow, displayedCount = null) => {
   if (sellerRow?.progress?.phase === 'waiting_rate_limit') {
     return 'Cooldown';
   }
@@ -112,22 +121,29 @@ const getSellerStateLabel = (sellerRow) => {
     return 'Issue';
   }
 
+  const hits = displayedCount ?? (sellerRow?.results?.length || 0);
   if (sellerRow?.processed) {
     if (sellerRow?.progress?.stopReason === 'age_window') {
       return 'Age cutoff';
     }
-    return (sellerRow?.results?.length || 0) > 0 ? 'Matched' : 'Complete';
+    return hits > 0 ? 'Matched' : 'Complete';
+  }
+
+  if (sellerRow?.hasCatalog && sellerRow?.catalogDay === currentResultDay()) {
+    return hits > 0 ? 'Matched' : 'Cached';
   }
 
   return 'Ready';
 };
 
-const formatSellerStatusLabel = (sellerRow, queuePosition = null) => {
+const formatSellerStatusLabel = (sellerRow, queuePosition = null, displayedCount = null) => {
   const progress = sellerRow?.progress;
-  const hits = Number(progress?.matches);
   const processed = Number(progress?.processed) || 0;
   const total = Number(progress?.total) || 0;
-  const safeHits = Number.isFinite(hits) ? hits : (sellerRow?.results?.length || 0);
+  const rawProgressHits = Number(progress?.matches);
+  const safeHits = sellerRow?.hasCatalog
+    ? (displayedCount ?? 0)
+    : (Number.isFinite(rawProgressHits) ? rawProgressHits : (displayedCount ?? sellerRow?.results?.length ?? 0));
 
   if (progress?.phase === 'waiting_rate_limit') {
     return 'Waiting for Depop cooldown';
@@ -249,6 +265,12 @@ const createSellerRow = (account, existingRow = null) => ({
   results: (existingRow?.results || []).filter((item) =>
     !item.seller || normalizeSellerUsername(item.seller) === account.username
   ),
+  catalog: (existingRow?.catalog || []).filter((item) =>
+    !item.seller || normalizeSellerUsername(item.seller) === account.username
+  ),
+  hasCatalog: Boolean(existingRow?.hasCatalog),
+  catalogDay: existingRow?.catalogDay || '',
+  scannedMaxPriceCad: existingRow?.scannedMaxPriceCad ?? null,
   resultsDay: existingRow?.resultsDay || '',
   resultsFilters: existingRow?.resultsFilters || null,
   loading: existingRow?.loading || false,
@@ -260,6 +282,45 @@ const createSellerRow = (account, existingRow = null) => ({
   progress: existingRow?.progress || null,
   searchTask: existingRow?.searchTask || null,
 });
+
+const readStoredDailyCatalog = () => {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = window.localStorage.getItem(DAILY_CATALOG_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (!parsed || parsed.day !== currentResultDay() || typeof parsed.pages !== 'object') {
+      return {};
+    }
+    return parsed.pages || {};
+  } catch {
+    return {};
+  }
+};
+
+const persistDailyCatalog = (workspaces) => {
+  if (typeof window === 'undefined') return;
+  const today = currentResultDay();
+  const pages = {};
+  for (const page of CATEGORY_PAGES) {
+    const sellers = {};
+    for (const row of workspaces[page.id]?.sellerRows || []) {
+      if (row.hasCatalog && row.catalogDay === today) {
+        sellers[row.seller] = {
+          items: row.catalog || [],
+          scannedMaxPriceCad: row.scannedMaxPriceCad ?? null,
+        };
+      }
+    }
+    if (Object.keys(sellers).length > 0) {
+      pages[page.id] = sellers;
+    }
+  }
+  try {
+    window.localStorage.setItem(DAILY_CATALOG_STORAGE_KEY, JSON.stringify({ day: today, pages }));
+  } catch {
+    // Backend SQLite daily cache remains authoritative when localStorage quota is full.
+  }
+};
 
 const buildSellerRows = (accounts, existingRows = []) => {
   const existingByUsername = new Map(existingRows.map((row) => [row.seller, row]));
@@ -289,32 +350,64 @@ const readStoredPageWorkspaces = (accounts) => {
   try {
     const raw = window.localStorage.getItem(PAGE_WORKSPACES_STORAGE_KEY);
     const parsed = raw ? JSON.parse(raw) : null;
+    const dailyCatalogByPage = readStoredDailyCatalog();
+    const today = currentResultDay();
     if (!parsed || typeof parsed !== 'object') {
-      return buildPageWorkspaces(accounts);
+      if (Object.keys(dailyCatalogByPage).length === 0) {
+        return buildPageWorkspaces(accounts);
+      }
     }
 
     const storedWorkspaces = Object.fromEntries(
       CATEGORY_PAGES.map((page) => {
-        const rows = Array.isArray(parsed[page.id]?.sellerRows)
+        const rows = Array.isArray(parsed?.[page.id]?.sellerRows)
           ? parsed[page.id].sellerRows
           : [];
-        const retailerRows = RETAIL_CATEGORIES.has(page.id) && Array.isArray(parsed[page.id]?.retailerRows)
+        const retailerRows = RETAIL_CATEGORIES.has(page.id) && Array.isArray(parsed?.[page.id]?.retailerRows)
           ? parsed[page.id].retailerRows
           : [];
+        const pageDaily = dailyCatalogByPage[page.id] || {};
+        const mergedMap = new Map();
+        for (const row of [...rows, ...retailerRows]) {
+          if (!row?.seller) continue;
+          const cached = pageDaily[row.seller];
+          mergedMap.set(row.seller, {
+            ...row,
+            results: Array.isArray(row?.results) ? row.results : [],
+            catalog: Array.isArray(cached?.items) ? cached.items : [],
+            hasCatalog: Boolean(cached),
+            catalogDay: cached ? today : '',
+            scannedMaxPriceCad: cached?.scannedMaxPriceCad ?? row?.scannedMaxPriceCad ?? null,
+            loading: Boolean(row?.searchId) || Boolean(row?.loading),
+            processed: Boolean(row?.processed),
+            searchId: String(row?.searchId || ''),
+            controller: null,
+            searchTask: row?.searchTask && typeof row.searchTask === 'object'
+              ? row.searchTask
+              : null,
+          });
+        }
+        for (const [seller, cached] of Object.entries(pageDaily)) {
+          if (!mergedMap.has(seller)) {
+            mergedMap.set(seller, {
+              seller,
+              results: [],
+              catalog: Array.isArray(cached?.items) ? cached.items : [],
+              hasCatalog: true,
+              catalogDay: today,
+              scannedMaxPriceCad: cached?.scannedMaxPriceCad ?? null,
+              loading: false,
+              processed: true,
+              searchId: '',
+              controller: null,
+              searchTask: null,
+            });
+          }
+        }
         return [
           page.id,
           {
-            sellerRows: [...rows, ...retailerRows].map((row) => ({
-              ...row,
-              results: Array.isArray(row?.results) ? row.results : [],
-              loading: Boolean(row?.searchId) || Boolean(row?.loading),
-              processed: Boolean(row?.processed),
-              searchId: String(row?.searchId || ''),
-              controller: null,
-              searchTask: row?.searchTask && typeof row.searchTask === 'object'
-                ? row.searchTask
-                : null,
-            })),
+            sellerRows: Array.from(mergedMap.values()),
           },
         ];
       })
@@ -555,7 +648,7 @@ const TOPS_RESULT_MEASUREMENTS = [
   { key: 'length', label: 'Length' },
 ];
 
-function ResultCard({ result, category }) {
+function ResultCard({ result, category, sellerBadge = '' }) {
   const fields = category === 'bottoms' ? BOTTOMS_RANGES : TOPS_RESULT_MEASUREMENTS;
   const measurements = fields.flatMap(({ key, label }) => {
     const value = readResultMeasurement(result[key]);
@@ -576,16 +669,19 @@ function ResultCard({ result, category }) {
         ) : (
           <div className="result-img placeholder" aria-hidden="true"><ImageOff size={24} /></div>
         )}
+        {sellerBadge && <span className="result-seller-pill">{sellerBadge}</span>}
       </div>
       <div className="result-info">
-        {result.price && <div className="result-price">{result.price}</div>}
+        <div className="result-top-row">
+          {result.price && <div className="result-price">{result.price}</div>}
+          {(result.sizeLabel || age !== null) && (
+            <div className="result-details">
+              {result.sizeLabel && <span>Size {result.sizeLabel}</span>}
+              {age !== null && <span>{Math.round(age)}d old</span>}
+            </div>
+          )}
+        </div>
         {result.title && <div className="result-title">{result.title}</div>}
-        {(result.sizeLabel || age !== null) && (
-          <div className="result-details">
-            {result.sizeLabel && <span>Size {result.sizeLabel}</span>}
-            {age !== null && <span>{Math.round(age)}d old</span>}
-          </div>
-        )}
         {measurements.length > 0 && (
           <dl className="result-measurements">
             {measurements.map(({ key, label, value }) => (
@@ -601,17 +697,18 @@ function ResultCard({ result, category }) {
   );
 }
 
-const buildSearchPayload = (page, filters, sellerUsername, searchId) => {
+const buildSearchPayload = (page, filters, sellerUsername, searchId, { forceRefresh = false } = {}) => {
   const retailer = RETAIL_BY_USERNAME.get(sellerUsername);
   const payload = {
     category: page.id,
     ...(retailer ? { retailSource: retailer.id, groups: page.id } : { seller: sellerUsername, groups: page.group }),
     gender: 'male',
-    maxItems: 40,
+    maxItems: 500,
     maxLinks: 1000,
     maxScrolls: 16,
     parseWorkers: 4,
     searchId,
+    ...(forceRefresh ? { forceRefresh: true } : {}),
   };
   const maxPriceCad = readPriceCap(filters.maxPriceCad);
   if (maxPriceCad !== null) payload.maxPriceCad = maxPriceCad;
@@ -770,7 +867,10 @@ function App() {
   const [sellerView, setSellerView] = useState('all');
   const [retailSources, setRetailSources] = useState(null);
   const [sellerQuery, setSellerQuery] = useState('');
+  const [itemQuery, setItemQuery] = useState('');
+  const [itemSort, setItemSort] = useState('default');
   const [expandedResults, setExpandedResults] = useState({});
+  const [collapsedSellers, setCollapsedSellers] = useState({});
   const [activePageId, setActivePageId] = useState(() => readInitialPageId());
   const [sellerAccounts, setSellerAccounts] = useState(initialSellerAccounts);
   const [pageFilters, setPageFilters] = useState(() => readStoredPageFilters());
@@ -793,33 +893,111 @@ function App() {
   const activePage = CATEGORY_PAGE_MAP[activePageId] || CATEGORY_PAGE_MAP[DEFAULT_CATEGORY_PAGE_ID];
   const hasRetailers = RETAIL_CATEGORIES.has(activePage.id);
   const hasFitGuide = activePage.id === 'tops' || activePage.id === 'bottoms';
-  const sellerRows = pageWorkspaces[activePage.id]?.sellerRows || [];
-  const currentFilters = pageFilters[activePage.id] || getDefaultPageFilters(activePage.id);
+  const sellerRows = useMemo(
+    () => pageWorkspaces[activePage.id]?.sellerRows || [],
+    [pageWorkspaces, activePage.id],
+  );
+  const currentFilters = useMemo(
+    () => pageFilters[activePage.id] || getDefaultPageFilters(activePage.id),
+    [pageFilters, activePage.id],
+  );
   const invalidTopsRanges = activePage.mode === 'measurements'
     && TOPS_RANGES.some((range) => !getTopsRange(currentFilters, range));
   const invalidPriceCap = Boolean(currentFilters.maxPriceCad.trim()) && readPriceCap(currentFilters.maxPriceCad) === null;
   const invalidSearchFilters = invalidTopsRanges || invalidPriceCap;
   const matchView = sellerView === 'matched';
+  const listingsView = sellerView === 'listings';
   const checkingRetailers = hasRetailers && retailSources === null;
   const canSearchRow = (username) => {
     const retailer = RETAIL_BY_USERNAME.get(username);
     return !retailer || retailSources?.[retailer.id] === true;
   };
+  const todayKey = currentResultDay();
+  const currentMaxPriceCad = readPriceCapValue(currentFilters.maxPriceCad);
   const sellerCount = sellerRows.length;
   const activeSearchCount = sellerRows.filter((row) => row.loading).length;
   const queuedCountForPage = sellerRows.filter((row) => row.progress?.phase === 'queued').length;
-  const totalHits = sellerRows.reduce((sum, row) => sum + row.results.length, 0);
   const pageIsLoading = activeSearchCount > 0 || queuedCountForPage > 0;
   const queuePositionByKey = new Map(
     queueState.pending.map((task, index) => [task.key, index + 1])
   );
   const sellerSearchQuery = sellerQuery.trim().toLowerCase().replace(/^@/, '');
-  const matchedSellerCount = sellerRows.filter((row) => row.results.length > 0).length;
-  const visibleSellerRows = sellerRows.filter((row) =>
-    (!matchView || row.results.length > 0)
-    && (!sellerSearchQuery || [row.seller, row.displayName].some((value) =>
-      String(value || '').toLowerCase().includes(sellerSearchQuery)))
+
+  const evaluatedSellerEntries = useMemo(() => sellerRows.map((row, originalIndex) => {
+    const isRetailer = RETAIL_BY_USERNAME.has(row.seller);
+    const filtered = filterRowResults(row, activePage, currentFilters, {
+      isRetailer,
+      keyword: itemQuery,
+    });
+    const displayedResults = sortResultsList(filtered, itemSort);
+    const isCachedToday = Boolean(row.hasCatalog && row.catalogDay === todayKey);
+    const needsHigherPriceScan = Boolean(
+      isRetailer
+      && isCachedToday
+      && row.scannedMaxPriceCad != null
+      && (currentMaxPriceCad === null || currentMaxPriceCad > row.scannedMaxPriceCad)
+    );
+    return {
+      row,
+      originalIndex,
+      displayedResults,
+      isCachedToday,
+      needsHigherPriceScan,
+    };
+  }), [sellerRows, activePage, currentFilters, itemQuery, itemSort, todayKey, currentMaxPriceCad]);
+
+  const sortedSellerEntries = useMemo(
+    () => sortSellerEntriesByHits(evaluatedSellerEntries),
+    [evaluatedSellerEntries],
   );
+
+  const totalHits = useMemo(
+    () => sortedSellerEntries.reduce((sum, entry) => sum + entry.displayedResults.length, 0),
+    [sortedSellerEntries],
+  );
+  const matchedSellerCount = useMemo(
+    () => sortedSellerEntries.filter((entry) => entry.displayedResults.length > 0).length,
+    [sortedSellerEntries],
+  );
+  const cachedSellerCount = useMemo(
+    () => sortedSellerEntries.filter((entry) => entry.isCachedToday).length,
+    [sortedSellerEntries],
+  );
+  const cachedCatalogItemCount = useMemo(
+    () => sortedSellerEntries.reduce(
+      (sum, entry) => sum + (entry.isCachedToday ? (entry.row.catalog?.length || 0) : 0),
+      0,
+    ),
+    [sortedSellerEntries],
+  );
+  const scannedSellerCount = useMemo(
+    () => sortedSellerEntries.filter((entry) => entry.row.processed || entry.isCachedToday).length,
+    [sortedSellerEntries],
+  );
+
+  const visibleSellerEntries = useMemo(
+    () => sortedSellerEntries.filter((entry) =>
+      (!matchView || entry.displayedResults.length > 0)
+      && (!sellerSearchQuery || [entry.row.seller, entry.row.displayName].some((value) =>
+        String(value || '').toLowerCase().includes(sellerSearchQuery)))
+    ),
+    [sortedSellerEntries, matchView, sellerSearchQuery],
+  );
+
+  const flatMatchingListings = useMemo(() => {
+    if (!listingsView) return [];
+    const merged = [];
+    for (const entry of visibleSellerEntries) {
+      const label = entry.row.displayName || entry.row.seller;
+      for (const item of entry.displayedResults) {
+        merged.push({ item, sellerLabel: label, seller: entry.row.seller });
+      }
+    }
+    if (itemSort === 'default') return merged;
+    const sortedItems = sortResultsList(merged.map((entry) => entry.item), itemSort);
+    const byUrl = new Map(merged.map((entry) => [entry.item.url, entry]));
+    return sortedItems.map((item) => byUrl.get(item.url) || { item, sellerLabel: item.seller || '', seller: item.seller || '' });
+  }, [listingsView, visibleSellerEntries, itemSort]);
 
   useEffect(() => {
     if (!hasRetailers) return undefined;
@@ -831,6 +1009,57 @@ function App() {
       });
     return () => controller.abort();
   }, [hasRetailers]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    loadDailyCache(activePage.id, controller.signal)
+      .then((data) => {
+        if (controller.signal.aborted || !data?.sellers || typeof data.sellers !== 'object') {
+          return;
+        }
+        const day = currentResultDay();
+        const prev = pageWorkspacesRef.current;
+        const currentRows = prev[activePage.id]?.sellerRows || [];
+        let changed = false;
+        const nextRows = currentRows.map((row) => {
+          const cached = data.sellers[row.seller];
+          if (!cached || row.loading) return row;
+          const items = Array.isArray(cached.items) ? cached.items : [];
+          if (row.hasCatalog && row.catalogDay === day && (row.catalog?.length || 0) >= items.length) {
+            return row;
+          }
+          changed = true;
+          const total = Number(cached.total) || items.length;
+          const processed = Number(cached.processed) || total;
+          return {
+            ...row,
+            catalog: items,
+            hasCatalog: true,
+            catalogDay: day,
+            scannedMaxPriceCad: cached.scannedMaxPriceCad ?? row.scannedMaxPriceCad ?? null,
+            processed: row.processed || Boolean(cached.complete) || processed > 0,
+            progress: row.progress || createProgressState({
+              phase: 'done',
+              processed,
+              total,
+              matches: items.length,
+              stopReason: 'completed',
+            }),
+          };
+        });
+        if (!changed) return;
+        const next = {
+          ...prev,
+          [activePage.id]: { sellerRows: nextRows },
+        };
+        pageWorkspacesRef.current = next;
+        setPageWorkspaces(next);
+      })
+      .catch(() => {
+        // Ignore when offline or unmocked in isolated browser tests.
+      });
+    return () => controller.abort();
+  }, [activePage.id]);
 
   useEffect(() => {
     pageWorkspacesRef.current = pageWorkspaces;
@@ -850,6 +1079,7 @@ function App() {
       } catch (error) {
         console.warn('[App] Failed to persist search results:', error);
       }
+      persistDailyCatalog(pageWorkspaces);
     }, 150);
 
     return () => window.clearTimeout(timeoutId);
@@ -869,6 +1099,7 @@ function App() {
       } catch (error) {
         console.warn('[App] Failed to flush search results:', error);
       }
+      persistDailyCatalog(pageWorkspacesRef.current);
     };
 
     window.addEventListener('pagehide', flushWorkspace);
@@ -1043,6 +1274,38 @@ function App() {
           }
 
           return { ...row, results: [...row.results, item] };
+        }),
+      },
+    };
+    pageWorkspacesRef.current = next;
+    setPageWorkspaces(next);
+  };
+
+  const addSellerCatalogItem = (pageId, sellerUsername, item) => {
+    if (!item?.url) return;
+    if (item.seller && normalizeSellerUsername(item.seller) !== sellerUsername) {
+      return;
+    }
+    const day = currentResultDay();
+    const prev = pageWorkspacesRef.current;
+    const next = {
+      ...prev,
+      [pageId]: {
+        sellerRows: prev[pageId].sellerRows.map((row) => {
+          if (row.seller !== sellerUsername) {
+            return row;
+          }
+          const existing = Array.isArray(row.catalog) ? row.catalog : [];
+          const hasItem = existing.some((entry) => entry.url === item.url);
+          const nextCatalog = hasItem
+            ? existing.map((entry) => (entry.url === item.url ? item : entry))
+            : [...existing, item];
+          return {
+            ...row,
+            catalog: nextCatalog,
+            hasCatalog: true,
+            catalogDay: day,
+          };
         }),
       },
     };
@@ -1328,7 +1591,9 @@ function App() {
     const page = CATEGORY_PAGE_MAP[pageId];
     const controller = new AbortController();
     const searchId = task.searchId;
-    const payload = buildSearchPayload(page, filters, sellerUsername, searchId);
+    const payload = buildSearchPayload(page, filters, sellerUsername, searchId, {
+      forceRefresh: Boolean(task.forceRefresh),
+    });
     let outcome = { status: 'done', code: null };
     let finalized = false;
 
@@ -1346,18 +1611,24 @@ function App() {
     const existingRow = getSellerRow(pageId, sellerUsername);
     const day = currentResultDay();
     const savedFilters = existingRow?.resultsFilters;
-    const keepResults = task.resetResults === false || (
+    const keepResults = !task.forceRefresh && (task.resetResults === false || (
       existingRow?.resultsDay === day
       && savedFilters
       && !isLegacyBottomsSearch(pageId, savedFilters)
       && JSON.stringify(normalizePageFilters(pageId, {
         ...savedFilters, maxPriceCad: savedFilters.maxPriceCad ?? '',
       })) === JSON.stringify(filters)
-    );
+    ));
     sellerRowUpdate.resultsDay = day;
     sellerRowUpdate.resultsFilters = filters;
     if (!keepResults) {
       sellerRowUpdate.results = [];
+    }
+    if (task.forceRefresh || existingRow?.catalogDay !== day) {
+      sellerRowUpdate.catalog = [];
+      sellerRowUpdate.hasCatalog = false;
+      sellerRowUpdate.catalogDay = '';
+      sellerRowUpdate.scannedMaxPriceCad = null;
     }
     updateSellerRow(pageId, sellerUsername, sellerRowUpdate);
     syncQueueState();
@@ -1386,6 +1657,9 @@ function App() {
     await streamSearch({
       payload,
       controller,
+      onCatalogItem: (evt) => {
+        if (isCurrent()) addSellerCatalogItem(pageId, sellerUsername, evt.item);
+      },
       onMatch: (evt) => {
         if (isCurrent()) addSellerResult(pageId, sellerUsername, evt.item);
       },
@@ -1439,7 +1713,8 @@ function App() {
           outcome = { status: 'cancelled', code: null };
           return;
         }
-        const existingProgress = getSellerRow(pageId, sellerUsername)?.progress;
+        const currentRow = getSellerRow(pageId, sellerUsername);
+        const existingProgress = currentRow?.progress;
         const doneProgress = existingProgress
           ? {
             ...existingProgress,
@@ -1461,9 +1736,14 @@ function App() {
           }
           : null;
         const shouldRetry = shouldRetryLowParse(task, summary);
+        const isRetailer = RETAIL_BY_USERNAME.has(sellerUsername);
+        const scannedMaxPriceCad = isRetailer
+          ? (summary?.scannedMaxPriceCad ?? null)
+          : null;
         const didFinish = finishSellerSearch(pageId, sellerUsername, searchId, {
           loading: false,
           processed: !shouldRetry,
+          ...(isRetailer ? { scannedMaxPriceCad } : {}),
           progress: shouldRetry
             ? createProgressState({
               phase: 'queued',
@@ -1507,6 +1787,7 @@ function App() {
       batchId: options.batchId || nextBatchId(options.source === 'batch' ? 'batch' : 'manual'),
       source: options.source || 'manual',
       resetResults: options.resetResults !== false,
+      forceRefresh: Boolean(options.forceRefresh),
       lowParseRetryCount: options.lowParseRetryCount || 0,
     };
 
@@ -1545,9 +1826,9 @@ function App() {
     });
   };
 
-  const startSellerSearch = async (pageId, sellerUsername) => {
+  const startSellerSearch = async (pageId, sellerUsername, { forceRefresh = false } = {}) => {
     if (invalidSearchFilters || !canSearchRow(sellerUsername)) return;
-    queueSellerSearch(pageId, sellerUsername, { source: 'manual' });
+    queueSellerSearch(pageId, sellerUsername, { source: 'manual', forceRefresh });
   };
 
   const startSearchAllForPage = async (pageId) => {
@@ -1622,6 +1903,7 @@ function App() {
       ...prev,
       [pageId]: getDefaultPageFilters(pageId),
     }));
+    setItemQuery('');
   };
 
   const renderFilterControls = () => {
@@ -1819,6 +2101,9 @@ function App() {
             <dl className="workspace-stats" aria-label="Workspace summary">
               <div><dt>Sellers</dt><dd>{sellerCount}</dd></div>
               <div><dt>Matches</dt><dd>{totalHits}</dd></div>
+              {cachedSellerCount > 0 && (
+                <div><dt>Cached</dt><dd>{cachedSellerCount}/{sellerCount}</dd></div>
+              )}
               {queueState.active.length + queueState.pending.length > 0 && (
                 <div><dt>In queue</dt><dd>{queueState.active.length + queueState.pending.length}</dd></div>
               )}
@@ -1828,7 +2113,15 @@ function App() {
           <section className={`home-controls${hasFitGuide ? ' has-fit-guide' : ''}`} aria-labelledby="fit-filters-title">
             <div className="home-controls-content">
               <div className="home-controls-heading">
-                <h2 id="fit-filters-title"><ListFilter size={17} /> Filters</h2>
+                <div className="home-controls-title-group">
+                  <h2 id="fit-filters-title"><ListFilter size={17} /> Filters</h2>
+                  {cachedCatalogItemCount > 0 && (
+                    <span className="live-filter-pill mono">
+                      <Database size={12} aria-hidden="true" />
+                      Instant filter · {cachedCatalogItemCount.toLocaleString()} cached today
+                    </span>
+                  )}
+                </div>
                 <button type="button" className="btn search-btn secondary reset-filters"
                   onClick={() => resetPageFilters(activePage.id)}>
                   <RotateCcw size={15} /> Reset filters
@@ -1845,6 +2138,12 @@ function App() {
                     value={currentFilters.maxPriceCad} aria-invalid={invalidPriceCap || undefined}
                     aria-describedby={invalidPriceCap ? 'price-filter-error' : undefined}
                     onChange={(event) => handlePageFilterChange(activePage.id, 'maxPriceCad', event.target.value)} />
+                </label>
+                <label className="filter-label keyword-filter">
+                  <span>Keyword filter</span>
+                  <input className="input-dark" placeholder="Brand, style, color…"
+                    value={itemQuery}
+                    onChange={(event) => setItemQuery(event.target.value)} />
                 </label>
                 {pageIsLoading ? (
                   <button
@@ -1874,14 +2173,35 @@ function App() {
 
           <section className="seller-section" aria-labelledby="seller-section-title">
             <div className="seller-section-heading">
-              <h2 id="seller-section-title">Seller queue</h2>
+              <div className="seller-section-title-group">
+                <h2 id="seller-section-title">Seller queue</h2>
+                {(pageIsLoading || scannedSellerCount > 0) && (
+                  <span className="scan-summary-chip mono">
+                    {scannedSellerCount}/{sellerCount} scanned · sorted by most hits
+                  </span>
+                )}
+              </div>
               <div className="seller-list-tools">
                 <div className="segmented" role="group" aria-label="Show sellers">
-                  <button type="button" aria-pressed={!matchView}
+                  <button type="button" aria-pressed={!matchView && !listingsView}
                     onClick={() => { setSellerView('all'); setSellerQuery(''); }}>All sellers</button>
                   <button type="button" aria-pressed={matchView}
                     onClick={() => setSellerView('matched')}>With matches <span>{matchedSellerCount}</span></button>
+                  <button type="button" aria-pressed={listingsView}
+                    onClick={() => setSellerView('listings')}>
+                    <LayoutGrid size={13} aria-hidden="true" /> Gallery <span>{totalHits}</span>
+                  </button>
                 </div>
+                <select
+                  className="input-dark item-sort-select"
+                  aria-label="Sort listings"
+                  value={itemSort}
+                  onChange={(event) => setItemSort(event.target.value)}
+                >
+                  <option value="default">Shop order</option>
+                  <option value="price_asc">Lowest price</option>
+                  <option value="newest">Newest listed</option>
+                </select>
                 <label className="seller-query">
                   <Search size={16} aria-hidden="true" />
                   <input aria-label="Filter sellers"
@@ -1890,7 +2210,35 @@ function App() {
                 </label>
               </div>
             </div>
-          {visibleSellerRows.length === 0 ? (
+
+            {pageIsLoading && sellerCount > 0 && (
+              <div className="scan-progress-track" aria-hidden="true">
+                <div
+                  className="scan-progress-fill"
+                  style={{ width: `${Math.min(100, Math.round((scannedSellerCount / sellerCount) * 100))}%` }}
+                />
+              </div>
+            )}
+
+          {listingsView ? (
+            flatMatchingListings.length === 0 ? (
+              <div className="empty-state-card">
+                <LayoutGrid size={22} />
+                <h3>{cachedCatalogItemCount > 0 ? 'No listings match the current filters' : 'No matching listings yet'}</h3>
+              </div>
+            ) : (
+              <div className="gallery-results-grid">
+                {flatMatchingListings.map(({ item, sellerLabel, seller }, index) => (
+                  <ResultCard
+                    key={`${seller}-${item.url}-${index}`}
+                    result={item}
+                    category={activePage.id}
+                    sellerBadge={sellerLabel}
+                  />
+                ))}
+              </div>
+            )
+          ) : visibleSellerEntries.length === 0 ? (
             <div className="empty-state-card">
               <UsersRound size={22} />
               <h3>{sellerCount === 0 ? 'No saved sellers' : sellerSearchQuery ? 'No sellers found' : 'No matching listings'}</h3>
@@ -1900,7 +2248,12 @@ function App() {
               <div className="seller-table-head" aria-hidden="true">
                 <span>Seller</span><span>Status</span><span>Action</span>
               </div>
-              {visibleSellerRows.map((sellerRow) => {
+              {visibleSellerEntries.map(({
+                row: sellerRow,
+                displayedResults,
+                isCachedToday,
+                needsHigherPriceScan,
+              }) => {
                   const retailer = RETAIL_BY_USERNAME.get(sellerRow.seller);
                   const unavailable = retailer && !canSearchRow(sellerRow.seller);
                   const availabilityLabel = retailSources?.[retailer?.id] === false ? 'Permission required'
@@ -1911,59 +2264,106 @@ function App() {
                   const stateTone = getSellerStateTone(sellerRow);
                   const isQueued = sellerRow.progress?.phase === 'queued';
                   const rowExpanded = Boolean(expandedResults[sellerKey]);
+                  const rowCollapsed = Boolean(collapsedSellers[sellerKey]);
+                  const hasHits = displayedResults.length > 0;
+                  const compactZero = !hasHits && (sellerRow.processed || isCachedToday) && !sellerRow.loading && !sellerRow.error;
 
                   return (
                     <div
                       key={`${activePage.id}-${sellerRow.seller}`}
-                      className={`seller-row-card ${sellerRow.loading ? 'loading' : ''}`}
+                      className={`seller-row-card${sellerRow.loading ? ' loading' : ''}${hasHits ? ' has-matches' : ''}${compactZero ? ' compact-zero' : ''}`}
                     >
                       <div className="seller-header">
                     <div className="seller-info">
-                      <a
-                        href={(retailer?.urls?.[activePage.id] || retailer?.url) || buildSellerPageHref(sellerRow.seller, activePage)}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="seller-name"
-                      >
-                        {sellerRow.displayName || sellerRow.seller}
-                        <ArrowUpRight size={13} aria-hidden="true" />
-                      </a>
+                      <div className="seller-name-row">
+                        <a
+                          href={(retailer?.urls?.[activePage.id] || retailer?.url) || buildSellerPageHref(sellerRow.seller, activePage)}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="seller-name"
+                        >
+                          {sellerRow.displayName || sellerRow.seller}
+                          <ArrowUpRight size={13} aria-hidden="true" />
+                        </a>
+                        {hasHits && (
+                          <span className="seller-hit-pill mono">
+                            {displayedResults.length} {displayedResults.length === 1 ? 'hit' : 'hits'}
+                          </span>
+                        )}
+                        {isCachedToday && !sellerRow.loading && (
+                          <span className="seller-cache-tag mono" title="Cached for today — filters update instantly">
+                            cached
+                          </span>
+                        )}
+                      </div>
                       <span className="seller-username">{retailer?.domain || `@${sellerRow.seller}`}</span>
                     </div>
 
                     <div className="seller-controls">
-                      {sellerRow.loading || isQueued ? (
-                        <button
-                          type="button"
-                          className="btn search-btn stop small"
-                          onClick={() => cancelSellerSearch(activePage.id, sellerRow.seller)}
-                        >
-                          <Square size={13} /> {sellerRow.loading ? 'Stop' : 'Remove'}
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          className="btn search-btn secondary small"
-                          onClick={() => startSellerSearch(activePage.id, sellerRow.seller)}
-                          disabled={invalidSearchFilters || Boolean(unavailable)}
-                          title={unavailable ? availabilityLabel : undefined}
-                        >
-                          <Search size={14} /> Search
-                        </button>
-                      )}
+                      <div className="seller-action-group">
+                        {sellerRow.loading || isQueued ? (
+                          <button
+                            type="button"
+                            className="btn search-btn stop small"
+                            onClick={() => cancelSellerSearch(activePage.id, sellerRow.seller)}
+                          >
+                            <Square size={13} /> {sellerRow.loading ? 'Stop' : 'Remove'}
+                          </button>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              className="btn search-btn secondary small"
+                              onClick={() => startSellerSearch(activePage.id, sellerRow.seller)}
+                              disabled={invalidSearchFilters || Boolean(unavailable)}
+                              title={unavailable ? availabilityLabel : undefined}
+                            >
+                              <Search size={14} /> Search
+                            </button>
+                            {isCachedToday && !unavailable && (
+                              <button
+                                type="button"
+                                className="btn search-btn secondary icon-button refresh-btn"
+                                onClick={() => startSellerSearch(activePage.id, sellerRow.seller, { forceRefresh: true })}
+                                disabled={invalidSearchFilters}
+                                aria-label={`Refresh ${sellerRow.displayName || sellerRow.seller}`}
+                                title="Force live refresh from seller"
+                              >
+                                <RefreshCw size={14} />
+                              </button>
+                            )}
+                          </>
+                        )}
+                      </div>
 
                       <div className="seller-status-stack">
                         <span className={`seller-status-badge ${stateTone}`}>
-                          {unavailable && !sellerRow.loading && !isQueued ? availabilityLabel : getSellerStateLabel(sellerRow)}
+                          {unavailable && !sellerRow.loading && !isQueued ? availabilityLabel : getSellerStateLabel(sellerRow, displayedResults.length)}
                         </span>
                         {stateTone !== 'idle' && (
                           <span className="seller-status">
-                            {formatSellerStatusLabel(sellerRow, queuePosition)}
+                            {formatSellerStatusLabel(sellerRow, queuePosition, displayedResults.length)}
                           </span>
                         )}
                       </div>
                     </div>
                   </div>
+
+                  {needsHigherPriceScan && !sellerRow.loading && (
+                    <div className="seller-progress-message seller-rescan-hint">
+                      <span>
+                        Scanned up to ${sellerRow.scannedMaxPriceCad} CAD today — refresh to include higher-priced listings.
+                      </span>
+                      <button
+                        type="button"
+                        className="btn search-btn secondary tiny"
+                        onClick={() => startSellerSearch(activePage.id, sellerRow.seller, { forceRefresh: true })}
+                        disabled={invalidSearchFilters}
+                      >
+                        <RefreshCw size={12} /> Rescan
+                      </button>
+                    </div>
+                  )}
 
                   {progressDetails && (
                     <div className="seller-progress-message">
@@ -1984,26 +2384,32 @@ function App() {
                     </div>
                   )}
 
-                  {sellerRow.results.length > 0 && (
+                  {hasHits && (
                     <div className="seller-results">
-                      <div className="results-scroll" id={`results-${sellerRow.seller}`}>
-                        {(rowExpanded ? sellerRow.results : sellerRow.results.slice(0, 6)).map((result, index) => (
-                          <ResultCard key={`${result.url}-${index}`} result={result} category={activePage.id} />
-                        ))}
-                      </div>
-                      {sellerRow.results.length > 6 && (
-                        <button type="button" className="btn search-btn secondary all-results"
-                          aria-expanded={rowExpanded} aria-controls={`results-${sellerRow.seller}`}
-                          onClick={() => setExpandedResults((previous) => ({ ...previous, [sellerKey]: !rowExpanded }))}>
-                          <ChevronDown size={16} /> {rowExpanded ? 'Show fewer' : `Show all ${sellerRow.results.length} matches`}
-                        </button>
+                      {!rowCollapsed && (
+                        <div className="results-scroll" id={`results-${sellerRow.seller}`}>
+                          {(rowExpanded ? displayedResults : displayedResults.slice(0, INITIAL_VISIBLE_RESULTS)).map((result, index) => (
+                            <ResultCard key={`${result.url}-${index}`} result={result} category={activePage.id} />
+                          ))}
+                        </div>
                       )}
-                    </div>
-                  )}
-
-                  {sellerRow.results.length === 0 && sellerRow.processed && !sellerRow.loading && !sellerRow.error && (
-                    <div className="seller-empty-results">
-                      No matching listings.
+                      <div className="seller-results-footer">
+                        {!rowCollapsed && displayedResults.length > INITIAL_VISIBLE_RESULTS && (
+                          <button type="button" className="btn search-btn secondary all-results"
+                            aria-expanded={rowExpanded} aria-controls={`results-${sellerRow.seller}`}
+                            onClick={() => setExpandedResults((previous) => ({ ...previous, [sellerKey]: !rowExpanded }))}>
+                            <ChevronDown size={16} /> {rowExpanded ? 'Show fewer' : `Show all ${displayedResults.length} matches`}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="btn search-btn secondary collapse-results"
+                          aria-expanded={!rowCollapsed}
+                          onClick={() => setCollapsedSellers((prev) => ({ ...prev, [sellerKey]: !rowCollapsed }))}
+                        >
+                          {rowCollapsed ? `Expand ${displayedResults.length} matches` : 'Collapse'}
+                        </button>
+                      </div>
                     </div>
                   )}
                     </div>

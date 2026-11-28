@@ -12,19 +12,27 @@ const response = (...chunks) => new Response(new ReadableStream({
 
 test('inventory refresh forwards removed listings without terminating the stream', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => response(
+    'data: {"type":"catalog","item":{"url":"cat-item","p2p":22,"length":28,"priceCad":45}}\n\n',
     'data: {"type":"remove","url":"sold-item"}\n\n',
     'data: {"type":"match","item":{"url":"new-item"}}\n\n',
-    'data: {"type":"done","matches":1}\n\n',
+    'data: {"type":"done","matches":1,"scannedMaxPriceCad":35}\n\n',
   ));
+  const catalog = [];
   const removed = [];
   const matches = [];
+  const done = [];
   await streamSearch({
     payload: {}, controller: new AbortController(),
+    onCatalogItem: (event) => catalog.push(event.item),
     onRemove: (event) => removed.push(event.url),
     onMatch: (event) => matches.push(event.item.url),
+    onDone: (summary) => done.push(summary),
   });
+  assert.equal(catalog.length, 1);
+  assert.equal(catalog[0].url, 'cat-item');
   assert.deepEqual(removed, ['sold-item']);
   assert.deepEqual(matches, ['new-item']);
+  assert.equal(done[0].scannedMaxPriceCad, 35);
 });
 
 test('metadata preserves counters from matches streamed during collection', async (t) => {

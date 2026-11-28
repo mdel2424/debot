@@ -24,7 +24,13 @@ from parser import parser
 from listing_pool import ParallelListingParser
 from search_jobs import SearchJob, SearchJobRegistry
 from search_models import validate_search_payload
-from retail_sources import RETAILERS, RetailAccessError, search_catalogue, source_enabled
+from retail_sources import (
+    RETAILERS,
+    RetailAccessError,
+    get_cached_retail_catalogues,
+    search_catalogue,
+    source_enabled,
+)
 from scraper import (
     build_seller_url,
     build_browse_url,
@@ -34,6 +40,7 @@ from scraper import (
     flush_debug_logs,
     get_cached_listing,
     get_cached_shop_collection,
+    list_cached_shop_collections,
     cache_shop_collection,
     cache_parsed_collection,
     unavailable_shop_urls,
@@ -44,6 +51,7 @@ from scraper import (
     parse_listing,
     listing_price_cad,
     extract_seller_sold_count,
+    extract_seller_username_from_href,
     extract_retry_after_seconds,
     create_browser_context,
     remember_browser_state,
@@ -671,16 +679,31 @@ def _extract_footwear_size(size_label: str) -> Optional[float]:
         return None
 
 
+def _extract_title_from_description(description: str) -> Optional[str]:
+    """Derive a concise display title from the first meaningful description line."""
+    for raw_line in (description or "").splitlines():
+        cleaned = re.sub(r"\s+", " ", raw_line).strip(" •‣-*|#")
+        if len(cleaned) >= 4:
+            return cleaned if len(cleaned) <= 96 else cleaned[:93].rstrip() + "…"
+    return None
+
+
 def _build_match_payload(item: Dict[str, Any], p2p: Optional[float] = None,
                          length: Optional[float] = None, waist: Optional[float] = None,
                          inseam: Optional[float] = None, rise: Optional[float] = None,
                          inseam_rise: Optional[float] = None,
-                         leg_opening: Optional[float] = None) -> Dict[str, Any]:
-    """Format a parsed listing into the stream match payload."""
-    return {
+                         leg_opening: Optional[float] = None,
+                         size_value: Optional[float] = None,
+                         price_cad: Optional[float] = None) -> Dict[str, Any]:
+    """Format a parsed listing into the stream match/catalog payload."""
+    resolved_price_cad = price_cad if price_cad is not None else listing_price_cad(item)
+    title = item.get("title") or _extract_title_from_description(item.get("description") or "")
+    payload = {
         "url": item.get("url"),
         "image": item.get("image"),
         "price": item.get("price"),
+        "priceCad": resolved_price_cad,
+        "title": title,
         "p2p": p2p,
         "length": length,
         "waist": waist,
@@ -694,6 +717,86 @@ def _build_match_payload(item: Dict[str, Any], p2p: Optional[float] = None,
         "sizeLabel": item.get("sizeLabel"),
         "soldCount": item.get("soldCount"),
     }
+    if size_value is not None:
+        payload["sizeValue"] = size_value
+    return payload
+
+
+def _extract_catalog_item(item: Dict[str, Any], category: str = "tops",
+                          seller_sold_count: Optional[int] = None) -> Dict[str, Any] | None:
+    """Extract all filterable attributes for an item without applying active fit/price filters."""
+    if not isinstance(item, dict) or not item.get("url"):
+        return None
+    payload = None
+    if category in MEASUREMENT_CATEGORIES:
+        w, L = parser.extract_tops(item.get("description", ""))
+        if w is None and L is None:
+            return None
+        payload = _build_match_payload(item, p2p=w, length=L)
+    elif category == "bottoms":
+        values = parser.extract_bottoms(item.get("description", ""))
+        if values.get("waist") is None:
+            size_waist = _extract_bottoms_size(item.get("sizeLabel") or "")
+            if size_waist is not None:
+                values["waist"] = size_waist
+        if not any(values.get(key) is not None for key in ("waist", "inseam", "rise", "legOpening")):
+            return None
+        inseam_rise = None
+        if values.get("inseam") is not None and values.get("rise") is not None:
+            inseam_rise = float(values["inseam"]) + float(values["rise"])
+        payload = _build_match_payload(
+            item,
+            waist=values.get("waist"),
+            inseam=values.get("inseam"),
+            rise=values.get("rise"),
+            inseam_rise=inseam_rise,
+            leg_opening=values.get("legOpening"),
+        )
+    elif category == "footwear":
+        size_value = _extract_footwear_size(item.get("sizeLabel") or "")
+        if size_value is None:
+            return None
+        payload = _build_match_payload(item, size_value=size_value)
+    elif category == "accessories":
+        payload = _build_match_payload(item)
+    if payload is not None and seller_sold_count is not None:
+        payload["soldCount"] = seller_sold_count
+    return payload
+
+
+def _format_retail_catalog_item(listing: Dict[str, Any], seller: str, category: str) -> Dict[str, Any] | None:
+    """Format a parsed retailer listing for catalog streaming or daily cache hydration."""
+    if not isinstance(listing, dict) or not listing.get("url"):
+        return None
+    price = listing.get("price")
+    base = {
+        **listing,
+        "price": f"${price:.2f} CAD" if isinstance(price, (int, float)) else listing.get("price"),
+        "seller": seller,
+    }
+    if category == "bottoms":
+        if listing.get("waist") is None:
+            return None
+        inseam = listing.get("inseam")
+        rise = listing.get("rise")
+        inseam_rise = (float(inseam) + float(rise)) if (inseam is not None and rise is not None) else None
+        return _build_match_payload(
+            base,
+            waist=listing.get("waist"),
+            inseam=inseam,
+            rise=rise,
+            inseam_rise=inseam_rise,
+            leg_opening=listing.get("legOpening"),
+            price_cad=float(price) if isinstance(price, (int, float)) else None,
+        )
+    if listing.get("p2p") is None or listing.get("length") is None:
+        return None
+    return _build_match_payload(
+        base,
+        p2p=listing.get("p2p"),
+        length=listing.get("length"),
+        price_cad=float(price) if isinstance(price, (int, float)) else None,
+    )
 
 
 def _process_item(item: Dict[str, Any], target_p2p: float, target_length: float,
@@ -853,7 +956,7 @@ def _match_retail_bottoms(listing, bottoms_measurements):
 
 def _search_retailer(source_id, search_id, max_items, max_links, max_price_cad,
                      target_p2p, target_length, p2p_tol, length_tol,
-                     category="tops", bottoms_measurements=None):
+                     category="tops", bottoms_measurements=None, force_refresh=False):
     """Run a catalogue search through the same persistent event stream as Depop."""
     seller = f"retail:{source_id}"
     processed = matches = 0
@@ -861,12 +964,19 @@ def _search_retailer(source_id, search_id, max_items, max_links, max_price_cad,
         "type": "progress", "phase": "collecting", "processed": 0, "total": 0,
         "matches": 0, "searchId": search_id,
     })
-    catalogue = search_catalogue(source_id, max_links, _cancel_check(search_id), max_price_cad, category)
+    if force_refresh:
+        catalogue = search_catalogue(source_id, max_links, _cancel_check(search_id), max_price_cad, category, force_refresh=True)
+    else:
+        catalogue = search_catalogue(source_id, max_links, _cancel_check(search_id), max_price_cad, category)
     with contextlib.closing(catalogue):
         total = next(catalogue)
         yield _sse({"type": "meta", "links": total, "seller": seller, "searchId": search_id})
         for url, listing in catalogue:
             processed += 1
+            if listing:
+                catalog_item = _format_retail_catalog_item(listing, seller, category)
+                if catalog_item is not None:
+                    yield _sse({"type": "catalog", "item": catalog_item, "searchId": search_id})
             matched_payload = None
             if listing and (max_price_cad is None or listing["price"] <= max_price_cad):
                 if category == "bottoms":
@@ -875,12 +985,14 @@ def _search_retailer(source_id, search_id, max_items, max_links, max_price_cad,
                         matched_payload = _build_match_payload(
                             {**listing, "price": f'${listing["price"]:.2f} CAD', "seller": seller},
                             **dims,
+                            price_cad=float(listing["price"]),
                         )
                 elif (parser.within(listing["p2p"], target_p2p, p2p_tol)
                         and parser.within(listing["length"], target_length, length_tol)):
                     matched_payload = _build_match_payload(
                         {**listing, "price": f'${listing["price"]:.2f} CAD', "seller": seller},
                         p2p=listing["p2p"], length=listing["length"],
+                        price_cad=float(listing["price"]),
                     )
             if matched_payload is not None:
                 matches += 1
@@ -895,6 +1007,7 @@ def _search_retailer(source_id, search_id, max_items, max_links, max_price_cad,
                 break
     yield _sse({
         "type": "done", "processed": processed, "total": total, "matches": matches,
+        "scannedMaxPriceCad": max_price_cad,
         "stopReason": "match_limit" if matches >= max_items else "completed", "searchId": search_id,
     })
 
@@ -942,6 +1055,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
     parse_workers = _listing_parse_worker_count(payload.get("parseWorkers"))
     headless = bool(payload.get("headless", True))
     slowmo = int(payload.get("slowmo") or 0)
+    force_refresh = bool(payload.get("forceRefresh", False))
     gender = payload.get("gender") or "male"
     groups = _normalize_groups(payload.get("groups") or "tops")
 
@@ -958,6 +1072,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
                     retail_source, search_id, max_items, max_links, max_price_cad,
                     target_p2p, target_length, p2p_tol, length_tol,
                     category=category, bottoms_measurements=bottoms_measurements,
+                    force_refresh=force_refresh,
                 )
                 return
 
@@ -970,6 +1085,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
                     emit_event=emit_stream_event, max_age_days=max_age_days,
                     cached_collections=cached_collections,
                     max_price_cad=max_price_cad,
+                    force_refresh=False,
                 )
                 return
 
@@ -1013,6 +1129,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
                                 slowmo=slowmo,
                                 max_age_days=max_age_days,
                                 max_price_cad=max_price_cad,
+                                force_refresh=force_refresh,
                             )
                         else:
                             yield from _browse_all(
@@ -1055,7 +1172,7 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
         acquired_slot = False
         waiting_state = None
         try:
-            cached_collections = None if retail_source else _cached_seller_collections(payload)
+            cached_collections = None if (retail_source or force_refresh) else _cached_seller_collections(payload)
             if cached_collections is not None:
                 for chunk in run_search(cached_collections):
                     job.publish(chunk)
@@ -1119,6 +1236,93 @@ def _ensure_search_job(payload: Dict[str, Any]) -> SearchJob:
     return job
 
 
+CATEGORY_DEPOP_GROUPS = {
+    "tops": ("tops", "coats-jackets"),
+    "coats-jackets": ("coats-jackets",),
+    "bottoms": ("bottoms",),
+    "footwear": ("footwear",),
+    "accessories": ("accessories",),
+}
+
+
+@app.get("/api/cache/daily")
+async def get_daily_cache(category: str = "tops"):
+    """Return today's cached, pre-parsed seller catalogs for instant client-side filtering."""
+    normalized = (category or "tops").strip().lower()
+    if normalized not in SUPPORTED_CATEGORIES:
+        raise HTTPException(status_code=422, detail=f"Unsupported category: {category}")
+
+    target_groups = set(CATEGORY_DEPOP_GROUPS.get(normalized, (normalized,)))
+    from urllib.parse import parse_qs, urlparse
+
+    sellers: Dict[str, Dict[str, Any]] = {}
+    seller_seen_urls: Dict[str, set[str]] = {}
+    seller_group_coverage: Dict[str, set[str]] = {}
+
+    for url, snapshot in list_cached_shop_collections():
+        parsed_url = urlparse(url)
+        query = parse_qs(parsed_url.query)
+        group = (query.get("groups") or [""])[0].strip().lower()
+        gender = (query.get("gender") or [""])[0].strip().lower()
+        if group not in target_groups or (gender and gender != "male"):
+            continue
+        seller_username = (extract_seller_username_from_href(url) or "").lower()
+        if not seller_username:
+            continue
+
+        entry = sellers.setdefault(seller_username, {
+            "total": 0,
+            "processed": 0,
+            "complete": True,
+            "scannedMaxPriceCad": None,
+            "items": [],
+        })
+        seen_urls = seller_seen_urls.setdefault(seller_username, set())
+        seller_group_coverage.setdefault(seller_username, set()).add(group)
+        if not snapshot.complete:
+            entry["complete"] = False
+
+        for link in snapshot.links:
+            if link in seen_urls:
+                continue
+            seen_urls.add(link)
+            entry["total"] += 1
+            item = snapshot.items.get(link)
+            if not item:
+                continue
+            entry["processed"] += 1
+            if item.get("seller") and item["seller"].lower() != seller_username:
+                continue
+            catalog_item = _extract_catalog_item(item, normalized, seller_sold_count=snapshot.sold_count)
+            if catalog_item is not None:
+                entry["items"].append(catalog_item)
+
+    for seller_username, entry in sellers.items():
+        if not target_groups.issubset(seller_group_coverage.get(seller_username, set())):
+            entry["complete"] = False
+
+    if normalized in {"tops", "bottoms"}:
+        for seller_key, retail_entry in get_cached_retail_catalogues(normalized).items():
+            formatted_items = []
+            for listing in retail_entry.get("items") or []:
+                formatted = _format_retail_catalog_item(listing, seller_key, normalized)
+                if formatted is not None:
+                    formatted_items.append(formatted)
+            sellers[seller_key] = {
+                "total": retail_entry.get("total", len(formatted_items)),
+                "processed": retail_entry.get("processed", len(formatted_items)),
+                "complete": bool(retail_entry.get("complete", False)),
+                "scannedMaxPriceCad": retail_entry.get("scannedMaxPriceCad"),
+                "items": formatted_items,
+            }
+
+    return {
+        "day": dt.date.today().isoformat(),
+        "category": normalized,
+        "sellers": sellers,
+    }
+
+
 @app.get("/api/search/retailers")
 async def search_retailers():
     """Expose configured retailer availability without making external requests."""
@@ -1177,7 +1381,7 @@ def _search_seller(ctx, page, seller, groups, gender,
                    reset_session: Optional[Callable[[], tuple[Any, Any]]] = None,
                    parse_workers: int = 1, headless: bool = True, slowmo: int = 0,
                    max_age_days: Optional[float] = None, cached_collections=None,
-                   max_price_cad: float | None = None):
+                   max_price_cad: float | None = None, force_refresh: bool = False):
     """Search a specific seller's listings."""
     should_cancel = _cancel_check(search_id)
     normalized_groups = _normalize_groups(groups)
@@ -1270,6 +1474,9 @@ def _search_seller(ctx, page, seller, groups, gender,
                 match = None
                 if (not _listing_exceeds_age_window(item, max_age_days)
                         and (not item.get('seller') or item['seller'].lower() == seller.lower())):
+                    catalog_item = _extract_catalog_item(item, category, seller_sold_count=seller_sold_count)
+                    if catalog_item is not None:
+                        emit_event({"type": "catalog", "item": catalog_item, "searchId": search_id or None})
                     match = _process_item(
                         item, target_p2p, target_length, p2p_tol, length_tol,
                         category, size_range, bottoms_measurements,
@@ -1290,9 +1497,11 @@ def _search_seller(ctx, page, seller, groups, gender,
             return True
 
         snapshot = (
-            cached_collections.get(group) if cached_collections is not None
-            else get_cached_shop_collection(search_url, remaining_capacity, seen_urls,
-                                            allow_partial=True, allow_stale=True)
+            None if force_refresh else (
+                cached_collections.get(group) if cached_collections is not None
+                else get_cached_shop_collection(search_url, remaining_capacity, seen_urls,
+                                                allow_partial=True, allow_stale=True)
+            )
         )
         if snapshot is not None:
             local_items.update(snapshot.items)
@@ -1304,7 +1513,7 @@ def _search_seller(ctx, page, seller, groups, gender,
                     grouped_links.append((group, snapshot.links))
                     continue
 
-        refresh_base = get_cached_shop_collection(search_url, 10000, allow_partial=True, allow_stale=True)
+        refresh_base = None if force_refresh else get_cached_shop_collection(search_url, 10000, allow_partial=True, allow_stale=True)
 
         if page is None:
             raise FetchError("The cached shop does not cover this search.")
@@ -1451,6 +1660,10 @@ def _search_seller(ctx, page, seller, groups, gender,
                             yield _sse({"type": "progress", "processed": processed, "total": total, "matches": matches, "searchId": search_id or None})
                             yield _sse({"type": "remove", "url": url, "searchId": search_id or None})
                             continue
+
+                        catalog_item = _extract_catalog_item(item, category, seller_sold_count=seller_sold_count)
+                        if catalog_item is not None:
+                            yield _sse({"type": "catalog", "item": catalog_item, "searchId": search_id or None})
 
                         match = _process_item(
                             item,
@@ -1701,6 +1914,10 @@ def _browse_all(ctx, page, groups, gender, target_p2p, target_length, p2p_tol, l
                                 )
                                 yield _sse({"type": "progress", "processed": processed, "total": len(seen_urls), "matches": matches, "searchId": search_id or None})
                                 continue
+
+                            catalog_item = _extract_catalog_item(item, category)
+                            if catalog_item is not None:
+                                yield _sse({"type": "catalog", "item": catalog_item, "searchId": search_id or None})
 
                             match = _process_item(
                                 item,

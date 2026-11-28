@@ -1,12 +1,18 @@
 """Read-only catalogue adapters for independently measured secondhand tops and bottoms."""
 
+import copy
+import datetime as dt
 import json
+import logging
 import math
 import os
 import re
+import sqlite3
 import time
+from contextlib import closing
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
+from pathlib import Path
 from threading import Lock
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, unquote, urljoin, urlsplit
@@ -49,8 +55,8 @@ MAX_COLLECTION_PAGES = 100
 MAX_COLLECTION_SCROLLS = 1500
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 REQUEST_INTERVAL = 1.5
-CATALOGUE_TTL = 180
-MAX_CACHED_PRODUCTS = 1000
+CATALOGUE_TTL = 86400
+MAX_CACHED_PRODUCTS = 2000
 TOP = re.compile(
     r"\b(?:"
     r"t[ -]?shirts?|tees?|shirts?|polos?|(?<!high[ -])tops?(?!\s+hats?)|tanks?|singlets?|jerseys?|"
@@ -496,7 +502,106 @@ class _OriginState:
 
 
 _ORIGINS = {source_id: _OriginState() for source_id in RETAILERS}
+_DEFAULT_ORIGINS = dict(_ORIGINS)
 _ACCESS_BLOCKS = {401, 403, 429}
+
+
+class RetailDailyCache:
+    """Persist scanned retailer catalogues and parsed products for the local calendar day."""
+
+    def __init__(self, *, path=None, day_key=None):
+        self.path = Path(path) if path else None
+        self.day_key = day_key or (lambda: dt.date.today().isoformat())
+        self._lock = Lock()
+
+    def _connect(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path, timeout=5)
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS retail_catalogues "
+            "(key TEXT PRIMARY KEY, day TEXT, payload TEXT)"
+        )
+        return connection
+
+    def _key(self, source_id, category):
+        return f"{source_id}|{category}"
+
+    def get(self, source_id, category, *, expected_origin=None):
+        if not self.path:
+            return None
+        today = self.day_key()
+        key = self._key(source_id, category)
+        with self._lock:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    connection.execute("DELETE FROM retail_catalogues WHERE day != ?", (today,))
+                    row = connection.execute(
+                        "SELECT payload FROM retail_catalogues WHERE key = ? AND day = ?",
+                        (key, today),
+                    ).fetchone()
+                    if not row:
+                        return None
+                    data = json.loads(row[0])
+                    if expected_origin and data.get("origin") != expected_origin:
+                        return None
+                    return copy.deepcopy(data)
+            except (OSError, sqlite3.Error, ValueError, TypeError):
+                logging.getLogger(__name__).warning("Could not read daily retail cache", exc_info=True)
+                return None
+
+    def put(self, source_id, category, data):
+        if not self.path:
+            return
+        today = self.day_key()
+        key = self._key(source_id, category)
+        with self._lock:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    connection.execute("DELETE FROM retail_catalogues WHERE day != ?", (today,))
+                    connection.execute(
+                        "INSERT OR REPLACE INTO retail_catalogues VALUES (?, ?, ?)",
+                        (key, today, json.dumps(data)),
+                    )
+            except (OSError, sqlite3.Error, TypeError):
+                logging.getLogger(__name__).warning("Could not persist daily retail cache", exc_info=True)
+
+    def discard(self, source_id, category):
+        if not self.path:
+            return
+        key = self._key(source_id, category)
+        with self._lock:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    connection.execute("DELETE FROM retail_catalogues WHERE key = ?", (key,))
+            except (OSError, sqlite3.Error):
+                logging.getLogger(__name__).warning("Could not clear daily retail cache", exc_info=True)
+
+    def list_for_category(self, category):
+        if not self.path:
+            return {}
+        today = self.day_key()
+        results = {}
+        with self._lock:
+            try:
+                with closing(self._connect()) as connection, connection:
+                    connection.execute("DELETE FROM retail_catalogues WHERE day != ?", (today,))
+                    rows = connection.execute(
+                        "SELECT payload FROM retail_catalogues WHERE day = ?",
+                        (today,),
+                    ).fetchall()
+                    for (encoded,) in rows:
+                        data = json.loads(encoded)
+                        if data.get("category") == category and data.get("source_id"):
+                            results[data["source_id"]] = data
+            except (OSError, sqlite3.Error, ValueError, TypeError):
+                logging.getLogger(__name__).warning("Could not list daily retail cache", exc_info=True)
+        return results
+
+
+RETAIL_DAILY_CACHE = RetailDailyCache(
+    path=os.environ.get("DEBOT_RETAIL_CACHE_PATH", str(Path(__file__).parent / ".cache" / "retail.sqlite3")),
+    day_key=lambda: dt.date.today().isoformat(),
+)
 
 
 def _pause_origin(store, state, status, response):
@@ -538,6 +643,9 @@ def _read(store, state, path, should_cancel, delay=REQUEST_INTERVAL):
         ttl = 900 if path == "/robots.txt" else CATALOGUE_TTL
         state.catalogues[path] = (time.monotonic() + ttl, body)
     return body
+
+
+_DEFAULT_READ = _read
 
 
 def _allowed(robots, url):
@@ -785,7 +893,39 @@ def _browser_candidates(store, state, robots, limit, should_cancel, delay, *, ca
     return candidates
 
 
-def search_catalogue(source_id, max_links, should_cancel, max_price_cad=None, category="tops"):
+def _use_daily_disk_cache(source_id, store, state):
+    return (
+        state is _DEFAULT_ORIGINS.get(source_id)
+        and not store.origin.startswith(("http://127.0.0.1", "http://localhost"))
+        and _read is _DEFAULT_READ
+    )
+
+
+def get_cached_retail_catalogues(category="tops"):
+    """Return today's cached retailer listings for the requested category."""
+    cached = RETAIL_DAILY_CACHE.list_for_category(category)
+    result = {}
+    for source_id, entry in cached.items():
+        if source_id not in RETAILERS or not source_enabled(source_id):
+            continue
+        candidates = entry.get("candidates") or {}
+        products = entry.get("products") or {}
+        items = []
+        for url in candidates:
+            item = products.get(url)
+            if isinstance(item, dict):
+                items.append(copy.deepcopy(item))
+        result[f"retail:{source_id}"] = {
+            "total": len(candidates),
+            "processed": len(candidates),
+            "complete": bool(entry.get("complete", False)),
+            "scannedMaxPriceCad": entry.get("scanned_max_price_cad"),
+            "items": items,
+        }
+    return result
+
+
+def search_catalogue(source_id, max_links, should_cancel, max_price_cad=None, category="tops", force_refresh=False):
     """Yield a candidate count followed by (url, parsed listing or None) pairs."""
     store = RETAILERS[source_id]
     if not source_enabled(source_id):
@@ -797,71 +937,150 @@ def search_catalogue(source_id, max_links, should_cancel, max_price_cad=None, ca
     while not state.lock.acquire(timeout=0.1):
         raise_if_cancelled(should_cancel)
     try:
-        robots_url = store.origin + "/robots.txt"
-        robots = RobotFileParser(robots_url)
-        robots_text = _read(store, state, "/robots.txt", should_cancel).lstrip("\ufeff")
-        if not re.search(r"^\s*User-agent\s*:", robots_text, re.I | re.M):
-            raise RetailAccessError("retailer_unavailable", f"{store.name}'s robots.txt could not be verified.")
-        robots.parse(robots_text.splitlines())
-        delay = max(REQUEST_INTERVAL, robots.crawl_delay(USER_AGENT) or 0)
-        rate = robots.request_rate(USER_AGENT)
-        if rate and rate.requests:
-            delay = max(delay, rate.seconds / rate.requests)
+        use_daily_disk = _use_daily_disk_cache(source_id, store, state)
+        if force_refresh:
+            state.catalogues = {k: v for k, v in state.catalogues.items() if k == "/robots.txt"}
+            state.scroll_cache = None
+            state.scroll_caches.clear()
+            state.products.clear()
+            if use_daily_disk:
+                RETAIL_DAILY_CACHE.discard(source_id, category)
+
+        daily_entry = (
+            RETAIL_DAILY_CACHE.get(source_id, category, expected_origin=store.origin)
+            if use_daily_disk and not force_refresh
+            else None
+        )
+        daily_products = dict((daily_entry or {}).get("products") or {})
+        daily_changed = False
+
+        candidates = {}
+        robots = None
+        delay = REQUEST_INTERVAL
+
+        def ensure_robots():
+            nonlocal robots, delay
+            if robots is not None:
+                return robots
+            robots_url = store.origin + "/robots.txt"
+            parsed_robots = RobotFileParser(robots_url)
+            robots_text = _read(store, state, "/robots.txt", should_cancel).lstrip("\ufeff")
+            if not re.search(r"^\s*User-agent\s*:", robots_text, re.I | re.M):
+                raise RetailAccessError("retailer_unavailable", f"{store.name}'s robots.txt could not be verified.")
+            parsed_robots.parse(robots_text.splitlines())
+            delay = max(REQUEST_INTERVAL, parsed_robots.crawl_delay(USER_AGENT) or 0)
+            rate = parsed_robots.request_rate(USER_AGENT)
+            if rate and rate.requests:
+                delay = max(delay, rate.seconds / rate.requests)
+            robots = parsed_robots
+            return robots
 
         def validate_path(path):
-            if not _allowed(robots, store.origin + path):
+            if not _allowed(ensure_robots(), store.origin + path):
                 raise RetailAccessError("retailer_restricted", f"{store.name}'s robots.txt restricts this catalogue path.")
 
         def read(path):
             validate_path(path)
             return _read(store, state, path, should_cancel, delay)
 
-        candidates = {}
-        for base in catalogues:
-            if len(candidates) >= max_links:
-                break
-            remaining = max_links - len(candidates)
-            if store.scroll_collection:
-                validate_path(base)
-                found = _browser_candidates(
-                    store, state, robots, remaining, should_cancel, delay, category=category, catalogue=base,
-                )
-                for url, card_price in found.items():
-                    if url not in candidates and len(candidates) >= max_links:
-                        break
-                    existing = candidates.get(url)
-                    if url not in candidates:
-                        candidates[url] = card_price
-                    elif card_price is not None and (existing is None or card_price < existing):
-                        candidates[url] = card_price
-            else:
-                current = base
-                for number in range(1, MAX_COLLECTION_PAGES + 1):
-                    parsed_page = _Page(read(current))
-                    _add_candidates(store, parsed_page.link_entries, candidates, max_links, category=category)
-                    current = _next_collection_path(store, parsed_page.links, number, catalogue=base)
-                    if len(candidates) >= max_links or current is None:
-                        break
+        if daily_entry and isinstance(daily_entry.get("candidates"), dict) and daily_entry["candidates"]:
+            for url, card_price in daily_entry["candidates"].items():
+                if len(candidates) >= max_links:
+                    break
+                candidates[url] = card_price
+        else:
+            ensure_robots()
+            for base in catalogues:
+                if len(candidates) >= max_links:
+                    break
+                remaining = max_links - len(candidates)
+                if store.scroll_collection:
+                    validate_path(base)
+                    found = _browser_candidates(
+                        store, state, robots, remaining, should_cancel, delay, category=category, catalogue=base,
+                    )
+                    for url, card_price in found.items():
+                        if url not in candidates and len(candidates) >= max_links:
+                            break
+                        existing = candidates.get(url)
+                        if url not in candidates:
+                            candidates[url] = card_price
+                        elif card_price is not None and (existing is None or card_price < existing):
+                            candidates[url] = card_price
                 else:
-                    raise RetailAccessError("retailer_unavailable", f"{store.name}'s collection exceeded the page limit.")
+                    current = base
+                    for number in range(1, MAX_COLLECTION_PAGES + 1):
+                        parsed_page = _Page(read(current))
+                        _add_candidates(store, parsed_page.link_entries, candidates, max_links, category=category)
+                        current = _next_collection_path(store, parsed_page.links, number, catalogue=base)
+                        if len(candidates) >= max_links or current is None:
+                            break
+                    else:
+                        raise RetailAccessError("retailer_unavailable", f"{store.name}'s collection exceeded the page limit.")
+            daily_changed = bool(candidates)
+
         yield len(candidates)
-        for url, card_price in candidates.items():
-            raise_if_cancelled(should_cancel)
-            path = urlsplit(url).path
-            validate_path(path)
-            cache_key = url if category == "tops" else (category, url)
-            cached = state.products.get(cache_key)
-            if cached and cached[0] > time.monotonic():
-                yield url, cached[1]
-                continue
-            if max_price_cad is not None and card_price is not None and card_price > max_price_cad:
-                yield url, None
-                continue
-            html = _read(store, state, path, should_cancel, delay)
-            item = parse_product(store, url, html, category=category) if html else None
-            if len(state.products) >= MAX_CACHED_PRODUCTS and cache_key not in state.products:
-                state.products.pop(next(iter(state.products)))
-            state.products[cache_key] = (time.monotonic() + CATALOGUE_TTL, item)
-            yield url, item
+        completed_all = True
+        try:
+            for url, card_price in candidates.items():
+                raise_if_cancelled(should_cancel)
+                cache_key = url if category == "tops" else (category, url)
+                if url in daily_products:
+                    item = daily_products[url]
+                    if len(state.products) >= MAX_CACHED_PRODUCTS and cache_key not in state.products:
+                        state.products.pop(next(iter(state.products)))
+                    state.products[cache_key] = (time.monotonic() + CATALOGUE_TTL, item)
+                    yield url, item
+                    continue
+                path = urlsplit(url).path
+                validate_path(path)
+                cached = state.products.get(cache_key)
+                if cached and cached[0] > time.monotonic():
+                    item = cached[1]
+                    if use_daily_disk:
+                        daily_products[url] = item
+                        daily_changed = True
+                    yield url, item
+                    continue
+                if max_price_cad is not None and card_price is not None and card_price > max_price_cad:
+                    yield url, None
+                    continue
+                html = _read(store, state, path, should_cancel, delay)
+                item = parse_product(store, url, html, category=category) if html else None
+                if len(state.products) >= MAX_CACHED_PRODUCTS and cache_key not in state.products:
+                    state.products.pop(next(iter(state.products)))
+                state.products[cache_key] = (time.monotonic() + CATALOGUE_TTL, item)
+                if use_daily_disk:
+                    daily_products[url] = item
+                    daily_changed = True
+                yield url, item
+        except BaseException:
+            completed_all = False
+            raise
+        finally:
+            if use_daily_disk and candidates and (daily_changed or completed_all):
+                prev_cap = (daily_entry or {}).get("scanned_max_price_cad")
+                had_prev = daily_entry is not None
+                if completed_all:
+                    all_fetched = all(url in daily_products for url in candidates)
+                    if all_fetched or max_price_cad is None:
+                        scanned_cap = None
+                    elif had_prev and prev_cap is None:
+                        scanned_cap = None
+                    elif had_prev and prev_cap is not None:
+                        scanned_cap = max(float(prev_cap), float(max_price_cad))
+                    else:
+                        scanned_cap = float(max_price_cad)
+                else:
+                    scanned_cap = prev_cap if had_prev else max_price_cad
+                RETAIL_DAILY_CACHE.put(source_id, category, {
+                    "origin": store.origin,
+                    "source_id": source_id,
+                    "category": category,
+                    "candidates": candidates,
+                    "products": daily_products,
+                    "scanned_max_price_cad": scanned_cap,
+                    "complete": bool(completed_all or (daily_entry or {}).get("complete", False)),
+                })
     finally:
         state.lock.release()

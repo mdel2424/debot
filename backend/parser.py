@@ -8,19 +8,42 @@ from typing import Optional, Tuple
 class MeasurementParser:
     """Parses clothing measurements from text descriptions."""
     
-    NUM = r'(?P<val>\d+(?:\.\d+)?(?:\s+\d\/\d)?)'
-    UNIT = r'''(?P<unit>\s*(?:cm|mm|["'″]?\s*(?:inches|inch|in)\b|["'″]))?'''
+    NUM = r'(?<![a-z0-9])(?P<val>\d+(?:\.\d+)?(?:\s+\d\/\d)?)'
+    UNIT = r'''(?P<unit>\s*(?:cm\b|mm\b|["'″]?\s*(?:inches|inch|in)\b|["'″]))?(?![a-z])'''
     LINE_LABEL_GAP = 40
-    P2P_LABELS = r'(?:p2p|pit\s*[- ]?(?:to|2)\s*[- ]?pit|chest|width|across\s*chest|pit)'
+    FORWARD_GAP = (
+        r'(?:'
+        r'\s*\([^0-9\n]{1,50}\)'
+        r'|[\s:=~\-\u2013\u2014.(]+'
+        r'|\s+(?:is|approx\.?|approximately|about|around|measures?|measured|flat|laid\s+flat|front|back|total|in\s+inches)\b'
+        r'){0,6}?'
+    )
+    BACKWARD_GAP = r'[\s:=~\-\u2013\u2014.(]{0,12}'
+    P2P_LABELS = (
+        r'(?:p2p|pit\s*[- ]?(?:to|2)\s*[- ]?pit|chest|width|across\s*chest|'
+        r'(?<!to )(?<!to-)(?<!2 )(?<!2-)(?<!from )(?<!from-)pit(?!\s*[- ]?(?:to|2)\b))'
+    )
     LENGTH_LABELS = (
-        r'(?:length|top\s*to\s*bottom|back\s*length|hps\s*to\s*hem|'
+        r'(?:(?<!sleeve )(?<!sleeve-)(?<!sleeves )(?<!arm )(?<!arm-)'
+        r'(?<!inseam )(?<!outseam )(?<!cuff )(?<!zipper )(?<!strap )length|'
+        r'top\s*to\s*bottom|back\s*length|hps\s*to\s*hem|'
         r'neck\s*to\s*hem|shoulder\s*to\s*(?:hem|bottom)|'
         r'collar\s*(?:[- ]?down|to\s*(?:bottom|hem)))'
     )
     WAIST_LABELS = r'(?:waist|waistband|across\s*waist)'
     INSEAM_LABELS = r'(?:inseam)'
     RISE_LABELS = r'(?:front\s*rise|rise)'
-    LEG_OPENING_LABELS = r'(?:leg\s*opening|bottom\s*hem|bottom\s*opening|hem\s*opening|ankle\s*opening|leg\s*hem|leg)'
+    LEG_OPENING_LABELS = (
+        r'(?:leg\s*opening|bottom\s*hem|bottom\s*opening|hem\s*opening|'
+        r'ankle\s*opening|leg\s*hem|'
+        r'(?<!zipper )(?<!zip )(?<!fly )(?<!pocket )(?<!button )(?<!neck )(?<!arm )(?<!sleeve )opening|'
+        r'(?<!wide )(?<!straight )(?<!tapered )(?<!bootcut )(?<!flare )(?<!flared )'
+        r'(?<!relaxed )(?<!loose )(?<!baggy )(?<!slim )(?<!skinny )(?<!pant )(?<!pants )leg)'
+    )
+    RE_MEASURED_WAIST_W = re.compile(
+        r'(?<![a-z0-9])(?P<val>\d+(?:\.\d+)?)\s*["\'″]\s*w\b',
+        re.I,
+    )
     
     RE_P2P = re.compile(rf'\b{P2P_LABELS}\b[^0-9]{{0,10}}{NUM}{UNIT}', re.I)
     RE_LENGTH = re.compile(rf'\b{LENGTH_LABELS}\b[^0-9]{{0,10}}{NUM}{UNIT}', re.I)
@@ -70,21 +93,50 @@ class MeasurementParser:
             return value / 25.4
         return value
 
-    def _extract_labeled_value_from_line(self, line: str, label_pattern: str) -> Optional[float]:
+    def _extract_labeled_value_from_line(
+        self,
+        line: str,
+        label_pattern: str,
+        *,
+        claimed_spans: Optional[set[tuple[int, int]]] = None,
+        backward_blocked_spans: Optional[set[tuple[int, int]]] = None,
+    ) -> Optional[float]:
         """Extract a labeled measurement from a single line, supporting either label order."""
         patterns = (
-            re.compile(rf'\b{label_pattern}\b[^0-9\n]{{0,{self.LINE_LABEL_GAP}}}{self.NUM}{self.UNIT}', re.I),
-            re.compile(rf'{self.NUM}{self.UNIT}[^a-z0-9\n]{{0,{self.LINE_LABEL_GAP}}}\b{label_pattern}\b', re.I),
+            (
+                "forward",
+                re.compile(rf'\b{label_pattern}\b{self.FORWARD_GAP}{self.NUM}{self.UNIT}', re.I),
+            ),
+            (
+                "backward",
+                re.compile(rf'{self.NUM}{self.UNIT}{self.BACKWARD_GAP}\b{label_pattern}\b', re.I),
+            ),
         )
-        for pattern in patterns:
-            match = pattern.search(line)
-            if not match:
-                continue
-            try:
-                return self.to_inches(match.group("val"), match.group("unit") or "")
-            except Exception:
-                continue
+        for direction, pattern in patterns:
+            for match in pattern.finditer(line):
+                val_span = match.span("val")
+                if claimed_spans and val_span in claimed_spans:
+                    continue
+                if direction == "backward" and backward_blocked_spans and val_span in backward_blocked_spans:
+                    continue
+                try:
+                    value = self.to_inches(match.group("val"), match.group("unit") or "")
+                except Exception:
+                    continue
+                if claimed_spans is not None:
+                    claimed_spans.add(val_span)
+                return value
         return None
+
+    def _pair_rhs_spans(self, line: str, pair_regex: re.Pattern) -> set[tuple[int, int]]:
+        """Return value spans for the right-hand operand of bare WxL pairs on a line."""
+        spans: set[tuple[int, int]] = set()
+        for match in pair_regex.finditer(line):
+            for group_name in ("l", "inseam"):
+                if group_name in match.groupdict() and match.group(group_name) is not None:
+                    spans.add(match.span(group_name))
+                    break
+        return spans
 
     def _extract_pair_from_line(
         self,
@@ -159,15 +211,27 @@ class MeasurementParser:
         length = None
 
         for raw_line in t.splitlines():
-            line = raw_line.strip()
+            line = re.sub(r"[ \t]+", " ", raw_line).strip()
             if not line:
                 continue
 
             for segment in self._split_measurement_segments(line):
+                claimed_spans: set[tuple[int, int]] = set()
+                pair_rhs_spans = self._pair_rhs_spans(segment, self.RE_PAIR_X)
                 if p2p is None:
-                    p2p = self._extract_labeled_value_from_line(segment, self.P2P_LABELS)
+                    p2p = self._extract_labeled_value_from_line(
+                        segment,
+                        self.P2P_LABELS,
+                        claimed_spans=claimed_spans,
+                        backward_blocked_spans=pair_rhs_spans,
+                    )
                 if length is None:
-                    length = self._extract_labeled_value_from_line(segment, self.LENGTH_LABELS)
+                    length = self._extract_labeled_value_from_line(
+                        segment,
+                        self.LENGTH_LABELS,
+                        claimed_spans=claimed_spans,
+                        backward_blocked_spans=pair_rhs_spans,
+                    )
 
                 if p2p is None or length is None:
                     pair = self._extract_pair_from_line(
@@ -225,15 +289,28 @@ class MeasurementParser:
                 return 1
             return 2
 
-        for line in t.splitlines():
-            normalized_line = line.strip()
+        for raw_line in t.splitlines():
+            normalized_line = re.sub(r"[ \t]+", " ", raw_line).strip()
             if not normalized_line:
                 continue
 
             for segment in self._split_measurement_segments(normalized_line):
+                claimed_spans: set[tuple[int, int]] = set()
                 for key, label_pattern in label_map.items():
-                    value = self._extract_labeled_value_from_line(segment, label_pattern)
-                    assign_value(key, value, 3)
+                    value = self._extract_labeled_value_from_line(
+                        segment,
+                        label_pattern,
+                        claimed_spans=claimed_spans,
+                    )
+                    assign_value(key, value, 4)
+
+                waist_w_match = self.RE_MEASURED_WAIST_W.search(segment)
+                if waist_w_match and waist_w_match.span("val") not in claimed_spans:
+                    try:
+                        assign_value("waist", self.to_inches(waist_w_match.group("val")), 4)
+                        claimed_spans.add(waist_w_match.span("val"))
+                    except Exception:
+                        pass
 
                 pair = self._extract_pair_from_line(
                     segment,

@@ -170,3 +170,22 @@ class ShopCache:
             self._entries.clear()
             self._item_count = 0
             self._persist()
+
+    def list_snapshots(self):
+        """Return copies of all currently retained snapshots (for today's daily cache)."""
+        with self._lock:
+            self._prune()
+            results = []
+            for key, (created, _, snapshot) in self._entries.items():
+                fresh = self.clock() - created < self.ttl_seconds
+                results.append((
+                    key,
+                    ShopSnapshot(
+                        list(snapshot.links),
+                        copy.deepcopy(snapshot.items),
+                        snapshot.complete,
+                        snapshot.sold_count,
+                        fresh,
+                    ),
+                ))
+            return results

@@ -131,12 +131,12 @@ def _read_int_env(name: str, default: int) -> int:
 MIN_NAV_INTERVAL_SECONDS = _read_float_env("DEBOT_MIN_NAV_INTERVAL_SECONDS", 0.0)
 RATE_LIMIT_NAV_INTERVAL_SECONDS = _read_float_env("DEBOT_RATE_LIMIT_NAV_INTERVAL_SECONDS", 1.0)
 REQUEST_INTERVAL_SECONDS = _read_float_env("DEBOT_REQUEST_INTERVAL_SECONDS", 1.0)
-LISTING_CACHE_TTL_SECONDS = _read_float_env("DEBOT_LISTING_CACHE_TTL_SECONDS", 300.0)
-LISTING_CACHE_MAX_ITEMS = _read_int_env("DEBOT_LISTING_CACHE_MAX_ITEMS", 1000)
+LISTING_CACHE_TTL_SECONDS = _read_float_env("DEBOT_LISTING_CACHE_TTL_SECONDS", 86400.0)
+LISTING_CACHE_MAX_ITEMS = _read_int_env("DEBOT_LISTING_CACHE_MAX_ITEMS", 5000)
 SHOP_CACHE = ShopCache(
-    ttl_seconds=_read_float_env("DEBOT_SHOP_CACHE_TTL_SECONDS", 300),
-    max_items=_read_int_env("DEBOT_SHOP_CACHE_MAX_ITEMS", 50000),
-    max_entries=_read_int_env("DEBOT_SHOP_CACHE_MAX_ENTRIES", 256),
+    ttl_seconds=_read_float_env("DEBOT_SHOP_CACHE_TTL_SECONDS", 86400),
+    max_items=_read_int_env("DEBOT_SHOP_CACHE_MAX_ITEMS", 150000),
+    max_entries=_read_int_env("DEBOT_SHOP_CACHE_MAX_ENTRIES", 512),
     path=os.environ.get("DEBOT_SHOP_CACHE_PATH", str(Path(__file__).parent / '.cache' / 'shops.sqlite3')),
     day_key=lambda: dt.date.today().isoformat(),
 )
@@ -232,6 +232,11 @@ def invalidate_cached_listings(urls):
         for url in urls:
             _LISTING_CACHE.pop(url, None)
     SHOP_CACHE.invalidate_urls(urls)
+
+
+def list_cached_shop_collections():
+    """Return all cached shop snapshots retained for today."""
+    return SHOP_CACHE.list_snapshots()
 
 
 def unavailable_shop_urls(page):

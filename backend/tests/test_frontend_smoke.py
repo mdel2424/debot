@@ -11,6 +11,12 @@ from playwright.sync_api import expect, sync_playwright
 
 RETAILER_NAMES = ["Wildrose Vintage", "La Penderie du Paradis", "People's Thrift"]
 RETAILER_IDS = ["wildrose", "la-penderie", "peoples-thrift"]
+V4_SELLERS = {
+    "greatlakesgrails", "thegoodsale", "jimmyvntg", "agfthrifts", "remainder",
+    "davos_wrld", "blueangelvtg", "mr_swag4life", "lileggyvintage",
+    "easyeddiesvintage", "rudra_19", "jpazcloset", "mtl_finepieces",
+    "kittycloset05", "sjthr1fts", "hiddenrags", "spotmarkedx", "inkloom", "width",
+}
 
 
 @unittest.skipUnless(os.getenv('DEBOT_FRONTEND_URL'), 'Set DEBOT_FRONTEND_URL to run browser regressions.')
@@ -22,7 +28,7 @@ class FrontendSmokeTest(unittest.TestCase):
         self.context.set_default_timeout(10000)
         self.context.add_init_script("""
             if (!localStorage.getItem('debot.followingAccounts.v1')) {
-                localStorage.setItem('debot.sellerAdditions.version', '3');
+                localStorage.setItem('debot.sellerAdditions.version', '4');
                 localStorage.setItem('debot.followingAccounts.v1', JSON.stringify([
                     {username: 'fixture_one', name: 'Fixture One'},
                     {username: 'fixture_two', name: 'Fixture Two'}
@@ -33,6 +39,9 @@ class FrontendSmokeTest(unittest.TestCase):
         self.context.route("**/api/search/retailers", lambda route: route.fulfill(json=[
             {"id": source_id, "enabled": True} for source_id in RETAILER_IDS
         ]))
+        self.context.route("**/api/cache/daily*", lambda route: route.fulfill(json={
+            "day": dt.date.today().isoformat(), "category": "tops", "sellers": {},
+        }))
         self.page = self.context.new_page()
         self.errors = []
         self.page.on('pageerror', lambda error: self.errors.append(str(error)))
@@ -414,22 +423,23 @@ class FrontendSmokeTest(unittest.TestCase):
             }
         """)
         self.page.goto(self.url)
-        self.page.wait_for_function("localStorage.getItem('debot.sellerAdditions.version') === '3'")
+        self.page.wait_for_function("localStorage.getItem('debot.sellerAdditions.version') === '4'")
         sellers = self.page.evaluate("JSON.parse(localStorage.getItem('debot.followingAccounts.v1'))")
-        self.assertEqual(len(sellers), 6)
+        expected_usernames = {
+            'fixture_one', 'theloopmtl', 'thriftsnspliffs', 'mountainvintagethrifts',
+            'secondlifeinc', 'vintagebysherman', *V4_SELLERS,
+        }
+        self.assertEqual(len(sellers), len(expected_usernames))
         self.assertEqual(sellers[0], {'username': 'fixture_one', 'name': 'My Custom Name'})
         self.assertEqual(sellers[1], {'username': 'theloopmtl', 'name': 'My Loop Name'})
-        self.assertEqual({seller['username'] for seller in sellers}, {
-            'fixture_one', 'theloopmtl', 'thriftsnspliffs', 'mountainvintagethrifts',
-            'secondlifeinc', 'vintagebysherman',
-        })
+        self.assertEqual({seller['username'] for seller in sellers}, expected_usernames)
         self.page.evaluate("""localStorage.setItem('debot.followingAccounts.v1', JSON.stringify(
             JSON.parse(localStorage.getItem('debot.followingAccounts.v1'))
                 .filter(seller => !['thriftsnspliffs', 'secondlifeinc'].includes(seller.username))
         ))""")
         self.page.reload()
-        self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.followingAccounts.v1')).length === 4")
-        self.assertEqual(self.page.locator('.seller-row-card').count(), 4 + len(RETAILER_NAMES))
+        self.page.wait_for_function(f"JSON.parse(localStorage.getItem('debot.followingAccounts.v1')).length === {len(expected_usernames) - 2}")
+        self.assertEqual(self.page.locator('.seller-row-card').count(), len(expected_usernames) - 2 + len(RETAILER_NAMES))
         self.assertEqual(self.errors, [])
 
     def test_second_seller_update_preserves_removals_and_existing_custom_names(self):
@@ -444,14 +454,15 @@ class FrontendSmokeTest(unittest.TestCase):
             }
         """)
         self.page.goto(self.url)
-        self.page.wait_for_function("localStorage.getItem('debot.sellerAdditions.version') === '3'")
+        self.page.wait_for_function("localStorage.getItem('debot.sellerAdditions.version') === '4'")
         sellers = self.page.evaluate("JSON.parse(localStorage.getItem('debot.followingAccounts.v1'))")
-        self.assertEqual(sellers, [
+        self.assertEqual(sellers[:3], [
             {'username': 'fixture_one', 'name': 'My Custom Seller'},
             {'username': 'secondlifeinc', 'name': 'My Second Life Name'},
             {'username': 'vintagebysherman', 'name': 'Vintage by Sherman'},
         ])
-        self.assertEqual(self.page.locator('.seller-row-card').count(), 3 + len(RETAILER_NAMES))
+        self.assertEqual({s['username'] for s in sellers[3:]}, V4_SELLERS)
+        self.assertEqual(self.page.locator('.seller-row-card').count(), 3 + len(V4_SELLERS) + len(RETAILER_NAMES))
         self.assertEqual(self.errors, [])
 
     def test_removed_sellers_leave_saved_lists_and_workspaces_without_resetting_other_results(self):
@@ -478,22 +489,25 @@ class FrontendSmokeTest(unittest.TestCase):
             }
         """)
         self.page.goto(self.url)
-        self.page.wait_for_function("localStorage.getItem('debot.sellerAdditions.version') === '3'")
+        self.page.wait_for_function("localStorage.getItem('debot.sellerAdditions.version') === '4'")
         self.page.wait_for_function("""Object.values(JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')))
-            .every(workspace => JSON.stringify(workspace.sellerRows.map(row => row.seller))
-                === JSON.stringify(['fixture_one', 'secondlifeinc']))""")
+            .every(workspace => !workspace.sellerRows.some(row => ['former_vintage', 'gwoodsgear', 'jizzypantthrifts'].includes(row.seller)))""")
         self.page.reload()
         sellers = self.page.evaluate("JSON.parse(localStorage.getItem('debot.followingAccounts.v1'))")
-        self.assertEqual(sellers, [
+        self.assertEqual(sellers[:2], [
             {'username': 'fixture_one', 'name': 'My Custom Seller'},
             {'username': 'secondlifeinc', 'name': 'My Second Life Name'},
         ])
+        self.assertEqual({s['username'] for s in sellers[2:]}, V4_SELLERS)
         workspaces = self.page.evaluate("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1'))")
         for workspace in workspaces.values():
-            self.assertEqual([row['seller'] for row in workspace['sellerRows']], ['fixture_one', 'secondlifeinc'])
+            usernames = [row['seller'] for row in workspace['sellerRows']]
+            self.assertEqual(usernames[:2], ['fixture_one', 'secondlifeinc'])
+            for removed in ('former_vintage', 'gwoodsgear', 'jizzypantthrifts'):
+                self.assertNotIn(removed, usernames)
         self.assertEqual(workspaces['tops']['sellerRows'][0]['results'][0]['url'], 'https://www.depop.com/products/keep/')
         self.assertEqual(requests, [])
-        self.assertEqual(self.page.locator('.seller-row-card').count(), 2 + len(RETAILER_NAMES))
+        self.assertEqual(self.page.locator('.seller-row-card').count(), 2 + len(V4_SELLERS) + len(RETAILER_NAMES))
         self.assertEqual(self.errors, [])
 
     def test_queued_seller_shows_the_shared_rate_limit_countdown(self):
@@ -621,6 +635,102 @@ class FrontendSmokeTest(unittest.TestCase):
             self.page.wait_for_function("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].processed")
             results = self.page.evaluate("JSON.parse(localStorage.getItem('debot.pageWorkspaces.v1')).tops.sellerRows[0].results")
             self.assertEqual([item['url'] for item in results], ['https://www.depop.com/products/current/'])
+        self.assertEqual(self.errors, [])
+
+    def test_realtime_filter_mask_and_live_hit_sorting_without_researching(self):
+        stream_calls = []
+
+        def stream(route):
+            payload = route.request.post_data_json
+            stream_calls.append(payload['seller'])
+            if payload['seller'] == 'fixture_one':
+                items = [
+                    {'url': 'https://www.depop.com/products/one-a/', 'seller': 'fixture_one',
+                     'title': 'Vintage Nike Tee', 'price': '$25.00 CAD', 'priceCad': 25, 'p2p': 21, 'length': 27},
+                    {'url': 'https://www.depop.com/products/one-b/', 'seller': 'fixture_one',
+                     'title': 'Carhartt Detroit Jacket', 'price': '$65.00 CAD', 'priceCad': 65, 'p2p': 21, 'length': 27},
+                    {'url': 'https://www.depop.com/products/one-c/', 'seller': 'fixture_one',
+                     'title': 'Boxy Sweatshirt', 'price': '$30.00 CAD', 'priceCad': 30, 'p2p': 23, 'length': 27},
+                ]
+            else:
+                items = [
+                    {'url': 'https://www.depop.com/products/two-a/', 'seller': 'fixture_two',
+                     'title': 'Polo Ralph Lauren Tee', 'price': '$20.00 CAD', 'priceCad': 20, 'p2p': 20.75, 'length': 27},
+                    {'url': 'https://www.depop.com/products/two-b/', 'seller': 'fixture_two',
+                     'title': 'Champion Reverse Weave', 'price': '$32.00 CAD', 'priceCad': 32, 'p2p': 21, 'length': 26.75},
+                ]
+            events = [{'type': 'catalog', 'item': item} for item in items]
+            events.append({'type': 'done', 'processed': len(items), 'total': len(items), 'matches': 0})
+            route.fulfill(content_type='text/event-stream', body=''.join(self.event(e) for e in events))
+
+        self.context.route('**/api/search/stream', stream)
+        self.page.goto(self.url + '#tops')
+        self.search_seller('Fixture One').click()
+        expect(self.page.locator('.result-card')).to_have_count(1)
+        # Fixture One (1 hit) moves ahead of 0-hit rows
+        expect(self.page.locator('.seller-name').first).to_have_text('Fixture One')
+
+        self.search_seller('Fixture Two').click()
+        expect(self.page.locator('.result-card')).to_have_count(3)
+        # Fixture Two (2 hits) sorts ahead of Fixture One (1 hit)
+        expect(self.page.locator('.seller-name').nth(0)).to_have_text('Fixture Two')
+        expect(self.page.locator('.seller-name').nth(1)).to_have_text('Fixture One')
+        self.assertEqual(len(stream_calls), 2)
+
+        # Refine filters in real time — ZERO additional backend searches!
+        self.page.get_by_role('textbox', name='Max price (CAD)').fill('70')
+        expect(self.page.locator('.result-card')).to_have_count(4)
+        self.page.get_by_role('textbox', name='Pit to pit maximum').fill('23.5')
+        expect(self.page.locator('.result-card')).to_have_count(5)
+        # Now Fixture One has 3 hits > Fixture Two (2 hits), so Fixture One rises to #1 live!
+        expect(self.page.locator('.seller-name').nth(0)).to_have_text('Fixture One')
+        expect(self.page.locator('.seller-name').nth(1)).to_have_text('Fixture Two')
+
+        # Keyword filter masks instantly
+        self.page.get_by_role('textbox', name='Keyword filter').fill('carhartt')
+        expect(self.page.locator('.result-card')).to_have_count(1)
+        expect(self.page.get_by_text('Carhartt Detroit Jacket', exact=True)).to_be_visible()
+
+        # Gallery view renders flat matching grid cleanly
+        self.page.get_by_role('textbox', name='Keyword filter').fill('')
+        self.page.get_by_role('button', name=re.compile(r'^Gallery')).click()
+        expect(self.page.locator('.gallery-results-grid .result-card')).to_have_count(5)
+        self.assertEqual(len(stream_calls), 2)
+        self.assertEqual(self.errors, [])
+
+    def test_daily_cache_hydrates_on_load_and_flags_higher_retail_price_cap(self):
+        self.context.unroute('**/api/cache/daily*')
+        self.context.route('**/api/cache/daily*', lambda route: route.fulfill(json={
+            'day': dt.date.today().isoformat(),
+            'category': 'tops',
+            'sellers': {
+                'fixture_one': {
+                    'total': 2, 'processed': 2, 'complete': True, 'scannedMaxPriceCad': None,
+                    'items': [
+                        {'url': 'https://www.depop.com/products/c1/', 'seller': 'fixture_one',
+                         'title': 'Cached Vintage Tee', 'price': '$28.00 CAD', 'priceCad': 28, 'p2p': 21, 'length': 27},
+                        {'url': 'https://www.depop.com/products/c2/', 'seller': 'fixture_one',
+                         'title': 'Cached Premium Knit', 'price': '$55.00 CAD', 'priceCad': 55, 'p2p': 21, 'length': 27},
+                    ],
+                },
+                'retail:wildrose': {
+                    'total': 5, 'processed': 5, 'complete': True, 'scannedMaxPriceCad': 35,
+                    'items': [
+                        {'url': 'https://www.wildrosevintage.ca/products/t1', 'seller': 'retail:wildrose',
+                         'title': 'Wildrose Tee', 'price': '$30.00 CAD', 'priceCad': 30, 'p2p': 21, 'length': 27},
+                    ],
+                },
+            },
+        }))
+        self.page.goto(self.url + '#tops')
+        expect(self.page.get_by_text('Cached Vintage Tee', exact=True)).to_be_visible()
+        expect(self.page.get_by_text('Wildrose Tee', exact=True)).to_be_visible()
+        expect(self.page.get_by_text('Cached Premium Knit', exact=True)).to_have_count(0)
+
+        # Raise max price -> Depop cached item appears instantly AND Wildrose shows rescan hint!
+        self.page.get_by_role('textbox', name='Max price (CAD)').fill('60')
+        expect(self.page.get_by_text('Cached Premium Knit', exact=True)).to_be_visible()
+        expect(self.page.get_by_text('Scanned up to $35 CAD today', exact=False)).to_be_visible()
         self.assertEqual(self.errors, [])
 
 
