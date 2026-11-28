@@ -41,7 +41,7 @@ const PAGE_WORKSPACES_STORAGE_KEY = 'debot.pageWorkspaces.v1';
 const DAILY_CATALOG_STORAGE_KEY = 'debot.dailyCatalog.v1';
 const LOW_PARSE_RETRY_RATIO = 0.9;
 const MAX_LOW_PARSE_RETRIES = 1;
-const INITIAL_VISIBLE_RESULTS = 8;
+const INITIAL_VISIBLE_RESULTS = 7;
 
 const CATEGORY_ICONS = { tops: Shirt, bottoms: ArrowDownUp, footwear: Footprints, accessories: Shapes };
 const TOPS_RANGES = [

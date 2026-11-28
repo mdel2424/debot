@@ -4,28 +4,17 @@ Search Depop and retailer listings by clothing measurements or shoe size.
 The React workspace saves sellers, filters, and results locally. Seller searches
 continue in the Python backend when the browser tab closes.
 
-## Setup
+## Quick Start
 
 Use Python 3.13 (see `.python-version`) and Node 22.12+ or Node 20.19+.
-From the repository root:
+From the repository root, run one command (no manual `venv` activation needed):
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/pip install -r backend/requirements.txt
-.venv/bin/python -m playwright install firefox
-.venv/bin/python -m uvicorn main:app --app-dir backend --host 127.0.0.1 --port 8000
+./start
 ```
 
-In another terminal:
+This automatically uses `.venv` (creating it and installing dependencies on first run if needed), starts both the FastAPI backend (`http://127.0.0.1:8000`) and the Vite frontend (`http://127.0.0.1:5173`), opens Debot in your browser, and stops both cleanly on `Ctrl+C`. Use `./start --no-open` to skip opening the browser. In VS Code, you can also run the default **Start Debot** task (`Ctrl+Shift+B`).
 
-```bash
-cd frontend
-npm ci
-npm run dev
-```
-
-Open the URL printed by Vite, normally <http://127.0.0.1:5173>.
 Vite proxies `/api` to the backend. For a separate API origin, set
 `VITE_API_BASE` and the backend's `DEBOT_ALLOWED_ORIGINS`.
 A production frontend needs an `/api` reverse proxy or an explicit API base.
@@ -91,11 +80,11 @@ A production frontend needs an `/api` reverse proxy or an explicit API base.
 | `DEBOT_MIN_NAV_INTERVAL_SECONDS` | `0` | Optional fixed request spacing |
 | `DEBOT_REQUEST_INTERVAL_SECONDS` | `1` | Shared spacing for cursor requests and uncached product navigations |
 | `DEBOT_RATE_LIMIT_NAV_INTERVAL_SECONDS` | `1` | Temporary recovery spacing |
-| `DEBOT_LISTING_CACHE_TTL_SECONDS` | `300` | Listing cache lifetime |
-| `DEBOT_LISTING_CACHE_MAX_ITEMS` | `1000` | Listing cache capacity |
-| `DEBOT_SHOP_CACHE_TTL_SECONDS` | `300` | Time before checking for inventory updates; same-day data is retained; 0 disables reuse |
-| `DEBOT_SHOP_CACHE_MAX_ITEMS` | `50000` | Total detail records retained in daily shop snapshots |
-| `DEBOT_SHOP_CACHE_MAX_ENTRIES` | `256` | Seller/category/gender snapshots retained within the item budget |
+| `DEBOT_LISTING_CACHE_TTL_SECONDS` | `86400` | Listing cache lifetime (daily) |
+| `DEBOT_LISTING_CACHE_MAX_ITEMS` | `5000` | Listing cache capacity |
+| `DEBOT_SHOP_CACHE_TTL_SECONDS` | `86400` | Daily shop cache freshness lifetime; expires at midnight; 0 disables reuse |
+| `DEBOT_SHOP_CACHE_MAX_ITEMS` | `150000` | Total detail records retained in daily shop snapshots |
+| `DEBOT_SHOP_CACHE_MAX_ENTRIES` | `512` | Seller/category/gender snapshots retained within the item budget |
 | `DEBOT_SHOP_CACHE_PATH` | `backend/.cache/shops.sqlite3` | Daily inventory database; empty disables disk persistence |
 | `DEBOT_SEARCH_JOB_HISTORY` | `500` | Retained jobs; completed jobs pruned first |
 | `DEBOT_ALLOWED_ORIGINS` | Localhost Vite origins | Allowed browser origins |

@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_PY="$ROOT/.venv/bin/python"
+VITE_BIN="$ROOT/frontend/node_modules/.bin/vite"
+BACKEND_HOST="${DEBOT_BACKEND_HOST:-127.0.0.1}"
+BACKEND_PORT="${DEBOT_BACKEND_PORT:-8000}"
+FRONTEND_HOST="${DEBOT_FRONTEND_HOST:-127.0.0.1}"
+FRONTEND_PORT="${DEBOT_FRONTEND_PORT:-5173}"
+OPEN_BROWSER="${DEBOT_NO_OPEN:-0}"
+
+for arg in "$@"; do
+  case "$arg" in
+    --no-open) OPEN_BROWSER=1 ;;
+    -h|--help)
+      echo "Usage: ./start [--no-open]"
+      echo "Starts both the Debot FastAPI backend (:$BACKEND_PORT) and Vite frontend (:$FRONTEND_PORT)."
+      echo "Automatically uses .venv without manual activation and stops both servers on Ctrl+C."
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $arg (try ./start --help)" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Auto-setup .venv if missing
+if [[ ! -x "$VENV_PY" ]]; then
+  echo "[debot] Setting up Python virtual environment (.venv)..."
+  python3 -m venv "$ROOT/.venv"
+  "$VENV_PY" -m pip install --upgrade pip
+  "$ROOT/.venv/bin/pip" install -r "$ROOT/backend/requirements.txt"
+  "$VENV_PY" -m playwright install firefox
+fi
+
+# Auto-install frontend dependencies if missing
+if [[ ! -x "$VITE_BIN" ]]; then
+  echo "[debot] Installing frontend dependencies..."
+  npm --prefix "$ROOT/frontend" ci
+fi
+
+BACKEND_PID=""
+FRONTEND_PID=""
+WATCHER_PID=""
+
+kill_tree() {
+  local pid="${1:-}"
+  [[ -z "$pid" ]] && return 0
+  if command -v pkill >/dev/null 2>&1; then
+    pkill -TERM -P "$pid" 2>/dev/null || true
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
+cleanup() {
+  local exit_code=$?
+  trap - EXIT INT TERM
+  kill_tree "$WATCHER_PID"
+  kill_tree "$FRONTEND_PID"
+  kill_tree "$BACKEND_PID"
+  # Give servers up to 2s to exit gracefully, then force-stop any stragglers
+  for _ in 1 2 3 4 5 6 7 8; do
+    if { [[ -z "$BACKEND_PID" ]] || ! kill -0 "$BACKEND_PID" 2>/dev/null; } && \
+       { [[ -z "$FRONTEND_PID" ]] || ! kill -0 "$FRONTEND_PID" 2>/dev/null; }; then
+      break
+    fi
+    sleep 0.25
+  done
+  for pid in "$WATCHER_PID" "$FRONTEND_PID" "$BACKEND_PID"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done
+  exit "$exit_code"
+}
+trap cleanup EXIT INT TERM
+
+echo "[debot] Starting backend on http://${BACKEND_HOST}:${BACKEND_PORT}..."
+"$VENV_PY" -m uvicorn main:app \
+  --app-dir "$ROOT/backend" \
+  --host "$BACKEND_HOST" \
+  --port "$BACKEND_PORT" &
+BACKEND_PID=$!
+
+echo "[debot] Starting frontend on http://${FRONTEND_HOST}:${FRONTEND_PORT}..."
+(
+  cd "$ROOT/frontend"
+  exec "$VITE_BIN" --host "$FRONTEND_HOST" --port "$FRONTEND_PORT" --strictPort
+) &
+FRONTEND_PID=$!
+
+APP_URL="http://${FRONTEND_HOST}:${FRONTEND_PORT}"
+
+# Wait briefly for both servers to come up, then open the browser
+(
+  for _ in $(seq 1 60); do
+    if ! kill -0 "$BACKEND_PID" 2>/dev/null || ! kill -0 "$FRONTEND_PID" 2>/dev/null; then
+      exit 0
+    fi
+    if "$VENV_PY" -c "import urllib.request; urllib.request.urlopen('${APP_URL}', timeout=1); urllib.request.urlopen('http://${BACKEND_HOST}:${BACKEND_PORT}/api/search/retailers', timeout=1)" >/dev/null 2>&1; then
+      echo ""
+      echo "[debot] Ready -> ${APP_URL} (Press Ctrl+C to stop both servers)"
+      if [[ "$OPEN_BROWSER" != "1" ]]; then
+        if command -v xdg-open >/dev/null 2>&1; then
+          xdg-open "$APP_URL" >/dev/null 2>&1 || true
+        elif command -v open >/dev/null 2>&1; then
+          open "$APP_URL" >/dev/null 2>&1 || true
+        fi
+      fi
+      exit 0
+    fi
+    sleep 0.25
+  done
+) &
+WATCHER_PID=$!
+
+# Stay alive until either server exits (or Ctrl+C triggers cleanup)
+while kill -0 "$BACKEND_PID" 2>/dev/null && kill -0 "$FRONTEND_PID" 2>/dev/null; do
+  sleep 0.5
+done
+
+echo "[debot] A server process exited; shutting down..." >&2
+exit 1
